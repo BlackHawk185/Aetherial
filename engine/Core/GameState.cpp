@@ -9,7 +9,6 @@
 
 #include "../World/VoxelChunk.h"
 #include "../World/VoronoiIslandPlacer.h"
-#include "../Rendering/GlobalLightingManager.h"
 
 GameState::GameState()
 {
@@ -37,11 +36,8 @@ bool GameState::initialize(bool shouldCreateDefaultWorld)
     // Initialize physics system - Re-enabled with fixed BodyID handling
     m_physicsSystem = std::make_unique<PhysicsSystem>();
 
-    // Configure lighting system for maximum performance
-    g_globalLighting.setUpdateFrequency(20.0f);   // Increased from 10 FPS to 20 FPS for smoother lighting
-    g_globalLighting.setOcclusionEnabled(false);  // Disable occlusion for maximum performance
-    
-    std::cout << "💡 Configured lighting: Simple face-orientation lighting at 10 FPS for performance" << std::endl;
+    // Real-time CSM/PCF shadows - no lightmap system needed
+    std::cout << "💡 Using real-time CSM shadows (no lightmap system)" << std::endl;
 
     // Create default world if requested
     if (shouldCreateDefaultWorld)

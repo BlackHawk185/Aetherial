@@ -22,7 +22,6 @@ add_library(engine STATIC
     Rendering/InstancedQuadRenderer.cpp  # GPU instanced quad renderer with shared unit quad
     Rendering/TextureManager.cpp
     Rendering/ShaderManager.cpp
-    Rendering/GlobalLightingManager.cpp
     Rendering/CascadedShadowMap.cpp
     Rendering/ModelInstanceRenderer.cpp
     Rendering/BlockHighlightRenderer.cpp

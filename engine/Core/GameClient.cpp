@@ -26,7 +26,6 @@
 #include "../Rendering/ModelInstanceRenderer.h"
 #include "../Rendering/TextureManager.h"
 #include "../Rendering/CascadedShadowMap.h"
-#include "../Rendering/GlobalLightingManager.h"
 #include "../Physics/PhysicsSystem.h"  // For ground detection
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>

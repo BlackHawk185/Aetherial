@@ -24,11 +24,9 @@ struct QuadFace
     Vec3 normal;     // Face normal (12 bytes, offset 12)
     float width;     // Width of the quad (4 bytes, offset 24)
     float height;    // Height of the quad (4 bytes, offset 28)
-    float lightmapU; // Lightmap U coordinate (4 bytes, offset 32)
-    float lightmapV; // Lightmap V coordinate (4 bytes, offset 36)
-    uint8_t blockType; // Block type (1 byte, offset 40)
-    uint8_t faceDir;   // Face direction 0-5 (1 byte, offset 41)
-    uint16_t padding;  // Padding (2 bytes, offset 42) - Total: 44 bytes
+    uint8_t blockType; // Block type (1 byte, offset 32)
+    uint8_t faceDir;   // Face direction 0-5 (1 byte, offset 33)
+    uint16_t padding;  // Padding (2 bytes, offset 34) - Total: 36 bytes (was 44)
 };
 #pragma pack(pop)
 
@@ -38,42 +36,6 @@ struct VoxelMesh
     std::vector<QuadFace> quads;
     GLuint instanceVBO = 0;  // Instance buffer for QuadFace data
     bool needsUpdate = true;
-};
-
-// Per-face light mapping data for the chunk
-struct FaceLightMap 
-{
-    static constexpr int LIGHTMAP_SIZE = 32; // 32x32 per face
-    uint32_t textureHandle = 0;  // OpenGL texture handle
-    std::vector<uint8_t> data;  // RGB data
-    bool needsUpdate = true;
-    
-    FaceLightMap() {
-        // Initialize with RGB data
-        data.resize(LIGHTMAP_SIZE * LIGHTMAP_SIZE * 3);
-    }
-    
-    ~FaceLightMap() {
-        if (textureHandle != 0) {
-            // Note: glDeleteTextures should only be called from OpenGL context
-            // This will be handled by proper cleanup in VoxelChunk destructor
-        }
-    }
-};
-
-// Light mapping data for the chunk - one light map per face direction
-struct ChunkLightMaps 
-{
-    // 6 face directions: +X, -X, +Y, -Y, +Z, -Z (matches face indices 4, 5, 2, 3, 0, 1)
-    std::array<FaceLightMap, 6> faceMaps;
-    
-    FaceLightMap& getFaceMap(int faceDirection) {
-        return faceMaps[faceDirection];
-    }
-    
-    const FaceLightMap& getFaceMap(int faceDirection) const {
-        return faceMaps[faceDirection];
-    }
 };
 
 struct CollisionFace
@@ -167,21 +129,10 @@ class VoxelChunk
     void clearModelInstances(uint8_t blockID);
     void clearAllModelInstances();
     
-    // Light mapping access
-    ChunkLightMaps& getLightMaps() { return lightMaps; }
-    const ChunkLightMaps& getLightMaps() const { return lightMaps; }
-    void updateLightMapTextures();  // Create/update OpenGL textures from light map data
-    void markLightMapsDirty();      // Mark light maps as needing GPU texture update
-    bool hasValidLightMaps() const; // Check if all lightmap textures are created
-    bool hasLightMapData() const;   // Check if lightmap data exists (before texture creation)
-    
     // NEW: Lighting dirty state management
     bool needsLightingUpdate() const { return lightingDirty; }
     void markLightingDirty() { lightingDirty = true; }
     void markLightingClean() { lightingDirty = false; }
-    
-    // Light mapping utilities - public for GlobalLightingManager
-    Vec3 calculateWorldPositionFromLightMapUV(int faceIndex, float u, float v) const;  // Convert UV to world pos
     
     void buildCollisionMesh();
     bool checkRayCollision(const Vec3& rayOrigin, const Vec3& rayDirection, float maxDistance,
@@ -197,7 +148,6 @@ class VoxelChunk
     VoxelMesh mesh;
     mutable std::mutex meshMutex;
     std::shared_ptr<CollisionMesh> collisionMesh;  // Thread-safe atomic access via getCollisionMesh/setCollisionMesh
-    ChunkLightMaps lightMaps;  // NEW: Per-face light mapping data
     bool meshDirty = true;
     bool lightingDirty = true;  // NEW: Lighting needs recalculation
     

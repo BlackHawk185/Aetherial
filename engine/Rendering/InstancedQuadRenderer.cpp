@@ -22,15 +22,13 @@ static const char* VERTEX_SHADER = R"(
 // Unit quad vertex attributes (shared by all instances)
 layout(location = 0) in vec3 aPosition;  // -0.5 to 0.5 range
 
-// Instance attributes (per QuadFace)
+// Instance attributes
 layout(location = 1) in vec3 aInstancePosition;
 layout(location = 2) in vec3 aInstanceNormal;
 layout(location = 3) in float aInstanceWidth;
 layout(location = 4) in float aInstanceHeight;
-layout(location = 5) in float aInstanceLightmapU;
-layout(location = 6) in float aInstanceLightmapV;
-layout(location = 7) in uint aInstanceBlockType;
-layout(location = 8) in uint aInstanceFaceDir;
+layout(location = 5) in uint aInstanceBlockType;
+layout(location = 6) in uint aInstanceFaceDir;
 
 // Chunk transforms in SSBO (accessed via gl_DrawID)
 layout(std430, binding = 0) readonly buffer TransformBuffer {
@@ -42,7 +40,6 @@ uniform mat4 uViewProjection;
 
 // Outputs to fragment shader
 out vec2 TexCoord;
-out vec2 LightmapCoord;
 out vec3 Normal;
 out vec3 WorldPos;
 flat out uint BlockType;
@@ -87,9 +84,6 @@ void main() {
     // Texture coordinates
     TexCoord = (aPosition.xy + 0.5) * vec2(aInstanceWidth, aInstanceHeight);
     
-    // Lightmap coordinates
-    LightmapCoord = vec2(aInstanceLightmapU, aInstanceLightmapV);
-    
     // Pass through normal and block type
     Normal = mat3(uChunkTransform) * aInstanceNormal;
     BlockType = aInstanceBlockType;
@@ -102,7 +96,6 @@ static const char* FRAGMENT_SHADER = R"(
 #version 460 core
 
 in vec2 TexCoord;
-in vec2 LightmapCoord;
 in vec3 Normal;
 in vec3 WorldPos;
 flat in uint BlockType;
@@ -240,10 +233,8 @@ layout(location = 1) in vec3 aInstancePosition;
 layout(location = 2) in vec3 aInstanceNormal;
 layout(location = 3) in float aInstanceWidth;
 layout(location = 4) in float aInstanceHeight;
-layout(location = 5) in float aInstanceLightmapU;
-layout(location = 6) in float aInstanceLightmapV;
-layout(location = 7) in uint aInstanceBlockType;
-layout(location = 8) in uint aInstanceFaceDir;
+layout(location = 5) in uint aInstanceBlockType;
+layout(location = 6) in uint aInstanceFaceDir;
 
 // Chunk transforms in SSBO (accessed via gl_DrawID)
 layout(std430, binding = 0) readonly buffer TransformBuffer {
@@ -603,47 +594,43 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
         // Bind merged instance buffer
         glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
         
-        // Pre-configure all instance vertex attributes
+        // Pre-configure all instance vertex attributes (QuadFace: 36 bytes)
         size_t offset = 0;
         
+        // Location 1: position (Vec3)
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
         glVertexAttribDivisor(1, 1);
         offset += sizeof(Vec3);
         
+        // Location 2: normal (Vec3)
         glEnableVertexAttribArray(2);
         glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
         glVertexAttribDivisor(2, 1);
         offset += sizeof(Vec3);
         
+        // Location 3: width (float)
         glEnableVertexAttribArray(3);
         glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
         glVertexAttribDivisor(3, 1);
         offset += sizeof(float);
         
+        // Location 4: height (float)
         glEnableVertexAttribArray(4);
         glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
         glVertexAttribDivisor(4, 1);
         offset += sizeof(float);
         
+        // Location 5: blockType (uint8_t)
         glEnableVertexAttribArray(5);
-        glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
+        glVertexAttribIPointer(5, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
         glVertexAttribDivisor(5, 1);
-        offset += sizeof(float);
-        
-        glEnableVertexAttribArray(6);
-        glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(6, 1);
-        offset += sizeof(float);
-        
-        glEnableVertexAttribArray(7);
-        glVertexAttribIPointer(7, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(7, 1);
         offset += sizeof(uint8_t);
         
-        glEnableVertexAttribArray(8);
-        glVertexAttribIPointer(8, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(8, 1);
+        // Location 6: faceDir (uint8_t)
+        glEnableVertexAttribArray(6);
+        glVertexAttribIPointer(6, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
+        glVertexAttribDivisor(6, 1);
         
         glBindVertexArray(0);
         vaoConfigured = true;

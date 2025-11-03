@@ -1,6 +1,5 @@
 // DayNightController.cpp - Implementation of day/night cycle
 #include "DayNightController.h"
-#include "../Rendering/GlobalLightingManager.h"
 #include <cmath>
 #include <algorithm>
 
@@ -33,17 +32,7 @@ void DayNightController::update(float deltaTime) {
         m_currentTime += 24.0f;
     }
     
-    // Update global lighting manager with new sun direction
-    Vec3 sunDir = getSunDirection();
-    g_globalLighting.setSunDirection(sunDir);
-    
-    // Update sun intensity
-    float intensity = getSunIntensity();
-    g_globalLighting.setSunIntensity(intensity);
-    
-    // Update ambient intensity based on time of day
-    float ambient = getAmbientIntensity();
-    g_globalLighting.setAmbientIntensity(ambient);
+    // Sun direction and intensity calculated by CSM shadow system (no lightmap manager needed)
 }
 
 void DayNightController::setTimeOfDay(float hours) {
