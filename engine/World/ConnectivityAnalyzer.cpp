@@ -1,213 +1,8 @@
-// ConnectivityAnalyzer.cpp - Implementation of connectivity detection
+// ConnectivityAnalyzer.cpp - Runtime island fragmentation detection
 #include "ConnectivityAnalyzer.h"
 #include "IslandChunkSystem.h"
 #include "VoxelChunk.h"
 #include <iostream>
-#include <chrono>
-
-std::vector<ConnectedGroup> ConnectivityAnalyzer::analyzeIsland(const FloatingIsland* island)
-{
-    if (!island) return {};
-    
-    std::vector<ConnectedGroup> groups;
-    std::unordered_set<Vec3> visited;
-    
-    // Iterate through all chunks and their voxels to find starting points
-    for (const auto& [chunkCoord, chunk] : island->chunks)
-    {
-        if (!chunk) continue;
-        
-        // Check each voxel in the chunk
-        Vec3 chunkWorldOffset = FloatingIsland::chunkCoordToWorldPos(chunkCoord);
-        
-        for (int x = 0; x < VoxelChunk::SIZE; x++)
-        {
-            for (int y = 0; y < VoxelChunk::SIZE; y++)
-            {
-                for (int z = 0; z < VoxelChunk::SIZE; z++)
-                {
-                    uint8_t voxelType = chunk->getVoxel(x, y, z);
-                    if (voxelType == 0) continue;  // Skip air
-                    
-                    // Convert to island-relative position
-                    Vec3 islandRelativePos = chunkWorldOffset + Vec3(x, y, z);
-                    
-                    // If not visited, start a new flood-fill
-                    if (visited.find(islandRelativePos) == visited.end())
-                    {
-                        ConnectedGroup group = floodFill(island, islandRelativePos, visited);
-                        if (group.voxelCount > 0)
-                        {
-                            groups.push_back(group);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    return groups;
-}
-
-int ConnectivityAnalyzer::cleanupSatellites(FloatingIsland* island, const Vec3& mainIslandAnchor)
-{
-    if (!island) return 0;
-    
-    auto totalStart = std::chrono::high_resolution_clock::now();
-    
-    // **FAST PATH**: Single flood-fill from anchor point to mark main island
-    std::unordered_set<Vec3> mainIslandVoxels;
-    
-    auto anchorCheckStart = std::chrono::high_resolution_clock::now();
-    
-    long long anchorCheckDuration = 0;
-    long long findSolidDuration = 0;
-    long long floodFillDuration = 0;
-    
-    // Check if anchor point is solid
-    if (!isSolidVoxel(island, mainIslandAnchor))
-    {
-        auto anchorCheckEnd = std::chrono::high_resolution_clock::now();
-        anchorCheckDuration = std::chrono::duration_cast<std::chrono::milliseconds>(anchorCheckEnd - anchorCheckStart).count();
-        
-        auto findSolidStart = std::chrono::high_resolution_clock::now();
-        
-        // Anchor is air - find nearest solid voxel (fallback)
-        bool foundSolid = false;
-        Vec3 solidPos;
-        
-        for (const auto& [chunkCoord, chunk] : island->chunks)
-        {
-            if (!chunk || foundSolid) break;
-            
-            Vec3 chunkWorldOffset = FloatingIsland::chunkCoordToWorldPos(chunkCoord);
-            for (int x = 0; x < VoxelChunk::SIZE && !foundSolid; x++)
-            {
-                for (int y = 0; y < VoxelChunk::SIZE && !foundSolid; y++)
-                {
-                    for (int z = 0; z < VoxelChunk::SIZE && !foundSolid; z++)
-                    {
-                        if (chunk->getVoxel(x, y, z) != 0)
-                        {
-                            solidPos = chunkWorldOffset + Vec3(x, y, z);
-                            foundSolid = true;
-                        }
-                    }
-                }
-            }
-        }
-        
-        if (!foundSolid)
-        {
-            // No solid voxels found - nothing to clean up
-            return 0;
-        }
-        
-        auto findSolidEnd = std::chrono::high_resolution_clock::now();
-        findSolidDuration = std::chrono::duration_cast<std::chrono::milliseconds>(findSolidEnd - findSolidStart).count();
-        
-        auto floodFillStart = std::chrono::high_resolution_clock::now();
-        
-        // Start flood-fill from first solid voxel found
-        std::queue<Vec3> queue;
-        queue.push(solidPos);
-        mainIslandVoxels.insert(solidPos);
-        
-        // Flood-fill to mark all connected voxels
-        while (!queue.empty())
-        {
-            Vec3 current = queue.front();
-            queue.pop();
-            
-            for (const Vec3& neighbor : getNeighbors(current))
-            {
-                if (mainIslandVoxels.find(neighbor) != mainIslandVoxels.end()) continue;
-                if (!isSolidVoxel(island, neighbor)) continue;
-                
-                mainIslandVoxels.insert(neighbor);
-                queue.push(neighbor);
-            }
-        }
-        
-        auto floodFillEnd = std::chrono::high_resolution_clock::now();
-        floodFillDuration = std::chrono::duration_cast<std::chrono::milliseconds>(floodFillEnd - floodFillStart).count();
-        
-        std::cout << "   ├─ Anchor Check: " << anchorCheckDuration << "ms (anchor was air)" << std::endl;
-        std::cout << "   ├─ Find Solid: " << findSolidDuration << "ms" << std::endl;
-        std::cout << "   └─ Flood Fill: " << floodFillDuration << "ms (" << mainIslandVoxels.size() << " voxels marked)" << std::endl;
-    }
-    else
-    {
-        auto anchorCheckEnd = std::chrono::high_resolution_clock::now();
-        anchorCheckDuration = std::chrono::duration_cast<std::chrono::milliseconds>(anchorCheckEnd - anchorCheckStart).count();
-        
-        auto floodFillStart = std::chrono::high_resolution_clock::now();
-        
-        // Anchor is solid - flood-fill from anchor point
-        std::queue<Vec3> queue;
-        queue.push(mainIslandAnchor);
-        mainIslandVoxels.insert(mainIslandAnchor);
-        
-        while (!queue.empty())
-        {
-            Vec3 current = queue.front();
-            queue.pop();
-            
-            for (const Vec3& neighbor : getNeighbors(current))
-            {
-                if (mainIslandVoxels.find(neighbor) != mainIslandVoxels.end()) continue;
-                if (!isSolidVoxel(island, neighbor)) continue;
-                
-                mainIslandVoxels.insert(neighbor);
-                queue.push(neighbor);
-            }
-        }
-        
-        auto floodFillEnd = std::chrono::high_resolution_clock::now();
-        floodFillDuration = std::chrono::duration_cast<std::chrono::milliseconds>(floodFillEnd - floodFillStart).count();
-        
-        std::cout << "   ├─ Anchor Check: " << anchorCheckDuration << "ms (anchor was solid)" << std::endl;
-        std::cout << "   └─ Flood Fill: " << floodFillDuration << "ms (" << mainIslandVoxels.size() << " voxels marked)" << std::endl;
-    }
-    
-    auto deletionStart = std::chrono::high_resolution_clock::now();
-    
-    // Delete everything NOT in main island
-    int voxelsRemoved = 0;
-    for (auto& [chunkCoord, chunk] : island->chunks)
-    {
-        if (!chunk) continue;
-        
-        Vec3 chunkWorldOffset = FloatingIsland::chunkCoordToWorldPos(chunkCoord);
-        
-        for (int x = 0; x < VoxelChunk::SIZE; x++)
-        {
-            for (int y = 0; y < VoxelChunk::SIZE; y++)
-            {
-                for (int z = 0; z < VoxelChunk::SIZE; z++)
-                {
-                    if (chunk->getVoxel(x, y, z) == 0) continue;
-                    
-                    Vec3 islandRelativePos = chunkWorldOffset + Vec3(x, y, z);
-                    
-                    // If this voxel is NOT in the main island, remove it
-                    if (mainIslandVoxels.find(islandRelativePos) == mainIslandVoxels.end())
-                    {
-                        chunk->setVoxel(x, y, z, 0);
-                        voxelsRemoved++;
-                    }
-                }
-            }
-        }
-    }
-    
-    auto deletionEnd = std::chrono::high_resolution_clock::now();
-    auto deletionDuration = std::chrono::duration_cast<std::chrono::milliseconds>(deletionEnd - deletionStart).count();
-    
-    std::cout << "   └─ Satellite Deletion: " << deletionDuration << "ms (" << voxelsRemoved << " voxels removed)" << std::endl;
-    
-    return voxelsRemoved;
-}
 
 std::vector<uint32_t> ConnectivityAnalyzer::splitIslandByConnectivity(
     IslandChunkSystem* system,
@@ -218,8 +13,39 @@ std::vector<uint32_t> ConnectivityAnalyzer::splitIslandByConnectivity(
     FloatingIsland* originalIsland = system->getIsland(originalIslandID);
     if (!originalIsland) return {};
     
-    // Analyze connectivity
-    std::vector<ConnectedGroup> groups = analyzeIsland(originalIsland);
+    // Analyze connectivity - inline flood-fill to find all groups
+    std::vector<ConnectedGroup> groups;
+    std::unordered_set<Vec3> visited;
+    
+    for (const auto& [chunkCoord, chunk] : originalIsland->chunks)
+    {
+        if (!chunk) continue;
+        
+        Vec3 chunkWorldOffset = FloatingIsland::chunkCoordToWorldPos(chunkCoord);
+        
+        for (int x = 0; x < VoxelChunk::SIZE; x++)
+        {
+            for (int y = 0; y < VoxelChunk::SIZE; y++)
+            {
+                for (int z = 0; z < VoxelChunk::SIZE; z++)
+                {
+                    uint8_t voxelType = chunk->getVoxel(x, y, z);
+                    if (voxelType == 0) continue;
+                    
+                    Vec3 islandRelativePos = chunkWorldOffset + Vec3(x, y, z);
+                    
+                    if (visited.find(islandRelativePos) == visited.end())
+                    {
+                        ConnectedGroup group = floodFill(originalIsland, islandRelativePos, visited);
+                        if (group.voxelCount > 0)
+                        {
+                            groups.push_back(group);
+                        }
+                    }
+                }
+            }
+        }
+    }
     
     // If only one group, no split needed
     if (groups.size() <= 1) return {};

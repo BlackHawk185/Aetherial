@@ -518,8 +518,8 @@ void InstancedQuadRenderer::uploadChunkInstances(ChunkEntry& entry)
         return;
     }
     
-    // Thread-safe atomic mesh access - no mutex needed!
-    auto mesh = entry.chunk->getRenderMesh();
+    // Lazy mesh generation - generates mesh on first access if needed
+    auto mesh = entry.chunk->getRenderMeshLazy();
     if (!mesh)
     {
         entry.instanceCount = 0;
@@ -560,8 +560,8 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
     size_t totalInstances = 0;
     for (auto& entry : m_chunks) {
         if (entry.chunk) {
-            // Thread-safe atomic mesh access - no mutex needed!
-            auto mesh = entry.chunk->getRenderMesh();
+            // Lazy mesh generation - generates mesh on first access if needed
+            auto mesh = entry.chunk->getRenderMeshLazy();
             if (mesh) {
                 entry.instanceCount = mesh->quads.size();
                 entry.baseInstance = totalInstances;

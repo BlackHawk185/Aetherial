@@ -287,7 +287,7 @@ void VoxelChunk::generateSimpleMeshInto(std::vector<QuadFace>& quads)
     PROFILE_SCOPE("VoxelChunk::generateSimpleMesh");
     
     // Stack-allocated mask buffer (reused 6×SIZE times per chunk)
-    // SIZE×SIZE bytes (256×256 = 64 KB for 256³ chunks - safe for stack)
+    // SIZE×SIZE bytes (512×512 = 256 KB for 512³ chunks - safe for stack)
     // Eliminates 6×SIZE heap allocations + deallocations per chunk!
     uint8_t maskBuffer[SIZE * SIZE];
     

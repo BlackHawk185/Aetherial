@@ -124,6 +124,16 @@ class VoxelChunk
         return std::atomic_load(&renderMesh);
     }
     
+    // Lazy mesh generation - generates mesh on first access if dirty
+    std::shared_ptr<const VoxelMesh> getRenderMeshLazy()
+    {
+        auto mesh = std::atomic_load(&renderMesh);
+        if (!mesh || meshDirty) {
+            generateMesh(false);  // Generate without lighting (real-time lighting)
+        }
+        return std::atomic_load(&renderMesh);
+    }
+    
     void setRenderMesh(std::shared_ptr<VoxelMesh> newMesh)
     {
         std::atomic_store(&renderMesh, newMesh);
@@ -140,6 +150,8 @@ class VoxelChunk
     // Island context for inter-chunk culling
     void setIslandContext(uint32_t islandID, const Vec3& chunkCoord);
     
+    // Friend class for async mesh generation
+    friend class AsyncMeshGenerator;
 
    private:
     std::array<uint8_t, VOLUME> voxels;

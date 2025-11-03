@@ -17,20 +17,10 @@ struct ConnectedGroup
     size_t voxelCount;                  // Number of voxels
 };
 
-// Analyzes voxel connectivity to detect separate islands
+// Analyzes voxel connectivity for runtime island fragmentation
 class ConnectivityAnalyzer
 {
 public:
-    // **FULL ANALYSIS** - Analyze an island and return all connected groups
-    // Each group is a separate "blob" of connected voxels that should be its own entity
-    // Use this for runtime island splitting where you need size/mass/center info
-    static std::vector<ConnectedGroup> analyzeIsland(const FloatingIsland* island);
-    
-    // **FAST PATH** - Remove satellite chunks, keeping only main island connected to anchor point
-    // Much faster than full analysis - use this for generation-time cleanup
-    // Returns number of voxels removed
-    static int cleanupSatellites(FloatingIsland* island, const Vec3& mainIslandAnchor = Vec3(0, 0, 0));
-    
     // **ULTRA-FAST SPLIT CHECK** - Check if breaking a block would split the island
     // Returns true if the block has exactly 2 non-adjacent neighbors (causing a split)
     // outFragmentAnchor will be set to one of the neighbors for fragment extraction

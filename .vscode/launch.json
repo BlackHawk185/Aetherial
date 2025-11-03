@@ -5,7 +5,7 @@
       "name": "Run MMORPGEngine (Debug)",
       "type": "cppvsdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build/review/bin/Debug/MMORPGEngine.exe",
+      "program": "${workspaceFolder}/build/bin/MMORPGEngine.exe",
       "args": [],
       "cwd": "${workspaceFolder}",
       "stopAtEntry": false,

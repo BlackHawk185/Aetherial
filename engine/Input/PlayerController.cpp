@@ -273,16 +273,6 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
         // Collision detected - use axis-separated movement
         Vec3 relativeMovement = intendedMovement;
         
-        if (collidingIsland)
-        {
-            // Move relative to the island to prevent clipping through moving walls
-            // Only apply to horizontal (X/Z) axes to avoid choppy vertical movement (jumping/climbing)
-            Vec3 islandMovement = collidingIsland->velocity * deltaTime;
-            relativeMovement.x -= islandMovement.x;
-            relativeMovement.z -= islandMovement.z;
-            // relativeMovement.y stays unchanged - vertical movement should be independent
-        }
-        
         // Try axis-separated movement
         // Process Y first to allow jumping/climbing to work smoothly
         Vec3 testPos;

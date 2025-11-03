@@ -14,9 +14,9 @@ add_library(engine STATIC
     World/VoxelRaycaster.cpp
     World/BlockType.cpp
     World/ConnectivityAnalyzer.cpp
-    World/ConnectivityTest.cpp
     World/ElementRecipes.cpp
     World/VoronoiIslandPlacer.cpp
+    World/AsyncMeshGenerator.cpp
     
     # Rendering systems
     Rendering/InstancedQuadRenderer.cpp  # GPU instanced quad renderer with shared unit quad

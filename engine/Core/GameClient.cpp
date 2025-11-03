@@ -27,6 +27,7 @@
 #include "../Rendering/TextureManager.h"
 #include "../Rendering/CascadedShadowMap.h"
 #include "../Physics/PhysicsSystem.h"  // For ground detection
+#include "../World/AsyncMeshGenerator.h"  // Async mesh generation
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include "../Time/TimeEffects.h"
@@ -108,6 +109,12 @@ bool GameClient::initialize(bool enableDebug)
     if (!initializeGraphics())
     {
         return false;
+    }
+
+    // Initialize async mesh generator for non-blocking chunk loading
+    if (!g_asyncMeshGenerator)
+    {
+        g_asyncMeshGenerator = new AsyncMeshGenerator();
     }
 
     m_initialized = true;
@@ -192,6 +199,13 @@ bool GameClient::update(float deltaTime)
         m_networkManager->update();
     }
 
+    // Process completed async mesh generations (fast - just swaps data)
+    if (g_asyncMeshGenerator)
+    {
+        PROFILE_SCOPE("processCompletedMeshes");
+        g_asyncMeshGenerator->processCompletedMeshes();
+    }
+
     // Update client-side physics for smooth island movement
     if (m_gameState)
     {
@@ -247,6 +261,13 @@ void GameClient::shutdown()
     if (!m_initialized)
     {
         return;
+    }
+
+    // Shutdown async mesh generator
+    if (g_asyncMeshGenerator)
+    {
+        delete g_asyncMeshGenerator;
+        g_asyncMeshGenerator = nullptr;
     }
 
     // Disconnect from game state
@@ -1158,39 +1179,85 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
     {
         // Apply the voxel data directly
         chunk->setRawVoxelData(voxelData, dataSize);
-        chunk->generateMesh();  // Already builds collision mesh internally
         
-        // DEFERRED INTER-CHUNK CULLING: Regenerate all 6 neighbors
-        // This allows them to cull faces that touch this new chunk
-        static const Vec3 neighborOffsets[6] = {
-            Vec3(0, -1, 0), Vec3(0, 1, 0),   // -Y, +Y
-            Vec3(0, 0, -1), Vec3(0, 0, 1),   // -Z, +Z
-            Vec3(-1, 0, 0), Vec3(1, 0, 0)    // -X, +X
-        };
-        
-        for (int i = 0; i < 6; ++i)
+        // Queue async mesh generation instead of blocking main thread
+        if (g_asyncMeshGenerator)
         {
-            Vec3 neighborCoord = chunkCoord + neighborOffsets[i];
-            VoxelChunk* neighbor = islandSystem->getChunkFromIsland(islandID, neighborCoord);
-            if (neighbor)
-            {
-                neighbor->generateMesh();
-            }
+            g_asyncMeshGenerator->queueChunkMeshGeneration(chunk, [this, islandID, chunk, island, chunkCoord]() {
+                // This callback runs on main thread after mesh is ready
+                if (g_instancedQuadRenderer && island)
+                {
+                    Vec3 chunkLocalPos(
+                        chunkCoord.x * VoxelChunk::SIZE,
+                        chunkCoord.y * VoxelChunk::SIZE,
+                        chunkCoord.z * VoxelChunk::SIZE
+                    );
+                    
+                    glm::mat4 chunkTransform = island->getTransformMatrix() * 
+                        glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
+                    
+                    g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+                }
+                
+                // Queue neighbor regeneration asynchronously (spread the load)
+                static const Vec3 neighborOffsets[6] = {
+                    Vec3(0, -1, 0), Vec3(0, 1, 0),
+                    Vec3(0, 0, -1), Vec3(0, 0, 1),
+                    Vec3(-1, 0, 0), Vec3(1, 0, 0)
+                };
+                
+                auto* islandSystem = m_gameState ? m_gameState->getIslandSystem() : nullptr;
+                if (islandSystem)
+                {
+                    for (int i = 0; i < 6; ++i)
+                    {
+                        Vec3 neighborCoord = chunkCoord + neighborOffsets[i];
+                        VoxelChunk* neighbor = islandSystem->getChunkFromIsland(islandID, neighborCoord);
+                        if (neighbor && g_asyncMeshGenerator)
+                        {
+                            g_asyncMeshGenerator->queueChunkMeshGeneration(neighbor);
+                        }
+                    }
+                }
+            });
         }
-        
-        // Register chunk with instanced renderer immediately
-        if (g_instancedQuadRenderer && island)
+        else
         {
-            Vec3 chunkLocalPos(
-                chunkCoord.x * VoxelChunk::SIZE,
-                chunkCoord.y * VoxelChunk::SIZE,
-                chunkCoord.z * VoxelChunk::SIZE
-            );
+            // Fallback to synchronous generation if async system not available
+            chunk->generateMesh();
             
-            glm::mat4 chunkTransform = island->getTransformMatrix() * 
-                glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
+            // DEFERRED INTER-CHUNK CULLING: Regenerate all 6 neighbors
+            // This allows them to cull faces that touch this new chunk
+            static const Vec3 neighborOffsets[6] = {
+                Vec3(0, -1, 0), Vec3(0, 1, 0),   // -Y, +Y
+                Vec3(0, 0, -1), Vec3(0, 0, 1),   // -Z, +Z
+                Vec3(-1, 0, 0), Vec3(1, 0, 0)    // -X, +X
+            };
             
-            g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+            for (int i = 0; i < 6; ++i)
+            {
+                Vec3 neighborCoord = chunkCoord + neighborOffsets[i];
+                VoxelChunk* neighbor = islandSystem->getChunkFromIsland(islandID, neighborCoord);
+                if (neighbor)
+                {
+                    neighbor->generateMesh();
+                }
+            }
+            
+            // Register chunk with instanced renderer immediately
+            if (g_instancedQuadRenderer && island)
+            {
+                Vec3 chunkLocalPos(
+                    chunkCoord.x * VoxelChunk::SIZE,
+                    chunkCoord.y * VoxelChunk::SIZE,
+                    chunkCoord.z * VoxelChunk::SIZE
+                );
+                
+                glm::mat4 chunkTransform = island->getTransformMatrix() * 
+                    glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
+                
+                g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+            }
         }
     }
     else

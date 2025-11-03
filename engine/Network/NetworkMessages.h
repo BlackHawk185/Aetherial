@@ -89,9 +89,9 @@ struct PACKED CompressedChunkHeader {
 
 // Maximum size for compressed data (dynamically scales with CHUNK_SIZE)
 // Worst case: ChunkConfig::MAX_CHUNK_DATA_SIZE uncompressed, LZ4 achieves 60-80% compression
-// For 256³ = 16.7MB uncompressed, we reserve 4MB max for compressed data
-constexpr uint32_t MAX_COMPRESSED_ISLAND_SIZE = 4194304; // 4MB max (scales with chunk size)
-constexpr uint32_t MAX_COMPRESSED_CHUNK_SIZE = 4194304;  // 4MB max (scales with chunk size)
+// For 512³ = 134MB uncompressed, we reserve 32MB max for compressed data
+constexpr uint32_t MAX_COMPRESSED_ISLAND_SIZE = 33554432; // 32MB max (scales with chunk size)
+constexpr uint32_t MAX_COMPRESSED_CHUNK_SIZE = 33554432;  // 32MB max (scales with chunk size)
 
 // Voxel change request from client to server
 struct PACKED VoxelChangeRequest {
