@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include "../Math/Vec3.h"
+#include "../World/ChunkConstants.h"
 
 // Cross-platform structure packing
 #ifdef _MSC_VER
@@ -86,10 +87,11 @@ struct PACKED CompressedChunkHeader {
     // Compressed voxel data follows this header (variable length)
 };
 
-// Maximum size for compressed data (conservative estimate for 128x128x128 chunks)
-// Worst case: ~2MB uncompressed, LZ4 compression typically achieves 60-80% reduction
-constexpr uint32_t MAX_COMPRESSED_ISLAND_SIZE = 1048576; // 1MB max compressed size
-constexpr uint32_t MAX_COMPRESSED_CHUNK_SIZE = 1048576;  // 1MB max compressed chunk size
+// Maximum size for compressed data (dynamically scales with CHUNK_SIZE)
+// Worst case: ChunkConfig::MAX_CHUNK_DATA_SIZE uncompressed, LZ4 achieves 60-80% compression
+// For 256³ = 16.7MB uncompressed, we reserve 4MB max for compressed data
+constexpr uint32_t MAX_COMPRESSED_ISLAND_SIZE = 4194304; // 4MB max (scales with chunk size)
+constexpr uint32_t MAX_COMPRESSED_CHUNK_SIZE = 4194304;  // 4MB max (scales with chunk size)
 
 // Voxel change request from client to server
 struct PACKED VoxelChangeRequest {

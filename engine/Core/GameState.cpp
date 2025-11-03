@@ -120,10 +120,10 @@ void GameState::createDefaultWorld()
     // ═══════════════════════════════════════════════════════════════
     struct WorldGenConfig {
         // World boundaries
-        float regionSize = 3000.0f;          // World region size (1000x1000 units)
+        float regionSize = 2000.0f;          // World region size (1000x1000 units)
         
         // Island generation (density-based for infinite scaling)
-        float islandDensity = 2.0f;          // Islands per 1000x1000 area (scales infinitely!)
+        float islandDensity = 3.0f;          // Islands per 1000x1000 area (scales infinitely!)
         float minIslandRadius = 100.0f;       // Minimum island size
         float maxIslandRadius = 750.0f;      // Maximum island size
         

@@ -518,9 +518,15 @@ void InstancedQuadRenderer::uploadChunkInstances(ChunkEntry& entry)
         return;
     }
     
-    const auto& mesh = entry.chunk->getMesh();
-    const auto& quads = mesh.quads;
-    entry.instanceCount = quads.size();
+    // Thread-safe atomic mesh access - no mutex needed!
+    auto mesh = entry.chunk->getRenderMesh();
+    if (!mesh)
+    {
+        entry.instanceCount = 0;
+        return;
+    }
+    
+    entry.instanceCount = mesh->quads.size();
     
     // Instance data is now managed by rebuildMDIBuffers, not per-chunk
     m_mdiDirty = true;
@@ -554,10 +560,15 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
     size_t totalInstances = 0;
     for (auto& entry : m_chunks) {
         if (entry.chunk) {
-            const auto& mesh = entry.chunk->getMesh();
-            entry.instanceCount = mesh.quads.size();
-            entry.baseInstance = totalInstances;
-            totalInstances += entry.instanceCount;
+            // Thread-safe atomic mesh access - no mutex needed!
+            auto mesh = entry.chunk->getRenderMesh();
+            if (mesh) {
+                entry.instanceCount = mesh->quads.size();
+                entry.baseInstance = totalInstances;
+                totalInstances += entry.instanceCount;
+            } else {
+                entry.instanceCount = 0;
+            }
         }
     }
     
@@ -569,8 +580,11 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
     
     for (const auto& entry : m_chunks) {
         if (entry.chunk && entry.instanceCount > 0) {
-            const auto& mesh = entry.chunk->getMesh();
-            mergedInstances.insert(mergedInstances.end(), mesh.quads.begin(), mesh.quads.end());
+            // Thread-safe atomic mesh access - no mutex needed!
+            auto mesh = entry.chunk->getRenderMesh();
+            if (mesh) {
+                mergedInstances.insert(mergedInstances.end(), mesh->quads.begin(), mesh->quads.end());
+            }
         }
     }
     

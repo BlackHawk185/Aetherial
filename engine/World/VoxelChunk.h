@@ -1,13 +1,13 @@
-// VoxelChunk.h - 16x16x16 dynamic physics-enabled voxel chunks with light mapping
+// VoxelChunk.h - Dynamic physics-enabled voxel chunks with light mapping
 #pragma once
 
 #include "../Math/Vec3.h"
 #include "BlockType.h"
+#include "ChunkConstants.h"
 #include <array>
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
-#include <mutex>
 #include <string>
 #include <memory>
 #include <atomic>
@@ -65,8 +65,8 @@ class IslandChunkSystem;  // Forward declaration
 class VoxelChunk
 {
    public:
-    static constexpr int SIZE = 128;  // 128x128x128 chunks for large islands
-    static constexpr int VOLUME = SIZE * SIZE * SIZE;
+    static constexpr int SIZE = ChunkConfig::CHUNK_SIZE;  // Use global chunk size
+    static constexpr int VOLUME = ChunkConfig::CHUNK_VOLUME;
     
     // Static island system pointer for inter-chunk queries (must be public for IslandChunkSystem to access)
     static IslandChunkSystem* s_islandSystem;
@@ -118,21 +118,19 @@ class VoxelChunk
         std::atomic_store(&collisionMesh, newMesh);
     }
     
-    // Mesh access for VBO rendering
-    VoxelMesh& getMesh() { return mesh; }
-    const VoxelMesh& getMesh() const { return mesh; }
-    std::mutex& getMeshMutex() const { return meshMutex; }
+    // Mesh access for VBO rendering - thread-safe atomic access (no mutex needed!)
+    std::shared_ptr<const VoxelMesh> getRenderMesh() const
+    {
+        return std::atomic_load(&renderMesh);
+    }
+    
+    void setRenderMesh(std::shared_ptr<VoxelMesh> newMesh)
+    {
+        std::atomic_store(&renderMesh, newMesh);
+    }
 
     // Decorative/model instance positions (generic per block type)
     const std::vector<Vec3>& getModelInstances(uint8_t blockID) const;
-    void addModelInstance(uint8_t blockID, const Vec3& position);
-    void clearModelInstances(uint8_t blockID);
-    void clearAllModelInstances();
-    
-    // NEW: Lighting dirty state management
-    bool needsLightingUpdate() const { return lightingDirty; }
-    void markLightingDirty() { lightingDirty = true; }
-    void markLightingClean() { lightingDirty = false; }
     
     void buildCollisionMesh();
     bool checkRayCollision(const Vec3& rayOrigin, const Vec3& rayDirection, float maxDistance,
@@ -145,11 +143,9 @@ class VoxelChunk
 
    private:
     std::array<uint8_t, VOLUME> voxels;
-    VoxelMesh mesh;
-    mutable std::mutex meshMutex;
+    std::shared_ptr<VoxelMesh> renderMesh;  // Thread-safe atomic access - no mutex needed!
     std::shared_ptr<CollisionMesh> collisionMesh;  // Thread-safe atomic access via getCollisionMesh/setCollisionMesh
     bool meshDirty = true;
-    bool lightingDirty = true;  // NEW: Lighting needs recalculation
     
     // Island context for inter-chunk culling
     uint32_t m_islandID = 0;
@@ -160,10 +156,7 @@ class VoxelChunk
     std::unordered_map<uint8_t, std::vector<Vec3>> m_modelInstances;
 
     // Greedy meshing helpers
-    void addGreedyQuad(float x, float y, float z, int face, int width, int height, uint8_t blockType);
-    
-    // Collision mesh building
-    void buildCollisionMeshFromVertices();
+    void addGreedyQuadTo(std::vector<QuadFace>& quads, float x, float y, float z, int face, int width, int height, uint8_t blockType);
     
     bool isVoxelSolid(int x, int y, int z) const;
     
@@ -171,12 +164,6 @@ class VoxelChunk
     bool isFaceExposed(int x, int y, int z, int face) const;
     
     // Simple meshing implementation
-    void generateSimpleMesh();
-    
-    // Light mapping utilities
-    float computeAmbientOcclusion(int x, int y, int z, int face) const;
-    void generatePerFaceLightMaps();  // Generate separate light map per face direction
-    bool performSunRaycast(const Vec3& rayStart, const Vec3& sunDirection, float maxDistance) const;  // Raycast for occlusion
-    bool performLocalSunRaycast(const Vec3& rayStart, const Vec3& sunDirection, float maxDistance) const;  // Local chunk raycast for floating islands
-    bool performInterIslandSunRaycast(const Vec3& rayStart, const Vec3& sunDirection, float maxDistance) const;  // Inter-island raycast for lighting
+    void generateSimpleMeshInto(std::vector<QuadFace>& quads);
 };
+
