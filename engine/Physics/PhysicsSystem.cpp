@@ -7,6 +7,7 @@
 #include "../World/IslandChunkSystem.h"
 #include "../World/VoxelChunk.h"
 #include "../World/BlockType.h"  // For BlockTypeRegistry and BlockTypeInfo
+#include "../World/VoxelRaycaster.h"  // For DDA-based ground detection
 #include "../Profiling/Profiler.h"
 
 PhysicsSystem g_physics;
@@ -251,25 +252,28 @@ bool PhysicsSystem::checkChunkCapsuleCollision(const VoxelChunk* chunk, const Ve
             Vec3 projectedPoint = closestPointOnAxis - face.normal * distToPlane;
             Vec3 localPoint = projectedPoint - face.position;
             
-            // Check if projected point overlaps with 1x1 face bounds
+            // Check if projected point overlaps with face bounds (using greedy merged dimensions)
+            float halfWidth = face.width * 0.5f;
+            float halfHeight = face.height * 0.5f;
+            
             bool withinBounds = true;
             if (abs(face.normal.x) > 0.5f)
             {
-                // X-facing face - check YZ circle overlap
-                withinBounds = (abs(localPoint.y) <= (0.5f + radius)) && 
-                              (abs(localPoint.z) <= (0.5f + radius));
+                // X-facing face - check YZ bounds (width=Z, height=Y)
+                withinBounds = (abs(localPoint.y) <= (halfHeight + radius)) && 
+                              (abs(localPoint.z) <= (halfWidth + radius));
             }
             else if (abs(face.normal.z) > 0.5f)
             {
-                // Z-facing face - check XY circle overlap
-                withinBounds = (abs(localPoint.x) <= (0.5f + radius)) && 
-                              (abs(localPoint.y) <= (0.5f + radius));
+                // Z-facing face - check XY bounds (width=X, height=Y)
+                withinBounds = (abs(localPoint.x) <= (halfWidth + radius)) && 
+                              (abs(localPoint.y) <= (halfHeight + radius));
             }
             else
             {
-                // Y-facing face - check XZ circle overlap
-                withinBounds = (abs(localPoint.x) <= (0.5f + radius)) && 
-                              (abs(localPoint.z) <= (0.5f + radius));
+                // Y-facing face - check XZ bounds (width=X, height=Z)
+                withinBounds = (abs(localPoint.x) <= (halfWidth + radius)) && 
+                              (abs(localPoint.z) <= (halfHeight + radius));
             }
             
             if (withinBounds)
@@ -357,97 +361,36 @@ GroundInfo PhysicsSystem::detectGroundCapsule(const Vec3& capsuleCenter, float r
     if (!m_islandSystem)
         return info;
     
-    // Raycast from bottom of capsule downward
-    // Bottom of capsule is at: capsuleCenter.y - (height/2 - radius)
+    // Raycast from bottom of capsule downward using DDA
     float cylinderHalfHeight = (height - 2.0f * radius) * 0.5f;
     float bottomY = capsuleCenter.y - cylinderHalfHeight - radius;
     
-    Vec3 rayOrigin = Vec3(capsuleCenter.x, bottomY, capsuleCenter.z);
+    // Start ray from well above feet to ensure we detect ground reliably
+    Vec3 rayOrigin = Vec3(capsuleCenter.x, bottomY + 0.5f, capsuleCenter.z);
     Vec3 rayDirection = Vec3(0, -1, 0);
-    float rayLength = rayMargin;
     
-    // Check all islands
-    const auto& islands = m_islandSystem->getIslands();
+    // More generous detection range
+    float generousMargin = rayMargin + 1.0f;
     
-    for (const auto& islandPair : islands)
+    // Use VoxelRaycaster DDA for accurate ground detection (same as block breaking)
+    RayHit hit = VoxelRaycaster::raycast(rayOrigin, rayDirection, generousMargin, m_islandSystem);
+    
+    if (hit.hit && hit.distance <= generousMargin)
     {
-        const FloatingIsland* island = &islandPair.second;
-        if (!island)
-            continue;
-        
-        // Transform world-space ray to island-local space (accounts for rotation!)
-        Vec3 localRayOrigin = island->worldToLocal(rayOrigin);
-        Vec3 localRayDirection = island->worldDirToLocal(rayDirection);
-        
-        // Calculate which chunks to check
-        float checkRadius = radius + VoxelChunk::SIZE;
-        int minChunkX = static_cast<int>(std::floor((localRayOrigin.x - checkRadius) / VoxelChunk::SIZE));
-        int maxChunkX = static_cast<int>(std::ceil((localRayOrigin.x + checkRadius) / VoxelChunk::SIZE));
-        int minChunkY = static_cast<int>(std::floor((localRayOrigin.y - rayLength) / VoxelChunk::SIZE));
-        int maxChunkY = static_cast<int>(std::ceil(localRayOrigin.y / VoxelChunk::SIZE));
-        int minChunkZ = static_cast<int>(std::floor((localRayOrigin.z - checkRadius) / VoxelChunk::SIZE));
-        int maxChunkZ = static_cast<int>(std::ceil((localRayOrigin.z + checkRadius) / VoxelChunk::SIZE));
-        
-        for (int chunkX = minChunkX; chunkX <= maxChunkX; ++chunkX)
+        // Get the island we hit
+        FloatingIsland* island = m_islandSystem->getIsland(hit.islandID);
+        if (island)
         {
-            for (int chunkY = minChunkY; chunkY <= maxChunkY; ++chunkY)
-            {
-                for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ)
-                {
-                    Vec3 chunkCoord(chunkX, chunkY, chunkZ);
-                    auto chunkIt = island->chunks.find(chunkCoord);
-                    if (chunkIt == island->chunks.end() || !chunkIt->second)
-                        continue;
-                    
-                    // Calculate chunk position in island-local space
-                    Vec3 chunkLocalOffset = FloatingIsland::chunkCoordToWorldPos(chunkCoord);
-                    Vec3 rayInChunkLocal = localRayOrigin - chunkLocalOffset;
-                    
-                    // Get collision mesh (thread-safe atomic load)
-                    auto collisionMesh = chunkIt->second->getCollisionMesh();
-                    if (!collisionMesh)
-                        continue;
-                    
-                    // Check each face for ground intersection
-                    for (const auto& face : collisionMesh->faces)
-                    {
-                        // Only check upward-facing surfaces (ground)
-                        if (face.normal.y < 0.7f)
-                            continue;
-                        
-                        // Ray-plane intersection (using local ray direction)
-                        float denom = localRayDirection.dot(face.normal);
-                        if (abs(denom) < 0.0001f)
-                            continue;
-                        
-                        Vec3 planeToRay = face.position - rayInChunkLocal;
-                        float t = planeToRay.dot(face.normal) / denom;
-                        
-                        if (t < 0 || t > rayLength)
-                            continue;
-                        
-                        Vec3 hitPoint = rayInChunkLocal + localRayDirection * t;
-                        Vec3 localPoint = hitPoint - face.position;
-                        
-                        // Check if hit point is within face bounds (1x1 square)
-                        if (abs(localPoint.x) <= (0.5f + radius) && 
-                            abs(localPoint.z) <= (0.5f + radius))
-                        {
-                            info.isGrounded = true;
-                            info.standingOnIslandID = island->islandID;
-                            info.groundNormal = face.normal;
-                            info.groundVelocity = island->velocity;
-                            
-                            // Transform hit point from chunk-local to world space
-                            Vec3 hitPointIslandLocal = hitPoint + chunkLocalOffset;
-                            info.groundContactPoint = island->localToWorld(hitPointIslandLocal);
-                            info.distanceToGround = t;
-                            
-                            return info;  // Return first hit
-                        }
-                    }
-                }
-            }
+            info.isGrounded = true;
+            info.standingOnIslandID = hit.islandID;
+            info.groundNormal = hit.normal;
+            info.groundVelocity = island->velocity;
+            info.distanceToGround = hit.distance;
+            
+            // Calculate world-space contact point
+            // Hit returns island-local block position, convert to world
+            Vec3 hitPointLocal = hit.localBlockPos + Vec3(0.5f, 0.5f, 0.5f); // Center of block
+            info.groundContactPoint = island->localToWorld(hitPointLocal);
         }
     }
     

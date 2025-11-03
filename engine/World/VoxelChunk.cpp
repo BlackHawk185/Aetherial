@@ -28,10 +28,6 @@ VoxelChunk::VoxelChunk()
     // Initialize collision mesh with empty shared_ptr
     collisionMesh = std::make_shared<CollisionMesh>();
     
-    // Initialize VBO handles
-    mesh.VAO = 0;
-    mesh.VBO = 0;
-    mesh.EBO = 0;
     mesh.needsUpdate = true;
     
     // Initialize light maps
@@ -82,30 +78,6 @@ void VoxelChunk::setIslandContext(uint32_t islandID, const Vec3& chunkCoord)
     m_chunkCoord = chunkCoord;
 }
 
-void VoxelChunk::addCollisionQuad(float x, float y, float z, int face)
-{
-    // Each face is a quad (4 vertices)
-    // STANDARD face ordering: 0=-Y(bottom), 1=+Y(top), 2=-Z(back), 3=+Z(front), 4=-X(left), 5=+X(right)
-    static const Vec3 quadVertices[6][4] = {
-        // -Y (bottom)
-        {Vec3(0, 0, 0), Vec3(1, 0, 0), Vec3(1, 0, 1), Vec3(0, 0, 1)},
-        // +Y (top)
-        {Vec3(0, 1, 0), Vec3(0, 1, 1), Vec3(1, 1, 1), Vec3(1, 1, 0)},
-        // -Z (back)
-        {Vec3(0, 0, 0), Vec3(0, 1, 0), Vec3(1, 1, 0), Vec3(1, 0, 0)},
-        // +Z (front)
-        {Vec3(0, 0, 1), Vec3(1, 0, 1), Vec3(1, 1, 1), Vec3(0, 1, 1)},
-        // -X (left)
-        {Vec3(0, 0, 0), Vec3(0, 0, 1), Vec3(0, 1, 1), Vec3(0, 1, 0)},
-        // +X (right)
-        {Vec3(1, 0, 0), Vec3(1, 1, 0), Vec3(1, 1, 1), Vec3(1, 0, 1)}};
-
-    for (int i = 0; i < 4; ++i)
-    {
-        collisionMeshVertices.push_back(Vec3(x, y, z) + quadVertices[face][i]);
-    }
-}
-
 bool VoxelChunk::isVoxelSolid(int x, int y, int z) const
 {
     uint8_t blockID = getVoxel(x, y, z);
@@ -121,102 +93,6 @@ bool VoxelChunk::isVoxelSolid(int x, int y, int z) const
     return true;
 }
 
-void VoxelChunk::addQuadWithSharing(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
-                                    std::unordered_map<Vertex, uint32_t>& vertexCache,
-                                    float x, float y, float z, int face, uint8_t blockType)
-{
-    // STANDARD face ordering: 0=-Y(bottom), 1=+Y(top), 2=-Z(back), 3=+Z(front), 4=-X(left), 5=+X(right)
-    static const Vec3 quadVertices[6][4] = {
-        // -Y (bottom)
-        {Vec3(0, 0, 0), Vec3(1, 0, 0), Vec3(1, 0, 1), Vec3(0, 0, 1)},
-        // +Y (top)
-        {Vec3(0, 1, 0), Vec3(0, 1, 1), Vec3(1, 1, 1), Vec3(1, 1, 0)},
-        // -Z (back)
-        {Vec3(0, 0, 0), Vec3(0, 1, 0), Vec3(1, 1, 0), Vec3(1, 0, 0)},
-        // +Z (front)
-        {Vec3(0, 0, 1), Vec3(1, 0, 1), Vec3(1, 1, 1), Vec3(0, 1, 1)},
-        // -X (left)
-        {Vec3(0, 0, 0), Vec3(0, 0, 1), Vec3(0, 1, 1), Vec3(0, 1, 0)},
-        // +X (right)
-        {Vec3(1, 0, 0), Vec3(1, 1, 0), Vec3(1, 1, 1), Vec3(1, 0, 1)}};
-
-    // Normals for each face (MUST match order above)
-    static const Vec3 normals[6] = {
-        Vec3(0, -1, 0),  // -Y (bottom)
-        Vec3(0, 1, 0),   // +Y (top)
-        Vec3(0, 0, -1),  // -Z (back)
-        Vec3(0, 0, 1),   // +Z (front)
-        Vec3(-1, 0, 0),  // -X (left)
-        Vec3(1, 0, 0)    // +X (right)
-    };
-
-    // Texture coordinates for each vertex of the quad
-    static const float texCoords[4][2] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
-
-    // Array to store indices for this quad's 4 vertices
-    uint32_t quadIndices[4];
-
-    // Add 4 vertices for this quad (with deduplication)
-    for (int i = 0; i < 4; ++i)
-    {
-        Vertex v;
-        Vec3 pos = Vec3(x, y, z) + quadVertices[face][i];
-        v.x = pos.x;
-        v.y = pos.y;
-        v.z = pos.z;
-        v.nx = normals[face].x;
-        v.ny = normals[face].y;
-        v.nz = normals[face].z;
-        v.u = texCoords[i][0];
-        v.v = texCoords[i][1];
-        
-        // Light mapping
-        switch (face)
-        {
-            case 0: case 1: // +Z/-Z faces: use X,Y
-                v.lu = (pos.x) / SIZE;
-                v.lv = (pos.y) / SIZE;
-                break;
-            case 2: case 3: // +Y/-Y faces: use X,Z
-                v.lu = (pos.x) / SIZE;
-                v.lv = (pos.z) / SIZE;
-                break;
-            case 4: case 5: // +X/-X faces: use Z,Y
-                v.lu = (pos.z) / SIZE;
-                v.lv = (pos.y) / SIZE;
-                break;
-        }
-        
-        v.ao = computeAmbientOcclusion(static_cast<int>(pos.x), static_cast<int>(pos.y), static_cast<int>(pos.z), face);
-        v.faceIndex = static_cast<float>(face);
-        v.blockType = static_cast<float>(blockType);  // ✅ FIX: Actually set the block type!
-        
-        // Check if this vertex already exists in the cache
-        auto it = vertexCache.find(v);
-        if (it != vertexCache.end())
-        {
-            // Reuse existing vertex
-            quadIndices[i] = it->second;
-        }
-        else
-        {
-            // Add new vertex
-            uint32_t newIndex = static_cast<uint32_t>(vertices.size());
-            vertices.push_back(v);
-            vertexCache[v] = newIndex;
-            quadIndices[i] = newIndex;
-        }
-    }
-
-    // Add 6 indices for two triangles (quad)
-    indices.push_back(quadIndices[0]);
-    indices.push_back(quadIndices[1]);
-    indices.push_back(quadIndices[2]);
-    indices.push_back(quadIndices[0]);
-    indices.push_back(quadIndices[2]);
-    indices.push_back(quadIndices[3]);
-}
-
 void VoxelChunk::generateMesh(bool generateLighting)
 {
     PROFILE_SCOPE("VoxelChunk::generateMesh");
@@ -225,9 +101,7 @@ void VoxelChunk::generateMesh(bool generateLighting)
     (void)startTime; // Reserved for future timing metrics
     
     std::lock_guard<std::mutex> lock(meshMutex);
-    mesh.vertices.clear();
-    mesh.indices.clear();
-    collisionMeshVertices.clear();
+    mesh.quads.clear();
     clearAllModelInstances();  // Clear all model instances before scanning
 
     auto grassScanStart = std::chrono::high_resolution_clock::now();
@@ -302,30 +176,17 @@ void VoxelChunk::generateMesh(bool generateLighting)
 
 void VoxelChunk::buildCollisionMeshFromVertices()
 {
-    // Build collision mesh in a local variable, then atomically swap it in
+    // Build collision mesh directly from quadFaces (no need for separate storage)
     auto newMesh = std::make_shared<CollisionMesh>();
 
-    // Build collision faces from collisionMeshVertices
-    // Each quad (4 vertices) becomes one collision face
-    for (size_t i = 0; i < collisionMeshVertices.size(); i += 4)
+    for (const auto& quad : mesh.quads)
     {
-        if (i + 3 >= collisionMeshVertices.size())
-            break;
-
-        // Calculate face center and normal from the quad vertices
-        Vec3 v0 = collisionMeshVertices[i];
-        Vec3 v1 = collisionMeshVertices[i + 1];
-        Vec3 v2 = collisionMeshVertices[i + 2];
-
-        // Face center is average of vertices
-        Vec3 faceCenter = (v0 + v1 + v2 + collisionMeshVertices[i + 3]) * 0.25f;
-
-        // Face normal from cross product of edges
-        Vec3 edge1 = v1 - v0;
-        Vec3 edge2 = v2 - v0;
-        Vec3 normal = edge1.cross(edge2).normalized();
-
-        newMesh->faces.push_back({faceCenter, normal});
+        newMesh->faces.push_back({
+            quad.position,
+            quad.normal,
+            quad.width,
+            quad.height
+        });
     }
     
     // Atomically update the collision mesh - safe for concurrent reads
@@ -334,7 +195,7 @@ void VoxelChunk::buildCollisionMeshFromVertices()
 
 void VoxelChunk::buildCollisionMesh()
 {
-    // Legacy method - now just calls the new implementation
+    // Wrapper for backwards compatibility (called by ConnectivityTest)
     std::lock_guard<std::mutex> lock(meshMutex);
     buildCollisionMeshFromVertices();
 }
@@ -543,14 +404,15 @@ void VoxelChunk::generatePerFaceLightMaps()
     const float sunIntensity = 1.2f;
     const float ambientIntensity = 0.0f;  // DISABLED for lightmap testing - was 0.2f
     
-    // Face normals and face offset directions: 0=+Z, 1=-Z, 2=+Y, 3=-Y, 4=+X, 5=-X
+    // Face normals - MUST match addGreedyQuad face ordering
+    // 0=-Y (bottom), 1=+Y (top), 2=-Z (back), 3=+Z (front), 4=-X (left), 5=+X (right)
     Vec3 faceNormals[6] = {
-        Vec3(0, 0, 1),   // +Z (Forward)
-        Vec3(0, 0, -1),  // -Z (Back)
-        Vec3(0, 1, 0),   // +Y (Up) 
-        Vec3(0, -1, 0),  // -Y (Down)
-        Vec3(1, 0, 0),   // +X (Right)
-        Vec3(-1, 0, 0)   // -X (Left)
+        Vec3(0, -1, 0),  // 0: -Y (bottom)
+        Vec3(0, 1, 0),   // 1: +Y (top)
+        Vec3(0, 0, -1),  // 2: -Z (back)
+        Vec3(0, 0, 1),   // 3: +Z (front)
+        Vec3(-1, 0, 0),  // 4: -X (left)
+        Vec3(1, 0, 0)    // 5: +X (right)
     };
     
     // Generate a light map for each face direction
@@ -571,33 +433,13 @@ void VoxelChunk::generatePerFaceLightMaps()
                 // Calculate ray start position (slightly offset from surface in face normal direction)
                 Vec3 rayStart = worldPos + faceNormal * 0.1f;
                 
-                // Use full inter-chunk/inter-island raycasting for proper lighting
+                // Use full inter-chunk/inter-island raycasting for shadow occlusion
                 // This will check occlusion across chunk boundaries and between islands
                 bool isOccluded = performSunRaycast(rayStart, sunDirection, SIZE * 3.0f);  // Extended range for inter-chunk
                 
-                // Calculate base lighting from face orientation
-                Vec3 negSunDirection = Vec3(-sunDirection.x, -sunDirection.y, -sunDirection.z);
-                float dotProduct = faceNormal.dot(negSunDirection);  // Negative sun direction to get proper lighting
-                
-                float finalLight;
-                if (dotProduct > 0.0f) {
-                    // Surface faces toward sun - check full occlusion including other islands
-                    float directionalLight = dotProduct * sunIntensity;
-                    if (isOccluded) {
-                        // Occluded by another voxel (local or remote) - reduced lighting
-                        finalLight = ambientIntensity + directionalLight * 0.1f;  // More dramatic shadow
-                    } else {
-                        // Clear path to sun - full directional lighting
-                        finalLight = ambientIntensity + directionalLight;
-                    }
-                } else {
-                    // Surface faces away from sun - just ambient
-                    finalLight = ambientIntensity;
-                }
-                
-                // Add some variation based on texel position for visual interest
-                float variation = (sin(normalizedU * 3.14159f * 2.0f) * cos(normalizedV * 3.14159f * 2.0f)) * 0.03f;
-                finalLight += variation;
+                // Pure shadow map: 1.0 = lit (not occluded), 0.0 = shadowed (occluded)
+                // No directional/lambert lighting - just binary shadow occlusion
+                float finalLight = isOccluded ? 0.0f : 1.0f;
                 
                 // Store in light map (clamp to valid range)
                 int index = (v * LIGHTMAP_SIZE + u) * 3;
@@ -783,6 +625,16 @@ void VoxelChunk::updateLightMapTextures()
     for (int faceIndex = 0; faceIndex < 6; ++faceIndex) {
         FaceLightMap& faceMap = lightMaps.getFaceMap(faceIndex);
         
+        // Check if lightmap data exists and is the correct size
+        size_t expectedSize = FaceLightMap::LIGHTMAP_SIZE * FaceLightMap::LIGHTMAP_SIZE * 3;
+        if (faceMap.data.empty() || faceMap.data.size() != expectedSize)
+        {
+            std::cerr << "⚠️  Face " << faceIndex << " lightmap data invalid! Size: " 
+                      << faceMap.data.size() << " (expected " << expectedSize << ")" << std::endl;
+            // Initialize with default white lighting if missing
+            faceMap.data.resize(expectedSize, 255);
+        }
+        
         // Generate OpenGL texture if it doesn't exist
         if (faceMap.textureHandle == 0)
         {
@@ -799,7 +651,28 @@ void VoxelChunk::updateLightMapTextures()
         
         // Upload light map data to GPU
         glBindTexture(GL_TEXTURE_2D, faceMap.textureHandle);
+        
+        // Clear any previous errors
+        while (glGetError() != GL_NO_ERROR);
+        
+        // Validate data before upload
+        if (faceMap.data.empty() || faceMap.data.data() == nullptr)
+        {
+            std::cerr << "❌ Face " << faceIndex << " has null/empty data!" << std::endl;
+            continue;
+        }
+        
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, FaceLightMap::LIGHTMAP_SIZE, FaceLightMap::LIGHTMAP_SIZE, 0, GL_RGB, GL_UNSIGNED_BYTE, faceMap.data.data());
+        
+        GLenum uploadError = glGetError();
+        if (uploadError != GL_NO_ERROR)
+        {
+            std::cerr << "❌ glTexImage2D failed for face " << faceIndex 
+                      << " error: " << uploadError 
+                      << " size: " << FaceLightMap::LIGHTMAP_SIZE 
+                      << " data size: " << faceMap.data.size() << std::endl;
+            continue;
+        }
         
         // Set texture parameters for light maps
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -892,46 +765,135 @@ bool VoxelChunk::isFaceExposed(int x, int y, int z, int face) const
 }
 
 // ========================================
-// SIMPLE MESH GENERATION - NO GREEDY MESHING
+// GREEDY MESHING IMPLEMENTATION
 // ========================================
+// Merges adjacent quads of the same block type into larger rectangles
+// Reduces vertex count by 70-90% compared to simple meshing
 
 void VoxelChunk::generateSimpleMesh()
 {
     PROFILE_SCOPE("VoxelChunk::generateSimpleMesh");
     
-    // Vertex deduplication cache
-    std::unordered_map<Vertex, uint32_t> vertexCache;
-    
-    // Iterate through all voxels and generate faces for each direction
-    for (int z = 0; z < SIZE; ++z)
+    // For each of the 6 face directions, perform greedy meshing
+    for (int faceDir = 0; faceDir < 6; ++faceDir)
     {
-        for (int y = 0; y < SIZE; ++y)
+        // Determine the axes based on face direction
+        // Face 0=-Y, 1=+Y, 2=-Z, 3=+Z, 4=-X, 5=+X
+        int du, dv, dn;  // Axis indices: u = width, v = height, n = depth (normal direction)
+        int nu, nv, nn;  // Dimensions along each axis
+        
+        switch (faceDir)
         {
-            for (int x = 0; x < SIZE; ++x)
+            case 0: case 1: // Y faces (top/bottom)
+                du = 0; dv = 2; dn = 1;  // u=X, v=Z, n=Y
+                nu = SIZE; nv = SIZE; nn = SIZE;
+                break;
+            case 2: case 3: // Z faces (front/back)
+                du = 0; dv = 1; dn = 2;  // u=X, v=Y, n=Z
+                nu = SIZE; nv = SIZE; nn = SIZE;
+                break;
+            case 4: case 5: // X faces (left/right)
+                du = 2; dv = 1; dn = 0;  // u=Z, v=Y, n=X
+                nu = SIZE; nv = SIZE; nn = SIZE;
+                break;
+            default:
+                continue;
+        }
+        
+        // For each slice perpendicular to the normal direction
+        for (int n = 0; n < nn; ++n)
+        {
+            // Build a mask for this slice
+            // mask[u + v * nu] = blockID if face should be generated, 0 otherwise
+            std::vector<uint8_t> mask(nu * nv, 0);
+            
+            for (int v = 0; v < nv; ++v)
             {
-                // Skip air and OBJ-type blocks
-                if (!isVoxelSolid(x, y, z))
-                    continue;
-                
-                uint8_t blockType = getVoxel(x, y, z);
-                
-                // Generate ONLY exposed faces (unified culling!)
-                for (int face = 0; face < 6; ++face)
+                for (int u = 0; u < nu; ++u)
                 {
-                    // ✅ UNIFIED CULLING - works for intra-chunk AND inter-chunk
-                    if (!isFaceExposed(x, y, z, face))
-                        continue;  // Skip hidden faces
+                    // Convert (u, v, n) to (x, y, z)
+                    int x = 0, y = 0, z = 0;
+                    if (faceDir == 0 || faceDir == 1) {      // Y faces
+                        x = u; z = v; y = n;
+                    } else if (faceDir == 2 || faceDir == 3) { // Z faces
+                        x = u; y = v; z = n;
+                    } else {                                  // X faces
+                        z = u; y = v; x = n;
+                    }
                     
-                    addQuadWithSharing(mesh.vertices, mesh.indices, vertexCache,
-                           static_cast<float>(x), 
-                           static_cast<float>(y), 
-                           static_cast<float>(z), 
-                           face, blockType);
+                    // Check if voxel is solid and face is exposed
+                    if (isVoxelSolid(x, y, z) && isFaceExposed(x, y, z, faceDir))
+                    {
+                        mask[u + v * nu] = getVoxel(x, y, z);
+                    }
+                }
+            }
+            
+            // Greedy meshing: merge adjacent quads into rectangles
+            for (int v = 0; v < nv; ++v)
+            {
+                for (int u = 0; u < nu; )
+                {
+                    uint8_t blockType = mask[u + v * nu];
+                    if (blockType == 0)
+                    {
+                        ++u;
+                        continue;
+                    }
                     
-                    addCollisionQuad(static_cast<float>(x), 
-                                   static_cast<float>(y), 
-                                   static_cast<float>(z), 
-                                   face);
+                    // Find the width (u direction) of this quad
+                    int width = 1;
+                    while (u + width < nu && mask[u + width + v * nu] == blockType)
+                    {
+                        ++width;
+                    }
+                    
+                    // Find the height (v direction) of this quad
+                    int height = 1;
+                    bool done = false;
+                    while (v + height < nv && !done)
+                    {
+                        // Check if the entire row matches
+                        for (int k = 0; k < width; ++k)
+                        {
+                            if (mask[u + k + (v + height) * nu] != blockType)
+                            {
+                                done = true;
+                                break;
+                            }
+                        }
+                        if (!done)
+                        {
+                            ++height;
+                        }
+                    }
+                    
+                    // Create a merged quad at (u, v) with dimensions (width x height)
+                    // Convert back to (x, y, z) coordinates
+                    int x = 0, y = 0, z = 0;
+                    if (faceDir == 0 || faceDir == 1) {      // Y faces
+                        x = u; z = v; y = n;
+                    } else if (faceDir == 2 || faceDir == 3) { // Z faces
+                        x = u; y = v; z = n;
+                    } else {                                  // X faces
+                        z = u; y = v; x = n;
+                    }
+                    
+                    // Add the greedy quad (used for both rendering and collision)
+                    addGreedyQuad(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z),
+                                  faceDir, width, height, blockType);
+                    
+                    // Clear the mask for the merged area
+                    for (int h = 0; h < height; ++h)
+                    {
+                        for (int w = 0; w < width; ++w)
+                        {
+                            mask[u + w + (v + h) * nu] = 0;
+                        }
+                    }
+                    
+                    // Move to the next unprocessed position
+                    u += width;
                 }
             }
         }
@@ -963,4 +925,96 @@ void VoxelChunk::clearModelInstances(uint8_t blockID)
 void VoxelChunk::clearAllModelInstances()
 {
     m_modelInstances.clear();
+}
+
+// Greedy quad generation for merged rectangles
+void VoxelChunk::addGreedyQuad(float x, float y, float z, int face, int width, int height, uint8_t blockType)
+{
+    // Quad vertices based on face direction
+    // Face ordering: 0=-Y, 1=+Y, 2=-Z, 3=+Z, 4=-X, 5=+X
+    
+    static const Vec3 normals[6] = {
+        Vec3(0, -1, 0),  // -Y (bottom)
+        Vec3(0, 1, 0),   // +Y (top)
+        Vec3(0, 0, -1),  // -Z (back)
+        Vec3(0, 0, 1),   // +Z (front)
+        Vec3(-1, 0, 0),  // -X (left)
+        Vec3(1, 0, 0)    // +X (right)
+    };
+    
+    Vec3 normal = normals[face];
+    float w = static_cast<float>(width);
+    float h = static_cast<float>(height);
+    
+    // Add to QuadFace array for instanced rendering
+    QuadFace quadFace;
+    
+    // Calculate center position based on face direction
+    switch (face)
+    {
+        case 0: // -Y (bottom)
+            quadFace.position = Vec3(x + w * 0.5f, y, z + h * 0.5f);
+            break;
+        case 1: // +Y (top)
+            quadFace.position = Vec3(x + w * 0.5f, y + 1, z + h * 0.5f);
+            break;
+        case 2: // -Z (back)
+            quadFace.position = Vec3(x + w * 0.5f, y + h * 0.5f, z);
+            break;
+        case 3: // +Z (front)
+            quadFace.position = Vec3(x + w * 0.5f, y + h * 0.5f, z + 1);
+            break;
+        case 4: // -X (left)
+            quadFace.position = Vec3(x, y + h * 0.5f, z + w * 0.5f);
+            break;
+        case 5: // +X (right)
+            quadFace.position = Vec3(x + 1, y + h * 0.5f, z + w * 0.5f);
+            break;
+    }
+    
+    quadFace.normal = normal;
+    quadFace.width = w;
+    quadFace.height = h;
+    
+    // Calculate lightmap UV coordinates based on quad position within chunk
+    // Lightmap is 32x32 covering the entire 16x16 chunk face
+    // Map quad center to lightmap space (0-1 range)
+    float lightmapU = 0.5f;
+    float lightmapV = 0.5f;
+    
+    switch (face)
+    {
+        case 0: // -Y (bottom) - map XZ to UV
+            lightmapU = (x + w * 0.5f) / SIZE;
+            lightmapV = (z + h * 0.5f) / SIZE;
+            break;
+        case 1: // +Y (top) - map XZ to UV
+            lightmapU = (x + w * 0.5f) / SIZE;
+            lightmapV = (z + h * 0.5f) / SIZE;
+            break;
+        case 2: // -Z (back) - map XY to UV
+            lightmapU = (x + w * 0.5f) / SIZE;
+            lightmapV = (y + h * 0.5f) / SIZE;
+            break;
+        case 3: // +Z (front) - map XY to UV
+            lightmapU = (x + w * 0.5f) / SIZE;
+            lightmapV = (y + h * 0.5f) / SIZE;
+            break;
+        case 4: // -X (left) - map ZY to UV
+            lightmapU = (z + w * 0.5f) / SIZE;
+            lightmapV = (y + h * 0.5f) / SIZE;
+            break;
+        case 5: // +X (right) - map ZY to UV
+            lightmapU = (z + w * 0.5f) / SIZE;
+            lightmapV = (y + h * 0.5f) / SIZE;
+            break;
+    }
+    
+    quadFace.lightmapU = lightmapU;
+    quadFace.lightmapV = lightmapV;
+    quadFace.blockType = blockType;
+    quadFace.faceDir = static_cast<uint8_t>(face);
+    quadFace.padding = 0;
+    
+    mesh.quads.push_back(quadFace);
 }

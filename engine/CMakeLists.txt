@@ -20,10 +20,9 @@ add_library(engine STATIC
     
     # Rendering systems
     Rendering/Renderer.cpp
-    Rendering/MDIRenderer.cpp  # Multi-Draw Indirect renderer for massive batching
+    Rendering/InstancedQuadRenderer.cpp  # GPU instanced quad renderer with shared unit quad
     Rendering/TextureManager.cpp
     Rendering/ShaderManager.cpp
-    Rendering/SimpleShader.cpp
     Rendering/GlobalLightingManager.cpp
     Rendering/CascadedShadowMap.cpp
     Rendering/ModelInstanceRenderer.cpp

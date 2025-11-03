@@ -39,7 +39,6 @@ This file is for the AI assistant (GitHub Copilot) to reference when generating 
 
 ### Core Systems (Implemented)
 - **ECS Framework**: Entity-Component-System for game objects
-- **JobSystem**: Multi-threaded task processing with worker threads
 - **Custom Physics**: Voxel-face-based collision detection with dual-mesh generation
 - **Rendering**: OpenGL-based renderer with Dear ImGui dev tools
 - **Input**: Camera controls (WASD+mouse, space for jump)

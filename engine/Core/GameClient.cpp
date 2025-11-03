@@ -23,7 +23,7 @@
 #include "../UI/HUD.h"
 #include "../UI/PeriodicTableUI.h"  // NEW: Periodic table UI for hotbar binding
 #include "../Core/Window.h"
-#include "../Rendering/MDIRenderer.h"
+#include "../Rendering/InstancedQuadRenderer.h"
 #include "../Rendering/ModelInstanceRenderer.h"
 #include "../Rendering/TextureManager.h"
 #include "../Rendering/CascadedShadowMap.h"
@@ -267,11 +267,11 @@ void GameClient::shutdown()
     m_gameState = nullptr;
 
     // Cleanup renderers (unique_ptr handles deletion automatically)
-    if (g_mdiRenderer)
+    if (g_instancedQuadRenderer)
     {
-        g_mdiRenderer->shutdown();
-        g_mdiRenderer.reset();
-        std::cout << "MDI renderer shutdown" << std::endl;
+        g_instancedQuadRenderer->shutdown();
+        g_instancedQuadRenderer.reset();
+        std::cout << "InstancedQuadRenderer shutdown" << std::endl;
     }
 
     if (g_modelRenderer)
@@ -427,16 +427,21 @@ bool GameClient::initializeGraphics()
         g_textureManager = new TextureManager();
     }
     
-    // Initialize MDI renderer with fixed allocation (each chunk gets a fixed buffer slice)
-    g_mdiRenderer = std::make_unique<MDIRenderer>();
-    if (!g_mdiRenderer->initialize(32768))  // 32k chunks max with fixed allocation
+    // Initialize instanced quad renderer (99.4% memory reduction vs per-vertex approach)
+    g_instancedQuadRenderer = std::make_unique<InstancedQuadRenderer>();
+    if (!g_instancedQuadRenderer->initialize())
     {
-        std::cerr << "⚠️  Failed to initialize MDI renderer - falling back to per-chunk rendering" << std::endl;
-        g_mdiRenderer.reset();
+        std::cerr << "❌ Failed to initialize InstancedQuadRenderer!" << std::endl;
+        g_instancedQuadRenderer.reset();
+        return false;
     }
-    else
+    std::cout << "✅ InstancedQuadRenderer initialized - shared unit quad ready!" << std::endl;
+
+    // Initialize shadow map system (must happen before renderers that use it)
+    if (!g_shadowMap.initialize(16384, 2))
     {
-        std::cout << "✅ MDI Renderer initialized - ready for massive batching!" << std::endl;
+        std::cerr << "❌ Failed to initialize shadow map system!" << std::endl;
+        return false;
     }
 
     // Initialize model instancing renderer (decorative GLB like grass)
@@ -818,15 +823,7 @@ void GameClient::renderWorld()
         return;
     }
     
-    // Process pending mesh updates from game logic thread (MUST be on render thread for OpenGL)
-    if (g_mdiRenderer)
-    {
-        PROFILE_SCOPE("Process pending mesh updates");
-        g_mdiRenderer->processPendingUpdates();
-    }
-    
-    // Sync island physics to chunk transforms (UNIFIED: updates both MDI and GLB)
-    // This is the ONLY place where chunk transforms are calculated
+    // Sync island physics to chunk transforms (updates GLB instances)
     {
         PROFILE_SCOPE("syncPhysicsToChunks");
         m_gameState->getIslandSystem()->syncPhysicsToChunks();
@@ -844,31 +841,18 @@ void GameClient::renderWorld()
         renderShadowPass();
     }
 
-    // Render all islands with MDI (single draw call for all chunks)
+    // Render all islands with instanced quads (single shared mesh + per-instance data)
     {
-        PROFILE_SCOPE("MDI_renderAll");
+        PROFILE_SCOPE("InstancedQuad_renderAll");
         
-        if (!g_mdiRenderer)
+        if (!g_instancedQuadRenderer)
         {
-            std::cerr << "❌ MDI renderer not initialized! Cannot render world." << std::endl;
+            std::cerr << "❌ InstancedQuadRenderer not initialized! Cannot render world." << std::endl;
             return;
         }
         
-        // Render everything with single draw call!
-        g_mdiRenderer->renderAll(viewMatrix, projectionMatrix);
-        
-        // Print stats periodically
-        static auto lastPrint = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastPrint).count() >= 5)
-        {
-            auto stats = g_mdiRenderer->getStatistics();
-            std::cout << "📊 MDI: " << stats.activeChunks << " chunks, " 
-                      << (stats.totalVertices / 1000) << "k verts, " 
-                      << stats.drawCalls << " draw call(s), "
-                      << stats.lastFrameTimeMs << "ms" << std::endl;
-            lastPrint = now;
-        }
+        glm::mat4 viewProjection = projectionMatrix * viewMatrix;
+        g_instancedQuadRenderer->render(viewProjection, viewMatrix);
         
         // Render GLB model instances with batched rendering
         if (g_modelRenderer)
@@ -954,22 +938,26 @@ void GameClient::renderShadowPass()
         // Render shadow depth pass for this cascade
         if (m_windowWidth > 0 && m_windowHeight > 0)
         {
-            // MDI begins shadow pass (binds FBO for this cascade layer)
-            if (g_mdiRenderer) {
-                g_mdiRenderer->beginDepthPass(lightVP, cascadeIdx);
-                g_mdiRenderer->renderDepth();
+            // Begin shadow map rendering (clears depth buffer, sets up FBO)
+            g_shadowMap.begin(cascadeIdx);
+            
+            // Render voxels into shadow map (they cast shadows!)
+            if (g_instancedQuadRenderer)
+            {
+                g_instancedQuadRenderer->beginDepthPass(lightVP, cascadeIdx);
+                g_instancedQuadRenderer->renderDepth();
+                g_instancedQuadRenderer->endDepthPass(m_windowWidth, m_windowHeight);
             }
             
-            // GLB models render into same shadow map cascade
+            // Render GLB models into shadow map
             if (g_modelRenderer) {
-                g_modelRenderer->beginDepthPass(lightVP, cascadeIdx);  // Sets shader uniforms only
+                g_modelRenderer->beginDepthPass(lightVP, cascadeIdx);
                 g_modelRenderer->renderDepth();
+                g_modelRenderer->endDepthPass(m_windowWidth, m_windowHeight);
             }
             
-            // MDI ends shadow pass (unbinds FBO, restores viewport)
-            if (g_mdiRenderer) {
-                g_mdiRenderer->endDepthPass(m_windowWidth, m_windowHeight);
-            }
+            // End shadow map rendering (restores viewport/framebuffer)
+            g_shadowMap.end(m_windowWidth, m_windowHeight);
         }
     }
     
@@ -979,10 +967,6 @@ void GameClient::renderShadowPass()
     
     // Set lighting data for forward pass (use first cascade for now - will update shader to pick cascade)
     glm::vec3 lightDirVec(lightDir.x, lightDir.y, lightDir.z);
-    if (g_mdiRenderer)
-    {
-        g_mdiRenderer->setLightingData(g_shadowMap.getCascade(0).viewProj, lightDirVec);
-    }
     if (g_modelRenderer)
     {
         g_modelRenderer->setLightingData(g_shadowMap.getCascade(0).viewProj, lightDirVec);
@@ -1142,8 +1126,22 @@ void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& p
         {
             // Apply the voxel data directly - this replaces any procedural generation
             chunk->setRawVoxelData(voxelData, dataSize);
-            chunk->generateMesh();
-            chunk->buildCollisionMesh();
+            chunk->generateMesh();  // Already builds collision mesh internally
+            
+            // Register chunk with instanced renderer
+            if (g_instancedQuadRenderer)
+            {
+                Vec3 chunkLocalPos(
+                    originChunk.x * VoxelChunk::SIZE,
+                    originChunk.y * VoxelChunk::SIZE,
+                    originChunk.z * VoxelChunk::SIZE
+                );
+                
+                glm::mat4 chunkTransform = island->getTransformMatrix() * 
+                    glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
+                
+                g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+            }
         }
         else
         {
@@ -1202,8 +1200,7 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
     {
         // Apply the voxel data directly
         chunk->setRawVoxelData(voxelData, dataSize);
-        chunk->generateMesh();
-        chunk->buildCollisionMesh();
+        chunk->generateMesh();  // Already builds collision mesh internally
         
         // DEFERRED INTER-CHUNK CULLING: Regenerate all 6 neighbors
         // This allows them to cull faces that touch this new chunk
@@ -1223,8 +1220,20 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
             }
         }
         
-        // Don't register with MDI here - syncPhysicsToChunks() will handle it
-        // with authoritative transforms after EntityStateUpdate sets correct positions
+        // Register chunk with instanced renderer immediately
+        if (g_instancedQuadRenderer && island)
+        {
+            Vec3 chunkLocalPos(
+                chunkCoord.x * VoxelChunk::SIZE,
+                chunkCoord.y * VoxelChunk::SIZE,
+                chunkCoord.z * VoxelChunk::SIZE
+            );
+            
+            glm::mat4 chunkTransform = island->getTransformMatrix() * 
+                glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
+            
+            g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+        }
     }
     else
     {
@@ -1244,24 +1253,36 @@ void GameClient::handleVoxelChangeReceived(const VoxelChangeUpdate& update)
     // Apply the authoritative voxel change from server
     m_gameState->setVoxel(update.islandID, update.localPos, update.voxelType);
 
-    // Update MDI renderer (client-side only - server doesn't render)
-    if (g_mdiRenderer)
+    // Update instanced renderer (regenerate mesh for modified chunk)
+    if (g_instancedQuadRenderer)
     {
         auto* islandSystem = m_gameState->getIslandSystem();
         Vec3 chunkCoord = FloatingIsland::islandPosToChunkCoord(update.localPos);
         auto* chunk = islandSystem->getChunkFromIsland(update.islandID, chunkCoord);
-        auto* island = islandSystem->getIsland(update.islandID);
-        if (chunk && island)
+        if (chunk)
         {
-            if (chunk->getMDIIndex() < 0)
+            // Regenerate mesh for this chunk (already done by setVoxel->setVoxelInIsland->generateMesh)
+            // But we need to re-upload the mesh data to GPU
+            g_instancedQuadRenderer->rebuildChunk(chunk);
+            
+            // Also check if neighbor chunks need updating (for face culling)
+            for (int dx = -1; dx <= 1; dx++)
             {
-                // Chunk not yet registered - syncPhysicsToChunks() will handle registration
-                // with correct transform after EntityStateUpdate sets authoritative position
-            }
-            else
-            {
-                // Existing chunk - update mesh
-                g_mdiRenderer->queueChunkMeshUpdate(chunk->getMDIIndex(), chunk);
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    for (int dz = -1; dz <= 1; dz++)
+                    {
+                        if (dx == 0 && dy == 0 && dz == 0) continue;
+                        
+                        Vec3 neighborCoord(chunkCoord.x + dx, chunkCoord.y + dy, chunkCoord.z + dz);
+                        auto* neighbor = islandSystem->getChunkFromIsland(update.islandID, neighborCoord);
+                        if (neighbor)
+                        {
+                            neighbor->generateMesh(true);
+                            g_instancedQuadRenderer->rebuildChunk(neighbor);
+                        }
+                    }
+                }
             }
         }
     }

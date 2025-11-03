@@ -15,53 +15,28 @@
 // Forward declaration for OpenGL types
 using GLuint = uint32_t;
 
-struct Vertex
+// Unified quad/face representation (used for both render and collision)
+// Pack tightly to match GPU buffer layout
+#pragma pack(push, 1)
+struct QuadFace
 {
-    float x, y, z;     // Position
-    float nx, ny, nz;  // Normal
-    float u, v;        // Texture coordinates
-    float lu, lv;      // Light map coordinates
-    float ao;          // Ambient occlusion (0.0 = fully occluded, 1.0 = no occlusion)
-    float faceIndex;   // Face index (0-5) for selecting correct light map texture
-    float blockType;   // Block type ID for texture selection
-    
-    // Equality operator for vertex deduplication
-    bool operator==(const Vertex& other) const {
-        return x == other.x && y == other.y && z == other.z &&
-               nx == other.nx && ny == other.ny && nz == other.nz &&
-               u == other.u && v == other.v &&
-               lu == other.lu && lv == other.lv &&
-               ao == other.ao && faceIndex == other.faceIndex &&
-               blockType == other.blockType;
-    }
+    Vec3 position;   // Center position (12 bytes, offset 0)
+    Vec3 normal;     // Face normal (12 bytes, offset 12)
+    float width;     // Width of the quad (4 bytes, offset 24)
+    float height;    // Height of the quad (4 bytes, offset 28)
+    float lightmapU; // Lightmap U coordinate (4 bytes, offset 32)
+    float lightmapV; // Lightmap V coordinate (4 bytes, offset 36)
+    uint8_t blockType; // Block type (1 byte, offset 40)
+    uint8_t faceDir;   // Face direction 0-5 (1 byte, offset 41)
+    uint16_t padding;  // Padding (2 bytes, offset 42) - Total: 44 bytes
 };
-
-// Hash function for Vertex
-namespace std {
-    template<>
-    struct hash<Vertex> {
-        size_t operator()(const Vertex& v) const {
-            // Combine hashes of all fields
-            size_t h1 = hash<float>()(v.x);
-            size_t h2 = hash<float>()(v.y);
-            size_t h3 = hash<float>()(v.z);
-            size_t h4 = hash<float>()(v.nx);
-            size_t h5 = hash<float>()(v.ny);
-            size_t h6 = hash<float>()(v.nz);
-            size_t h7 = hash<float>()(v.u);
-            size_t h8 = hash<float>()(v.v);
-            // Combine using XOR and bit shifting
-            return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ 
-                   (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7);
-        }
-    };
-}
+#pragma pack(pop)
 
 struct VoxelMesh
 {
-    std::vector<Vertex> vertices;
-    std::vector<uint32_t> indices;
-    uint32_t VAO, VBO, EBO;  // OpenGL handles
+    // Quad-based mesh for instanced rendering
+    std::vector<QuadFace> quads;
+    GLuint instanceVBO = 0;  // Instance buffer for QuadFace data
     bool needsUpdate = true;
 };
 
@@ -105,6 +80,8 @@ struct CollisionFace
 {
     Vec3 position;  // Center position of the face
     Vec3 normal;    // Normal vector of the face
+    float width;    // Width of the face (for greedy merged quads)
+    float height;   // Height of the face (for greedy merged quads)
 };
 
 struct CollisionMesh
@@ -129,7 +106,8 @@ class VoxelChunk
     static constexpr int SIZE = 16;  // 16x16x16 chunks
     static constexpr int VOLUME = SIZE * SIZE * SIZE;
     
-    // Static island system pointer for inter-chunk queries
+    // Static island system pointer for inter-chunk queries (must be public for IslandChunkSystem to access)
+    static IslandChunkSystem* s_islandSystem;
     static void setIslandSystem(IslandChunkSystem* system) { s_islandSystem = system; }
 
     VoxelChunk();
@@ -189,9 +167,6 @@ class VoxelChunk
     void clearModelInstances(uint8_t blockID);
     void clearAllModelInstances();
     
-    // Legacy grass-specific accessor (for backwards compatibility during refactor)
-    const std::vector<Vec3>& getGrassInstancePositions() const { return getModelInstances(BlockID::DECOR_GRASS); }
-    
     // Light mapping access
     ChunkLightMaps& getLightMaps() { return lightMaps; }
     const ChunkLightMaps& getLightMaps() const { return lightMaps; }
@@ -205,15 +180,10 @@ class VoxelChunk
     void markLightingDirty() { lightingDirty = true; }
     void markLightingClean() { lightingDirty = false; }
     
-    // MDI renderer integration
-    int getMDIIndex() const { return mdiIndex; }
-    void setMDIIndex(int index) { mdiIndex = index; }
-    
     // Light mapping utilities - public for GlobalLightingManager
     Vec3 calculateWorldPositionFromLightMapUV(int faceIndex, float u, float v) const;  // Convert UV to world pos
     
     void buildCollisionMesh();
-    void buildCollisionMeshFromVertices();  // Internal method called during generateMesh()
     bool checkRayCollision(const Vec3& rayOrigin, const Vec3& rayDirection, float maxDistance,
                            Vec3& hitPoint, Vec3& hitNormal) const;
 
@@ -230,24 +200,21 @@ class VoxelChunk
     ChunkLightMaps lightMaps;  // NEW: Per-face light mapping data
     bool meshDirty = true;
     bool lightingDirty = true;  // NEW: Lighting needs recalculation
-    int mdiIndex = -1;  // Index in MDI renderer for transform updates (-1 = not registered)
     
     // Island context for inter-chunk culling
     uint32_t m_islandID = 0;
     Vec3 m_chunkCoord{0, 0, 0};
-    
-    // Static island system for inter-chunk queries
-    static IslandChunkSystem* s_islandSystem;
 
     // NEW: Per-block-type model instance positions (for BlockRenderType::OBJ blocks)
     // Key: BlockID, Value: list of instance positions within this chunk
     std::unordered_map<uint8_t, std::vector<Vec3>> m_modelInstances;
 
-    // Mesh generation helpers
-    void addQuadWithSharing(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
-                            std::unordered_map<Vertex, uint32_t>& vertexCache,
-                            float x, float y, float z, int face, uint8_t blockType);
-    void addCollisionQuad(float x, float y, float z, int face);
+    // Greedy meshing helpers
+    void addGreedyQuad(float x, float y, float z, int face, int width, int height, uint8_t blockType);
+    
+    // Collision mesh building
+    void buildCollisionMeshFromVertices();
+    
     bool isVoxelSolid(int x, int y, int z) const;
     
     // Unified culling - works for intra-chunk AND inter-chunk
@@ -262,7 +229,4 @@ class VoxelChunk
     bool performSunRaycast(const Vec3& rayStart, const Vec3& sunDirection, float maxDistance) const;  // Raycast for occlusion
     bool performLocalSunRaycast(const Vec3& rayStart, const Vec3& sunDirection, float maxDistance) const;  // Local chunk raycast for floating islands
     bool performInterIslandSunRaycast(const Vec3& rayStart, const Vec3& sunDirection, float maxDistance) const;  // Inter-island raycast for lighting
-    
-    std::vector<Vec3>
-        collisionMeshVertices;  // Collision mesh: stores positions of exposed faces for physics
 };

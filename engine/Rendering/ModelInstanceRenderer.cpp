@@ -223,10 +223,9 @@ void main(){
     // Alpha cutout
     if (albedo.a < 0.3) discard;
     
-    // Dark-by-default: visibility value represents LIGHT VISIBILITY (reverse shadow map)
-    // Surfaces are unlit unless the light map says they receive light
-    float ambient = 0.04;
-    vec3 lit = albedo.rgb * (ambient + visibility);
+    // Apply PCF shadow visibility (no ambient, no lambert - pure shadow map)
+    // Visibility = 1.0 means fully lit, 0.0 means fully shadowed
+    vec3 lit = albedo.rgb * visibility;
     FragColor = vec4(lit, 1.0);
 }
 )GLSL";
@@ -738,8 +737,7 @@ void ModelInstanceRenderer::beginDepthPass(const glm::mat4& lightVP, int cascade
     
     if (m_depthProgram == 0) return;  // Failed to compile
     
-    // NOTE: Don't call g_shadowMap.begin() here - MDIRenderer already did that
-    // We're just adding more geometry to the same shadow map cascade
+    // Shadow map begin() already called by GameClient - just set shader uniforms
     
     glUseProgram(m_depthProgram);
     if (m_depth_uLightVP != -1) {
@@ -784,8 +782,8 @@ void ModelInstanceRenderer::renderDepth()
 
 void ModelInstanceRenderer::endDepthPass(int screenWidth, int screenHeight)
 {
-    // MDIRenderer will call g_shadowMap.end(), not us
-    // This method exists for API consistency but doesn't do anything
+    // Shadow map end() will be called by GameClient after all depth rendering
+    // This method exists for API consistency but doesn't need to do anything
     (void)screenWidth;
     (void)screenHeight;
 }

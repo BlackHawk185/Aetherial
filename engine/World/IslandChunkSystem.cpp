@@ -8,13 +8,15 @@
 #include <memory>
 #include <string>
 #include <chrono>
+#include <random>
 #include <unordered_set>
+#include <immintrin.h>  // SSE/AVX intrinsics
 
 #include "VoxelChunk.h"
 #include "BlockType.h"
 #include "ConnectivityAnalyzer.h"
 #include "../Profiling/Profiler.h"
-#include "../Rendering/MDIRenderer.h"
+#include "../Rendering/InstancedQuadRenderer.h"
 #include "../Rendering/ModelInstanceRenderer.h"
 #include "../../libs/FastNoiseLite/FastNoiseLite.h"
 
@@ -25,10 +27,16 @@ IslandChunkSystem::IslandChunkSystem()
     // Initialize system
     // Seed random number generator for island velocity
     std::srand(static_cast<unsigned int>(std::time(nullptr)));
+    
+    // Set static pointer so VoxelChunk can access island system for inter-chunk culling
+    VoxelChunk::s_islandSystem = this;
 }
 
 IslandChunkSystem::~IslandChunkSystem()
 {
+    // Clear static pointer before destruction
+    VoxelChunk::s_islandSystem = nullptr;
+    
     // Clean up all islands
     // Collect IDs first to avoid iterator invalidation
     std::vector<uint32_t> islandIDs;
@@ -78,9 +86,24 @@ uint32_t IslandChunkSystem::createIsland(const Vec3& physicsCenter, uint32_t for
     island.needsPhysicsUpdate = true;
     island.acceleration = Vec3(0.0f, 0.0f, 0.0f);
     
-    // Set initial velocity - no random drift, islands start stationary
-    // Velocity will be controlled by piloting or network updates
-    island.velocity = Vec3(0.0f, 0.0f, 0.0f);
+    // Set initial random drift velocity for natural island movement
+    // Use island position as seed for deterministic random values
+    uint32_t seedX = static_cast<uint32_t>(std::abs(physicsCenter.x * 73856093.0f));
+    uint32_t seedY = static_cast<uint32_t>(std::abs(physicsCenter.y * 19349663.0f));
+    uint32_t seedZ = static_cast<uint32_t>(std::abs(physicsCenter.z * 83492791.0f));
+    std::mt19937 rng(seedX ^ seedY ^ seedZ);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    
+    island.velocity = Vec3(
+        dist(rng),  // Random X drift
+        dist(rng) * 0.3f,  // Reduced Y drift (mostly horizontal movement)
+        dist(rng)   // Random Z drift
+    );
+    
+    std::cout << "[ISLAND] Created island " << islandID 
+              << " with drift velocity (" << island.velocity.x 
+              << ", " << island.velocity.y 
+              << ", " << island.velocity.z << ")" << std::endl;
     
     return islandID;
 }
@@ -274,7 +297,128 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
             float dx = static_cast<float>(x);
             float xSquared = dx * dx;
             
-            for (int z = -searchRadius; z <= searchRadius; z++)
+            // **SIMD VECTORIZATION** - Process Z-loop 4 voxels at a time using SSE
+            int z = -searchRadius;
+            int zEnd = searchRadius;
+            int zVectorEnd = zEnd - 3;  // Process up to last complete group of 4
+            
+            // SIMD constants (broadcast to all 4 lanes)
+            __m128 xSquared_v = _mm_set1_ps(xSquared);
+            __m128 radiusSquared_v = _mm_set1_ps(radiusSquared);
+            __m128 radiusDivisor_v = _mm_set1_ps(radiusDivisor);
+            __m128 verticalDensity_v = _mm_set1_ps(verticalDensity);
+            __m128 zero_v = _mm_setzero_ps();
+            __m128 one_v = _mm_set1_ps(1.0f);
+            __m128 earlyRejectThreshold_v = _mm_set1_ps(0.01f);
+            __m128 densityRejectThreshold_v = _mm_set1_ps(0.05f);
+            
+            // **SIMD LOOP** - Process 4 Z values per iteration
+            for (; z <= zVectorEnd; z += 4)
+            {
+                voxelsSampled += 4;
+                
+                // Load 4 consecutive Z values
+                __m128 dz_v = _mm_set_ps(
+                    static_cast<float>(z + 3),
+                    static_cast<float>(z + 2),
+                    static_cast<float>(z + 1),
+                    static_cast<float>(z + 0)
+                );
+                
+                // **SPHERE CULLING** - distanceSquared = xSquared + z²
+                __m128 zSquared_v = _mm_mul_ps(dz_v, dz_v);
+                __m128 distanceSquared_v = _mm_add_ps(xSquared_v, zSquared_v);
+                
+                // Mask: which voxels are inside sphere?
+                __m128 insideSphere_mask = _mm_cmple_ps(distanceSquared_v, radiusSquared_v);
+                
+                // Early out if all 4 voxels outside sphere
+                if (_mm_movemask_ps(insideSphere_mask) == 0) {
+                    voxelsSkipped += 4;
+                    continue;
+                }
+                
+                // **RADIAL FALLOFF** - distanceFromCenter = sqrt(distanceSquared)
+                __m128 distanceFromCenter_v = _mm_sqrt_ps(distanceSquared_v);
+                __m128 islandBase_v = _mm_sub_ps(one_v, _mm_mul_ps(distanceFromCenter_v, radiusDivisor_v));
+                islandBase_v = _mm_max_ps(zero_v, islandBase_v);  // clamp to 0
+                islandBase_v = _mm_mul_ps(islandBase_v, islandBase_v);  // square
+                
+                // Mask: which voxels have sufficient radial falloff?
+                __m128 radialOK_mask = _mm_cmpge_ps(islandBase_v, earlyRejectThreshold_v);
+                
+                // Combined mask: inside sphere AND radial OK
+                __m128 viable_mask = _mm_and_ps(insideSphere_mask, radialOK_mask);
+                
+                // Early out if all 4 voxels rejected
+                int viableMask = _mm_movemask_ps(viable_mask);
+                if (viableMask == 0) {
+                    earlyRejects += 4;
+                    continue;
+                }
+                
+                // **BASE DENSITY** - baseDensity = islandBase * verticalDensity
+                __m128 baseDensity_v = _mm_mul_ps(islandBase_v, verticalDensity_v);
+                
+                // Mask: which voxels have sufficient base density?
+                __m128 densityOK_mask = _mm_cmpge_ps(baseDensity_v, densityRejectThreshold_v);
+                
+                // Final mask: viable AND density OK
+                __m128 needNoise_mask = _mm_and_ps(viable_mask, densityOK_mask);
+                int noiseMask = _mm_movemask_ps(needNoise_mask);
+                
+                if (noiseMask == 0) {
+                    earlyRejects += 4;
+                    continue;
+                }
+                
+                // **SCALAR FALLBACK** - Process survivors one-by-one for noise sampling
+                // (FastNoiseLite doesn't have SIMD, so we need scalar calls)
+                alignas(16) float islandBase_a[4];
+                alignas(16) float baseDensity_a[4];
+                _mm_store_ps(islandBase_a, islandBase_v);
+                _mm_store_ps(baseDensity_a, baseDensity_v);
+                
+                for (int lane = 0; lane < 4; lane++)
+                {
+                    if ((noiseMask & (1 << lane)) == 0) {
+                        earlyRejects++;
+                        continue;  // This lane was rejected
+                    }
+                    
+                    int zPos = z + lane;
+                    float dz = static_cast<float>(zPos);
+                    float islandBase = islandBase_a[lane];
+                    
+                    auto densityStart = std::chrono::high_resolution_clock::now();
+                    
+                    // **3D PERLIN NOISE**
+                    float volumetricNoise = noise3D.GetNoise(dx, dy, dz);
+                    volumetricNoise = (volumetricNoise + 1.0f) * 0.5f;
+                    
+                    // **2D PERLIN NOISE**
+                    float terrainNoise = noise2D.GetNoise(dx, dz);
+                    terrainNoise = (terrainNoise + 1.0f) * 0.5f;
+                    
+                    // **FINAL DENSITY**
+                    float finalDensity = islandBase * verticalDensity * (volumetricNoise * 0.6f + terrainNoise * 0.4f);
+                    
+                    auto densityEnd = std::chrono::high_resolution_clock::now();
+                    noiseTimeUs += std::chrono::duration_cast<std::chrono::microseconds>(densityEnd - densityStart).count();
+                    
+                    // Place voxel if density exceeds threshold
+                    if (finalDensity > densityThreshold)
+                    {
+                        Vec3 pos(x, y, zPos);
+                        setBlockIDWithAutoChunk(islandID, pos, BlockID::DIRT);
+                        surfacePositions.push_back(pos);
+                        voxelsGenerated++;
+                    }
+                }
+            }
+            
+            // **SCALAR TAIL** - Process remaining 1-3 voxels
+            for (; z <= zEnd; z++)
             {
                 voxelsSampled++;
                 
@@ -392,8 +536,6 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     auto meshGenStart = std::chrono::high_resolution_clock::now();
     
     long long renderMeshTime = 0;
-    long long collisionMeshTime = 0;
-    long long mdiRegistrationTime = 0;
     int chunksProcessed = 0;
     
     for (auto& [chunkCoord, chunk] : island->chunks)
@@ -401,19 +543,13 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
         if (chunk)
         {
             auto renderMeshStart = std::chrono::high_resolution_clock::now();
-            chunk->generateMesh();
+            chunk->generateMesh(false);  // Skip lighting during world gen - will be generated on-demand during rendering
             auto renderMeshEnd = std::chrono::high_resolution_clock::now();
             renderMeshTime += std::chrono::duration_cast<std::chrono::microseconds>(renderMeshEnd - renderMeshStart).count();
             
-            auto collisionMeshStart = std::chrono::high_resolution_clock::now();
-            chunk->buildCollisionMesh();
-            auto collisionMeshEnd = std::chrono::high_resolution_clock::now();
-            collisionMeshTime += std::chrono::duration_cast<std::chrono::microseconds>(collisionMeshEnd - collisionMeshStart).count();
-            
-            if (g_mdiRenderer)
+            // Register with instanced quad renderer
+            if (g_instancedQuadRenderer)
             {
-                auto mdiStart = std::chrono::high_resolution_clock::now();
-                
                 Vec3 chunkLocalPos(
                     chunkCoord.x * VoxelChunk::SIZE,
                     chunkCoord.y * VoxelChunk::SIZE,
@@ -423,10 +559,7 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
                 glm::mat4 chunkTransform = island->getTransformMatrix() * 
                     glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
                 
-                g_mdiRenderer->queueChunkRegistration(chunk.get(), chunkTransform);
-                
-                auto mdiEnd = std::chrono::high_resolution_clock::now();
-                mdiRegistrationTime += std::chrono::duration_cast<std::chrono::microseconds>(mdiEnd - mdiStart).count();
+                g_instancedQuadRenderer->registerChunk(chunk.get(), chunkTransform);
             }
             
             chunksProcessed++;
@@ -437,16 +570,10 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     auto meshGenDuration = std::chrono::duration_cast<std::chrono::milliseconds>(meshGenEnd - meshGenStart).count();
     
     long long renderMeshDuration = renderMeshTime / 1000;
-    long long collisionMeshDuration = collisionMeshTime / 1000;
-    long long mdiRegistrationDuration = mdiRegistrationTime / 1000;
     
     std::cout << "📐 Mesh Generation: " << meshGenDuration << "ms (" << chunksProcessed << " chunks)" << std::endl;
-    std::cout << "   ├─ Render: " << renderMeshDuration << "ms (" 
+    std::cout << "   └─ Render+Collision: " << renderMeshDuration << "ms (" 
               << (renderMeshDuration * 100 / std::max(1LL, meshGenDuration)) << "%)" << std::endl;
-    std::cout << "   ├─ Collision: " << collisionMeshDuration << "ms (" 
-              << (collisionMeshDuration * 100 / std::max(1LL, meshGenDuration)) << "%)" << std::endl;
-    std::cout << "   └─ MDI: " << mdiRegistrationDuration << "ms (" 
-              << (mdiRegistrationDuration * 100 / std::max(1LL, meshGenDuration)) << "%)" << std::endl;
     
     auto totalEnd = std::chrono::high_resolution_clock::now();
     auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(totalEnd - startTime).count();
@@ -529,8 +656,7 @@ void IslandChunkSystem::setVoxelInIsland(uint32_t islandID, const Vec3& islandRe
         return;
     
     chunk->setVoxel(x, y, z, voxelType);
-    chunk->generateMesh();
-    chunk->buildCollisionMesh();
+    chunk->generateMesh();  // Already builds collision mesh internally
 }
 
 void IslandChunkSystem::setVoxelWithAutoChunk(uint32_t islandID, const Vec3& islandRelativePos, uint8_t voxelType)
@@ -625,15 +751,9 @@ void IslandChunkSystem::updateIslandPhysics(float deltaTime)
 
 void IslandChunkSystem::syncPhysicsToChunks()
 {
-    // UNIFIED TRANSFORM UPDATE: Single source of truth for ALL rendering (MDI + GLB)
+    // UNIFIED TRANSFORM UPDATE: Updates transforms for instanced renderer and GLB models
     // Event-driven: Only update chunks whose islands have actually moved
     std::lock_guard<std::mutex> lock(m_islandsMutex);
-    
-    if (!g_mdiRenderer)
-    {
-        std::cerr << "⚠️  syncPhysicsToChunks: MDI renderer not available!" << std::endl;
-        return;
-    }
     
     // Cache OBJ block types once instead of querying every iteration
     static std::vector<uint8_t> objBlockTypes;
@@ -675,14 +795,10 @@ void IslandChunkSystem::syncPhysicsToChunks()
             glm::mat4 chunkTransform = islandTransform * 
                 glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
             
-            // === UPDATE MDI RENDERER (voxel chunks) ===
-            if (chunk->getMDIIndex() >= 0)
+            // === UPDATE INSTANCED RENDERER (voxel chunks) ===
+            if (g_instancedQuadRenderer)
             {
-                g_mdiRenderer->updateChunkTransform(chunk->getMDIIndex(), chunkTransform);
-            }
-            else
-            {
-                g_mdiRenderer->queueChunkRegistration(chunk.get(), chunkTransform);
+                g_instancedQuadRenderer->updateChunkTransform(chunk.get(), chunkTransform);
             }
             
             // === UPDATE GLB MODEL RENDERER (only for OBJ block types) ===

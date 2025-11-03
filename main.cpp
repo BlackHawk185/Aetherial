@@ -98,8 +98,6 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Removed verbose debug output
-
     // Enable profiler to diagnose performance bottlenecks
     g_profiler.setEnabled(false);  // Disabled - profiling complete
 
@@ -167,7 +165,6 @@ int main(int argc, char* argv[])
                 }
             }
 
-            // Removed verbose debug output
             client.shutdown();
             server.stop();
 
@@ -176,8 +173,6 @@ int main(int argc, char* argv[])
 
         case RunMode::SERVER_ONLY:
         {
-            // Removed verbose debug output
-
             // Create and initialize server with networking enabled
             GameServer server;
             if (!server.initialize(60.0f, true, serverPort))
@@ -186,19 +181,14 @@ int main(int argc, char* argv[])
                 return 1;
             }
 
-            // Removed verbose debug output
-
             // Run server (blocks until stopped)
             server.run();
 
-            // Removed verbose debug output
             break;
         }
 
         case RunMode::CLIENT_ONLY:
         {
-            // Removed verbose debug output
-
             // Create and initialize client
             GameClient client;
             if (!client.initialize(enableDebug))
@@ -213,8 +203,6 @@ int main(int argc, char* argv[])
                 std::cerr << "Failed to connect to remote server!" << std::endl;
                 return 1;
             }
-
-            // Removed verbose debug output
 
             // Main client loop
             auto lastTime = std::chrono::high_resolution_clock::now();
@@ -257,6 +245,5 @@ int main(int argc, char* argv[])
     g_timeEffects = nullptr;
     g_timeManager = nullptr;
 
-    // Removed verbose debug output
     return 0;
 }
