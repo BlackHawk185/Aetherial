@@ -12,7 +12,7 @@ class VoxelCompression {
 public:
     /**
      * Compress voxel data using LZ4
-     * @param input - Raw voxel data (16*16*16 = 4096 bytes)
+     * @param input - Raw voxel data (VoxelChunk::VOLUME bytes)
      * @param inputSize - Size of input data 
      * @param output - Vector to store compressed data
      * @return Size of compressed data, or 0 if compression failed
@@ -23,8 +23,8 @@ public:
      * Decompress LZ4-compressed voxel data
      * @param input - Compressed data
      * @param inputSize - Size of compressed data
-     * @param output - Buffer to store decompressed data (must be pre-allocated)
-     * @param outputSize - Expected size of decompressed data (4096 for 16x16x16 chunk)
+     * @param output - Buffer to store decompressed data (must be pre-allocated to VoxelChunk::VOLUME)
+     * @param outputSize - Expected size of decompressed data (VoxelChunk::VOLUME for standard chunk)
      * @return true if decompression succeeded
      */
     static bool decompressLZ4(const uint8_t* input, uint32_t inputSize, uint8_t* output, uint32_t outputSize);

@@ -17,8 +17,6 @@ HUD::~HUD() {
 void HUD::render(float deltaTime) {
     m_timeSinceLastUpdate += deltaTime;
     
-    // Render HUD elements
-    // renderCrosshair();  // REMOVED: Using block wireframe instead
     renderHealthBar();
     renderCurrentBlock();
     renderFPS();
@@ -32,127 +30,119 @@ void HUD::render(float deltaTime) {
     }
 }
 
-void HUD::renderCrosshair() {
-    // Simple crosshair at screen center
-    ImGuiIO& io = ImGui::GetIO();
-    ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-    
-    ImGui::GetForegroundDrawList()->AddLine(
-        ImVec2(center.x - 10, center.y),
-        ImVec2(center.x + 10, center.y),
-        IM_COL32(255, 255, 255, 200), 2.0f
-    );
-    ImGui::GetForegroundDrawList()->AddLine(
-        ImVec2(center.x, center.y - 10),
-        ImVec2(center.x, center.y + 10),
-        IM_COL32(255, 255, 255, 200), 2.0f
-    );
-}
-
 void HUD::renderHealthBar() {
-    ImGuiIO& io = ImGui::GetIO();
-    
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(200, 60), ImGuiCond_Always);
-    ImGui::Begin("Health", nullptr, 
-                 ImGuiWindowFlags_NoTitleBar | 
-                 ImGuiWindowFlags_NoResize | 
-                 ImGuiWindowFlags_NoMove | 
-                 ImGuiWindowFlags_NoScrollbar |
-                 ImGuiWindowFlags_NoBackground);
+    // OPTIMIZED: Use direct ImDrawList rendering instead of ImGui windows
+    // This eliminates per-frame GPU sync overhead from ImGui::Begin/End
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
     
     float healthPercent = m_health / m_maxHealth;
-    ImGui::Text("Health");
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.8f, 0.1f, 0.1f, 1.0f));
-    ImGui::ProgressBar(healthPercent, ImVec2(-1, 20));
-    ImGui::PopStyleColor();
     
-    ImGui::End();
+    // Health bar position (top-left)
+    const float x = 10.0f;
+    const float y = 10.0f;
+    const float width = 200.0f;
+    const float height = 20.0f;
+    
+    // Background
+    drawList->AddRectFilled(
+        ImVec2(x, y),
+        ImVec2(x + width, y + height),
+        IM_COL32(20, 20, 20, 200),
+        3.0f
+    );
+    
+    // Health fill
+    drawList->AddRectFilled(
+        ImVec2(x, y),
+        ImVec2(x + width * healthPercent, y + height),
+        IM_COL32(204, 25, 25, 255),  // Red health bar
+        3.0f
+    );
+    
+    // Border
+    drawList->AddRect(
+        ImVec2(x, y),
+        ImVec2(x + width, y + height),
+        IM_COL32(255, 255, 255, 255),
+        3.0f,
+        0,
+        2.0f
+    );
+    
+    // "Health" label above bar
+    drawList->AddText(ImVec2(x, y - 18.0f), IM_COL32(255, 255, 255, 255), "Health");
 }
 
 void HUD::renderDebugInfo() {
-    ImGuiIO& io = ImGui::GetIO();
+    // OPTIMIZED: Use direct ImDrawList rendering instead of ImGui windows
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
     
-    ImGui::SetNextWindowPos(ImVec2(10, 80), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(300, 120), ImGuiCond_Always);
-    ImGui::Begin("Debug Info", nullptr,
-                 ImGuiWindowFlags_NoTitleBar |
-                 ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoMove |
-                 ImGuiWindowFlags_NoScrollbar |
-                 ImGuiWindowFlags_NoBackground);
+    const float x = 10.0f;
+    float y = 80.0f;
+    const float lineHeight = 20.0f;
     
-    ImGui::Text("Position: %.1f, %.1f, %.1f", m_playerX, m_playerY, m_playerZ);
-    ImGui::Text("FPS: %.1f", m_fps);
-    ImGui::Text("Press F3 to toggle debug info");
+    char buffer[256];
     
-    ImGui::End();
+    snprintf(buffer, sizeof(buffer), "Position: %.1f, %.1f, %.1f", m_playerX, m_playerY, m_playerZ);
+    drawList->AddText(ImVec2(x, y), IM_COL32(255, 255, 255, 255), buffer);
+    y += lineHeight;
+    
+    snprintf(buffer, sizeof(buffer), "FPS: %.1f", m_fps);
+    drawList->AddText(ImVec2(x, y), IM_COL32(255, 255, 255, 255), buffer);
+    y += lineHeight;
+    
+    drawList->AddText(ImVec2(x, y), IM_COL32(200, 200, 200, 255), "Press F3 to toggle debug info");
 }
 
 void HUD::renderCurrentBlock() {
+    // OPTIMIZED: Use direct ImDrawList rendering instead of ImGui windows
     ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
     
     // Bottom center
-    ImVec2 pos(io.DisplaySize.x * 0.5f - 100, io.DisplaySize.y - 80);
-    ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(200, 60), ImGuiCond_Always);
-    ImGui::Begin("Current Block", nullptr,
-                 ImGuiWindowFlags_NoTitleBar |
-                 ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoMove |
-                 ImGuiWindowFlags_NoScrollbar |
-                 ImGuiWindowFlags_NoBackground);
+    ImVec2 textSize = ImGui::CalcTextSize(m_currentBlock.c_str());
+    float x = io.DisplaySize.x * 0.5f - textSize.x * 0.5f;
+    float y = io.DisplaySize.y - 80.0f;
     
-    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize(m_currentBlock.c_str()).x) * 0.5f);
-    ImGui::Text("%s", m_currentBlock.c_str());
-    
-    ImGui::End();
+    drawList->AddText(ImVec2(x, y), IM_COL32(255, 255, 255, 255), m_currentBlock.c_str());
 }
 
 void HUD::renderTargetBlock() {
+    // OPTIMIZED: Use direct ImDrawList rendering instead of ImGui windows
     ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
     
     // Center, below crosshair
-    ImVec2 pos(io.DisplaySize.x * 0.5f - 100, io.DisplaySize.y * 0.5f + 30);
-    ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(200, 40), ImGuiCond_Always);
-    ImGui::Begin("Target Block", nullptr,
-                 ImGuiWindowFlags_NoTitleBar |
-                 ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoMove |
-                 ImGuiWindowFlags_NoScrollbar |
-                 ImGuiWindowFlags_NoBackground);
+    ImVec2 blockNameSize = ImGui::CalcTextSize(m_targetBlock.c_str());
+    float x = io.DisplaySize.x * 0.5f - blockNameSize.x * 0.5f;
+    float y = io.DisplaySize.y * 0.5f + 30.0f;
     
-    // Block name
-    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize(m_targetBlock.c_str()).x) * 0.5f);
-    ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "%s", m_targetBlock.c_str());
+    // Block name (light blue)
+    drawList->AddText(ImVec2(x, y), IM_COL32(178, 178, 255, 255), m_targetBlock.c_str());
     
-    // Chemical formula (if available)
+    // Chemical formula (if available) - green, below name
     if (!m_targetFormula.empty()) {
-        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize(m_targetFormula.c_str()).x) * 0.5f);
-        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", m_targetFormula.c_str());
+        ImVec2 formulaSize = ImGui::CalcTextSize(m_targetFormula.c_str());
+        float formulaX = io.DisplaySize.x * 0.5f - formulaSize.x * 0.5f;
+        drawList->AddText(ImVec2(formulaX, y + 20.0f), IM_COL32(128, 255, 128, 255), m_targetFormula.c_str());
     }
-    
-    ImGui::End();
 }
 
 void HUD::renderFPS() {
     if (m_showDebugInfo) return; // Already shown in debug info
     
+    // OPTIMIZED: Use direct ImDrawList rendering instead of ImGui windows
     ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
     
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 100, 10), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(90, 30), ImGuiCond_Always);
-    ImGui::Begin("FPS", nullptr,
-                 ImGuiWindowFlags_NoTitleBar |
-                 ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoMove |
-                 ImGuiWindowFlags_NoScrollbar |
-                 ImGuiWindowFlags_NoBackground);
+    char fpsBuffer[32];
+    snprintf(fpsBuffer, sizeof(fpsBuffer), "FPS: %.0f", m_fps);
     
-    ImGui::Text("FPS: %.0f", m_fps);
+    ImVec2 textSize = ImGui::CalcTextSize(fpsBuffer);
+    float x = io.DisplaySize.x - textSize.x - 10.0f;  // Right-aligned with 10px margin
+    float y = 10.0f;
     
-    ImGui::End();
+    drawList->AddText(ImVec2(x, y), IM_COL32(255, 255, 255, 255), fpsBuffer);
 }
 
 void HUD::setPlayerPosition(float x, float y, float z) {

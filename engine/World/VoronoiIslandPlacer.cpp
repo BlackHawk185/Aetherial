@@ -116,17 +116,31 @@ std::vector<IslandDefinition> VoronoiIslandPlacer::generateIslands(
     // Take the closest N islands to the center
     int numIslands = std::min(targetIslandCount, static_cast<int>(candidateIslands.size()));
     
+    // Create noise generator for size variation
+    FastNoiseLite sizeNoise;
+    sizeNoise.SetNoiseType(FastNoiseLite::NoiseType_Perlin);
+    sizeNoise.SetSeed(worldSeed + 1000);
+    sizeNoise.SetFrequency(0.003f);  // Low frequency for smooth size variation
+    
     for (int i = 0; i < numIslands; ++i) {
         Vec3 pos = candidateIslands[i].first;
         float cellSize = candidateIslands[i].second;
         
-        // Map cell size to island radius
+        // Map cell size to island radius with added noise variation
         // Larger cells = larger islands (they have more space)
         // Normalize cell size to [0, 1] range (approximate)
         float normalizedSize = std::min(1.0f, cellSize / (regionSize * 0.5f));
         
+        // Add Perlin noise for additional size variation (range: -1 to 1)
+        float sizeVariation = sizeNoise.GetNoise(pos.x, pos.z);
+        
+        // Combine cell size (60% weight) with noise variation (40% weight)
+        // This gives us both spatial coherence AND interesting variation
+        float combinedSize = (normalizedSize * 0.6f) + ((sizeVariation * 0.5f + 0.5f) * 0.4f);
+        combinedSize = std::max(0.0f, std::min(1.0f, combinedSize));  // Clamp to [0, 1]
+        
         // Map to radius range
-        float radius = minRadius + normalizedSize * (maxRadius - minRadius);
+        float radius = minRadius + combinedSize * (maxRadius - minRadius);
         
         // Generate unique seed for this island based on position
         uint32_t islandSeed = worldSeed;

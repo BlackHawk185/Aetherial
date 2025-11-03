@@ -15,7 +15,7 @@ std::unique_ptr<InstancedQuadRenderer> g_instancedQuadRenderer;
 extern ShadowMap g_shadowMap;
 extern DayNightController* g_dayNightController;
 
-// Vertex shader - transforms shared unit quad using instance data
+// Vertex shader - MDI version with SSBO transform lookup
 static const char* VERTEX_SHADER = R"(
 #version 460 core
 
@@ -32,9 +32,13 @@ layout(location = 6) in float aInstanceLightmapV;
 layout(location = 7) in uint aInstanceBlockType;
 layout(location = 8) in uint aInstanceFaceDir;
 
+// Chunk transforms in SSBO (accessed via gl_DrawID)
+layout(std430, binding = 0) readonly buffer TransformBuffer {
+    mat4 chunkTransforms[];
+};
+
 // Uniforms
 uniform mat4 uViewProjection;
-uniform mat4 uChunkTransform;
 
 // Outputs to fragment shader
 out vec2 TexCoord;
@@ -45,8 +49,8 @@ flat out uint BlockType;
 flat out uint FaceDir;
 
 void main() {
-    // Unit quad in XY plane with CCW winding from +Z
-    // Y is UP in world space, not Z!
+    // Get this chunk's transform using gl_DrawID (which draw command we're in)
+    mat4 uChunkTransform = chunkTransforms[gl_DrawID];
     
     // Scale unit quad by instance dimensions
     vec3 scaledPos = vec3(
@@ -57,26 +61,18 @@ void main() {
     
     // Rotate to align with face normal
     // Face direction: 0=-Y, 1=+Y, 2=-Z, 3=+Z, 4=-X, 5=+X
-    // Y faces are HORIZONTAL (width=X, height=Z)
-    // Z and X faces are VERTICAL (height=Y)
     vec3 rotatedPos;
     if (aInstanceFaceDir == 0u) {
-        // -Y (bottom): horizontal face, map X→X, Y→Z
         rotatedPos = vec3(scaledPos.x, 0.0, scaledPos.y);
     } else if (aInstanceFaceDir == 1u) {
-        // +Y (top): horizontal face, map X→X, Y→Z, flip X for winding
         rotatedPos = vec3(-scaledPos.x, 0.0, scaledPos.y);
     } else if (aInstanceFaceDir == 2u) {
-        // -Z (back): vertical face, map X→X, Y→Y, flip X for winding
         rotatedPos = vec3(-scaledPos.x, scaledPos.y, 0.0);
     } else if (aInstanceFaceDir == 3u) {
-        // +Z (front): vertical face, map X→X, Y→Y
         rotatedPos = vec3(scaledPos.x, scaledPos.y, 0.0);
     } else if (aInstanceFaceDir == 4u) {
-        // -X (left): vertical face, map X→Z, Y→Y
         rotatedPos = vec3(0.0, scaledPos.y, scaledPos.x);
     } else {
-        // +X (right): vertical face, map X→Z, Y→Y, flip Z for winding
         rotatedPos = vec3(0.0, scaledPos.y, -scaledPos.x);
     }
     
@@ -88,13 +84,10 @@ void main() {
     WorldPos = worldPos4.xyz;
     gl_Position = uViewProjection * worldPos4;
     
-    // Texture coordinates - use the rotated position offset from quad center
-    // The quad center (aInstancePosition) represents the face surface
-    // We need texture UVs based on the actual vertex position within the quad
-    // Map the unit quad space (-0.5 to 0.5) to texture space (0 to width/height)
+    // Texture coordinates
     TexCoord = (aPosition.xy + 0.5) * vec2(aInstanceWidth, aInstanceHeight);
     
-    // Lightmap coordinates - use the pre-calculated UV from quad generation
+    // Lightmap coordinates
     LightmapCoord = vec2(aInstanceLightmapU, aInstanceLightmapV);
     
     // Pass through normal and block type
@@ -104,7 +97,7 @@ void main() {
 }
 )";
 
-// Fragment shader - real-time CSM/PCF shadows (matches ModelInstanceRenderer)
+// Fragment shader - OPTIMIZED with texture atlas (no branching!)
 static const char* FRAGMENT_SHADER = R"(
 #version 460 core
 
@@ -115,10 +108,10 @@ in vec3 WorldPos;
 flat in uint BlockType;
 flat in uint FaceDir;
 
-uniform sampler2D uTexture;      // Dirt
-uniform sampler2D uStoneTexture;
-uniform sampler2D uGrassTexture;
-uniform sampler2D uSandTexture;
+uniform sampler2D uTextureStone;
+uniform sampler2D uTextureDirt;
+uniform sampler2D uTextureGrass;
+uniform sampler2D uTextureSand;
 
 // Real-time shadow system (CSM/PCF)
 uniform sampler2DArrayShadow uShadowMap;  // Cascaded shadow map array
@@ -202,20 +195,18 @@ float sampleShadowPCF(float bias, float viewZ)
 }
 
 void main() {
+    // Sample appropriate texture based on block type
     vec4 texColor;
-    
-    // Select texture based on block type
     if (BlockType == 1u) {
-        texColor = texture(uStoneTexture, TexCoord);
+        texColor = texture(uTextureStone, TexCoord);
     } else if (BlockType == 2u) {
-        texColor = texture(uTexture, TexCoord);  // Dirt
+        texColor = texture(uTextureDirt, TexCoord);
     } else if (BlockType == 3u) {
-        texColor = texture(uGrassTexture, TexCoord);
+        texColor = texture(uTextureGrass, TexCoord);
     } else if (BlockType == 25u) {
-        texColor = texture(uSandTexture, TexCoord);
+        texColor = texture(uTextureSand, TexCoord);
     } else {
-        // Placeholder colors for other blocks
-        texColor = vec4(0.5, 0.5, 0.5, 1.0);
+        texColor = texture(uTextureStone, TexCoord);  // Default
     }
     
     // Calculate view-space Z for cascade selection
@@ -237,7 +228,7 @@ void main() {
 }
 )";
 
-// Depth-only shader for shadow map rendering (no textures, just depth)
+// Depth-only shader for shadow map rendering - MDI version with SSBO
 static const char* DEPTH_VERTEX_SHADER = R"(
 #version 460 core
 
@@ -254,10 +245,17 @@ layout(location = 6) in float aInstanceLightmapV;
 layout(location = 7) in uint aInstanceBlockType;
 layout(location = 8) in uint aInstanceFaceDir;
 
+// Chunk transforms in SSBO (accessed via gl_DrawID)
+layout(std430, binding = 0) readonly buffer TransformBuffer {
+    mat4 chunkTransforms[];
+};
+
 uniform mat4 uLightVP;
-uniform mat4 uChunkTransform;
 
 void main() {
+    // Get this chunk's transform using gl_DrawID
+    mat4 uChunkTransform = chunkTransforms[gl_DrawID];
+    
     // Same rotation logic as forward shader
     vec3 scaledPos = vec3(
         aPosition.x * aInstanceWidth,
@@ -295,7 +293,8 @@ void main() {
 )";
 
 InstancedQuadRenderer::InstancedQuadRenderer()
-    : m_unitQuadVAO(0), m_unitQuadVBO(0), m_unitQuadEBO(0), m_shaderProgram(0), m_depthProgram(0)
+    : m_unitQuadVAO(0), m_unitQuadVBO(0), m_unitQuadEBO(0), m_shaderProgram(0), m_depthProgram(0),
+      m_globalVAO(0), m_globalInstanceVBO(0), m_indirectCommandBuffer(0), m_transformSSBO(0), m_mdiDirty(false)
 {
 }
 
@@ -357,7 +356,13 @@ bool InstancedQuadRenderer::initialize()
         }
     }
     
-    std::cout << "✅ InstancedQuadRenderer initialized" << std::endl;
+    // Create global VAO for MDI (will be configured when chunks are registered)
+    glGenVertexArrays(1, &m_globalVAO);
+    glGenBuffers(1, &m_globalInstanceVBO);
+    glGenBuffers(1, &m_indirectCommandBuffer);
+    glGenBuffers(1, &m_transformSSBO);
+    
+    std::cout << "✅ InstancedQuadRenderer initialized with MDI support" << std::endl;
     return true;
 }
 
@@ -423,13 +428,13 @@ void InstancedQuadRenderer::createShader()
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
     
-    // Get uniform locations
+    // Get uniform locations (no more uChunkTransform - using SSBO)
     m_uViewProjection = glGetUniformLocation(m_shaderProgram, "uViewProjection");
     m_uView = glGetUniformLocation(m_shaderProgram, "uView");
-    m_uTexture = glGetUniformLocation(m_shaderProgram, "uTexture");
-    m_uStoneTexture = glGetUniformLocation(m_shaderProgram, "uStoneTexture");
-    m_uGrassTexture = glGetUniformLocation(m_shaderProgram, "uGrassTexture");
-    m_uSandTexture = glGetUniformLocation(m_shaderProgram, "uSandTexture");
+    m_uTextureStone = glGetUniformLocation(m_shaderProgram, "uTextureStone");
+    m_uTextureDirt = glGetUniformLocation(m_shaderProgram, "uTextureDirt");
+    m_uTextureGrass = glGetUniformLocation(m_shaderProgram, "uTextureGrass");
+    m_uTextureSand = glGetUniformLocation(m_shaderProgram, "uTextureSand");
     
     // CSM/PCF shadow uniforms
     m_uShadowMap = glGetUniformLocation(m_shaderProgram, "uShadowMap");
@@ -462,10 +467,10 @@ void InstancedQuadRenderer::createDepthShader()
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
     
-    // Get uniform locations
+    // Get uniform locations (no more uChunkTransform - using SSBO)
     m_depth_uLightVP = glGetUniformLocation(m_depthProgram, "uLightVP");
     
-    std::cout << "   └─ Depth shader compiled and linked (for shadow casting)" << std::endl;
+    std::cout << "   └─ Depth shader compiled and linked (MDI + SSBO)" << std::endl;
 }
 
 GLuint InstancedQuadRenderer::compileShader(const char* source, GLenum type)
@@ -498,7 +503,7 @@ void InstancedQuadRenderer::registerChunk(VoxelChunk* chunk, const glm::mat4& tr
     for (auto& entry : m_chunks) {
         if (entry.chunk == chunk) {
             entry.transform = transform;
-            uploadChunkInstances(entry);
+            m_mdiDirty = true;  // Mark for rebuild
             return;
         }
     }
@@ -508,14 +513,10 @@ void InstancedQuadRenderer::registerChunk(VoxelChunk* chunk, const glm::mat4& tr
     entry.chunk = chunk;
     entry.transform = transform;
     entry.instanceCount = 0;
-    
-    // Create instance VBO
-    glGenBuffers(1, &entry.instanceVBO);
-    
-    // Upload instance data
-    uploadChunkInstances(entry);
+    entry.baseInstance = 0;  // Will be set during rebuildMDIBuffers
     
     m_chunks.push_back(entry);
+    m_mdiDirty = true;  // Mark for rebuild
 }
 
 void InstancedQuadRenderer::uploadChunkInstances(ChunkEntry& entry)
@@ -530,11 +531,8 @@ void InstancedQuadRenderer::uploadChunkInstances(ChunkEntry& entry)
     const auto& quads = mesh.quads;
     entry.instanceCount = quads.size();
     
-    if (entry.instanceCount == 0)
-        return;
-    
-    glBindBuffer(GL_ARRAY_BUFFER, entry.instanceVBO);
-    glBufferData(GL_ARRAY_BUFFER, quads.size() * sizeof(QuadFace), quads.data(), GL_DYNAMIC_DRAW);
+    // Instance data is now managed by rebuildMDIBuffers, not per-chunk
+    m_mdiDirty = true;
 }
 
 void InstancedQuadRenderer::updateChunkTransform(VoxelChunk* chunk, const glm::mat4& transform)
@@ -557,6 +555,133 @@ void InstancedQuadRenderer::rebuildChunk(VoxelChunk* chunk)
     }
 }
 
+void InstancedQuadRenderer::rebuildMDIBuffers()
+{
+    if (m_chunks.empty()) return;
+    
+    // 1. Calculate total instance count and update instance counts
+    size_t totalInstances = 0;
+    for (auto& entry : m_chunks) {
+        if (entry.chunk) {
+            const auto& mesh = entry.chunk->getMesh();
+            entry.instanceCount = mesh.quads.size();
+            entry.baseInstance = totalInstances;
+            totalInstances += entry.instanceCount;
+        }
+    }
+    
+    if (totalInstances == 0) return;
+    
+    // 2. Build merged instance buffer (all chunk quads concatenated)
+    std::vector<QuadFace> mergedInstances;
+    mergedInstances.reserve(totalInstances);
+    
+    for (const auto& entry : m_chunks) {
+        if (entry.chunk && entry.instanceCount > 0) {
+            const auto& mesh = entry.chunk->getMesh();
+            mergedInstances.insert(mergedInstances.end(), mesh.quads.begin(), mesh.quads.end());
+        }
+    }
+    
+    // 3. Upload merged instance data to GPU
+    glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
+    glBufferData(GL_ARRAY_BUFFER, mergedInstances.size() * sizeof(QuadFace), 
+                 mergedInstances.data(), GL_DYNAMIC_DRAW);
+    
+    // 4. Configure global VAO (one-time setup, or when first built)
+    static bool vaoConfigured = false;
+    if (!vaoConfigured) {
+        glBindVertexArray(m_globalVAO);
+        
+        // Bind shared unit quad (vertex attribute 0)
+        glBindBuffer(GL_ARRAY_BUFFER, m_unitQuadVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_unitQuadEBO);
+        
+        // Bind merged instance buffer
+        glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
+        
+        // Pre-configure all instance vertex attributes
+        size_t offset = 0;
+        
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
+        glVertexAttribDivisor(1, 1);
+        offset += sizeof(Vec3);
+        
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
+        glVertexAttribDivisor(2, 1);
+        offset += sizeof(Vec3);
+        
+        glEnableVertexAttribArray(3);
+        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
+        glVertexAttribDivisor(3, 1);
+        offset += sizeof(float);
+        
+        glEnableVertexAttribArray(4);
+        glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
+        glVertexAttribDivisor(4, 1);
+        offset += sizeof(float);
+        
+        glEnableVertexAttribArray(5);
+        glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
+        glVertexAttribDivisor(5, 1);
+        offset += sizeof(float);
+        
+        glEnableVertexAttribArray(6);
+        glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
+        glVertexAttribDivisor(6, 1);
+        offset += sizeof(float);
+        
+        glEnableVertexAttribArray(7);
+        glVertexAttribIPointer(7, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
+        glVertexAttribDivisor(7, 1);
+        offset += sizeof(uint8_t);
+        
+        glEnableVertexAttribArray(8);
+        glVertexAttribIPointer(8, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
+        glVertexAttribDivisor(8, 1);
+        
+        glBindVertexArray(0);
+        vaoConfigured = true;
+    }
+    
+    // 5. Build indirect command buffer and transform array (MUST match 1:1)
+    std::vector<DrawElementsIndirectCommand> commands;
+    std::vector<glm::mat4> transforms;
+    commands.reserve(m_chunks.size());
+    transforms.reserve(m_chunks.size());
+    
+    for (const auto& entry : m_chunks) {
+        if (entry.instanceCount > 0) {
+            DrawElementsIndirectCommand cmd;
+            cmd.count = 6;  // Quad indices
+            cmd.instanceCount = static_cast<uint32_t>(entry.instanceCount);
+            cmd.firstIndex = 0;
+            cmd.baseVertex = 0;
+            cmd.baseInstance = static_cast<uint32_t>(entry.baseInstance);
+            commands.push_back(cmd);
+            
+            // CRITICAL: Transform array must match command array 1:1
+            transforms.push_back(entry.transform);
+        }
+    }
+    
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
+    glBufferData(GL_DRAW_INDIRECT_BUFFER, commands.size() * sizeof(DrawElementsIndirectCommand),
+                 commands.data(), GL_DYNAMIC_DRAW);
+    
+    // 6. Upload chunk transforms to SSBO (now matches commands array)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, transforms.size() * sizeof(glm::mat4),
+                 transforms.data(), GL_DYNAMIC_DRAW);
+    
+    m_mdiDirty = false;
+}
+
 void InstancedQuadRenderer::render(const glm::mat4& viewProjection, const glm::mat4& view)
 {
     if (m_chunks.empty())
@@ -570,28 +695,24 @@ void InstancedQuadRenderer::render(const glm::mat4& viewProjection, const glm::m
     glUniformMatrix4fv(m_uViewProjection, 1, GL_FALSE, glm::value_ptr(viewProjection));
     glUniformMatrix4fv(m_uView, 1, GL_FALSE, glm::value_ptr(view));
     
-    // Bind textures
+    // Bind 4 separate textures
     extern TextureManager* g_textureManager;
     
     glActiveTexture(GL_TEXTURE0);
-    GLuint dirtTex = g_textureManager->getTexture("dirt.png");
-    glBindTexture(GL_TEXTURE_2D, dirtTex);
-    glUniform1i(m_uTexture, 0);
+    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("stone.png"));
+    glUniform1i(m_uTextureStone, 0);
     
     glActiveTexture(GL_TEXTURE1);
-    GLuint stoneTex = g_textureManager->getTexture("stone.png");
-    glBindTexture(GL_TEXTURE_2D, stoneTex);
-    glUniform1i(m_uStoneTexture, 1);
+    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("dirt.png"));
+    glUniform1i(m_uTextureDirt, 1);
     
     glActiveTexture(GL_TEXTURE2);
-    GLuint grassTex = g_textureManager->getTexture("grass.png");
-    glBindTexture(GL_TEXTURE_2D, grassTex);
-    glUniform1i(m_uGrassTexture, 2);
+    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("grass.png"));
+    glUniform1i(m_uTextureGrass, 2);
     
     glActiveTexture(GL_TEXTURE3);
-    GLuint sandTex = g_textureManager->getTexture("sand.png");
-    glBindTexture(GL_TEXTURE_2D, sandTex);
-    glUniform1i(m_uSandTexture, 3);
+    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("sand.png"));
+    glUniform1i(m_uTextureSand, 3);
     
     // Bind CSM/PCF shadow map (matches ModelInstanceRenderer)
     extern class ShadowMap g_shadowMap;
@@ -620,86 +741,52 @@ void InstancedQuadRenderer::render(const glm::mat4& viewProjection, const glm::m
     }
     glUniformMatrix4fv(m_uCascadeVP, 2, GL_FALSE, glm::value_ptr(cascadeVPs[0]));
     
-    // Bind unit quad
-    glBindVertexArray(m_unitQuadVAO);
-    
-    // Render each chunk
-    for (const auto& entry : m_chunks) {
-        if (!entry.chunk || entry.instanceCount == 0)
-            continue;
-        
-        // Set chunk transform
-        GLint uChunkTransform = glGetUniformLocation(m_shaderProgram, "uChunkTransform");
-        glUniformMatrix4fv(uChunkTransform, 1, GL_FALSE, glm::value_ptr(entry.transform));
-        
-        // Bind instance data
-        glBindBuffer(GL_ARRAY_BUFFER, entry.instanceVBO);
-        
-        // Instance attributes (QuadFace struct layout)
-        size_t offset = 0;
-        
-        // aInstancePosition (vec3)
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(1, 1);
-        offset += sizeof(Vec3);
-        
-        // aInstanceNormal (vec3)
-        glEnableVertexAttribArray(2);
-        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(2, 1);
-        offset += sizeof(Vec3);
-        
-        // aInstanceWidth (float)
-        glEnableVertexAttribArray(3);
-        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(3, 1);
-        offset += sizeof(float);
-        
-        // aInstanceHeight (float)
-        glEnableVertexAttribArray(4);
-        glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(4, 1);
-        offset += sizeof(float);
-        
-        // aInstanceLightmapU (float)
-        glEnableVertexAttribArray(5);
-        glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(5, 1);
-        offset += sizeof(float);
-        
-        // aInstanceLightmapV (float)
-        glEnableVertexAttribArray(6);
-        glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(6, 1);
-        offset += sizeof(float);
-        
-        // aInstanceBlockType (uint8_t)
-        glEnableVertexAttribArray(7);
-        glVertexAttribIPointer(7, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(7, 1);
-        offset += sizeof(uint8_t);
-        
-        // aInstanceFaceDir (uint8_t)
-        glEnableVertexAttribArray(8);
-        glVertexAttribIPointer(8, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(8, 1);
-        
-        // Draw instanced
-        glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0, entry.instanceCount);
+    // Rebuild MDI buffers if dirty (chunks added/removed/updated)
+    if (m_mdiDirty) {
+        rebuildMDIBuffers();
     }
+    
+    // Count non-empty draws
+    size_t drawCount = 0;
+    for (const auto& entry : m_chunks) {
+        if (entry.instanceCount > 0) drawCount++;
+    }
+    
+    if (drawCount == 0) {
+        return;
+    }
+    
+    // OPTIMIZED: Directly update SSBO buffer with transforms (no temp vector)
+    // Map the buffer for writing, copy transforms directly
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
+    glm::mat4* mappedTransforms = (glm::mat4*)glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_WRITE_ONLY);
+    if (mappedTransforms) {
+        size_t index = 0;
+        for (const auto& entry : m_chunks) {
+            if (entry.instanceCount > 0) {
+                mappedTransforms[index++] = entry.transform;
+            }
+        }
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    }
+    
+    // Bind global VAO and transform SSBO
+    glBindVertexArray(m_globalVAO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_transformSSBO);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
+    
+    // SINGLE MDI CALL FOR ALL CHUNKS! (GPU-driven rendering)
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
+                                static_cast<GLsizei>(drawCount), 0);
     
     glBindVertexArray(0);
 }
 
 void InstancedQuadRenderer::clear()
 {
-    for (auto& entry : m_chunks) {
-        if (entry.instanceVBO != 0) {
-            glDeleteBuffers(1, &entry.instanceVBO);
-        }
-    }
+    // No per-chunk VAOs/VBOs to delete - just clear the list
     m_chunks.clear();
+    m_mdiDirty = true;  // Mark for rebuild
 }
 
 void InstancedQuadRenderer::shutdown()
@@ -719,6 +806,27 @@ void InstancedQuadRenderer::shutdown()
     if (m_unitQuadEBO != 0) {
         glDeleteBuffers(1, &m_unitQuadEBO);
         m_unitQuadEBO = 0;
+    }
+    
+    // Delete MDI buffers
+    if (m_globalVAO != 0) {
+        glDeleteVertexArrays(1, &m_globalVAO);
+        m_globalVAO = 0;
+    }
+    
+    if (m_globalInstanceVBO != 0) {
+        glDeleteBuffers(1, &m_globalInstanceVBO);
+        m_globalInstanceVBO = 0;
+    }
+    
+    if (m_indirectCommandBuffer != 0) {
+        glDeleteBuffers(1, &m_indirectCommandBuffer);
+        m_indirectCommandBuffer = 0;
+    }
+    
+    if (m_transformSSBO != 0) {
+        glDeleteBuffers(1, &m_transformSSBO);
+        m_transformSSBO = 0;
     }
     
     if (m_shaderProgram != 0) {
@@ -749,73 +857,41 @@ void InstancedQuadRenderer::renderDepth()
 {
     if (m_depthProgram == 0 || m_chunks.empty()) return;
     
-    // Bind unit quad
-    glBindVertexArray(m_unitQuadVAO);
-    
-    // Render each chunk's quads into shadow map
-    for (const auto& entry : m_chunks) {
-        if (!entry.chunk || entry.instanceCount == 0)
-            continue;
-        
-        // Set chunk transform
-        GLint uChunkTransform = glGetUniformLocation(m_depthProgram, "uChunkTransform");
-        glUniformMatrix4fv(uChunkTransform, 1, GL_FALSE, glm::value_ptr(entry.transform));
-        
-        // Bind instance data (same layout as forward rendering)
-        glBindBuffer(GL_ARRAY_BUFFER, entry.instanceVBO);
-        
-        size_t offset = 0;
-        
-        // aInstancePosition (vec3)
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(1, 1);
-        offset += sizeof(Vec3);
-        
-        // aInstanceNormal (vec3)
-        glEnableVertexAttribArray(2);
-        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(2, 1);
-        offset += sizeof(Vec3);
-        
-        // aInstanceWidth (float)
-        glEnableVertexAttribArray(3);
-        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(3, 1);
-        offset += sizeof(float);
-        
-        // aInstanceHeight (float)
-        glEnableVertexAttribArray(4);
-        glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(4, 1);
-        offset += sizeof(float);
-        
-        // aInstanceLightmapU (float)
-        glEnableVertexAttribArray(5);
-        glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(5, 1);
-        offset += sizeof(float);
-        
-        // aInstanceLightmapV (float)
-        glEnableVertexAttribArray(6);
-        glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(6, 1);
-        offset += sizeof(float);
-        
-        // aInstanceBlockType (uint8_t)
-        glEnableVertexAttribArray(7);
-        glVertexAttribIPointer(7, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(7, 1);
-        offset += sizeof(uint8_t);
-        
-        // aInstanceFaceDir (uint8_t)
-        glEnableVertexAttribArray(8);
-        glVertexAttribIPointer(8, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(8, 1);
-        
-        // Draw instanced (same as forward pass, but depth shader)
-        glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0, entry.instanceCount);
+    // Rebuild MDI buffers if dirty
+    if (m_mdiDirty) {
+        rebuildMDIBuffers();
     }
+    
+    // Count non-empty draws
+    size_t drawCount = 0;
+    for (const auto& entry : m_chunks) {
+        if (entry.instanceCount > 0) drawCount++;
+    }
+    
+    if (drawCount == 0) {
+        return;
+    }
+    
+    // Update transforms every frame (islands are moving!)
+    std::vector<glm::mat4> transforms;
+    transforms.reserve(drawCount);
+    for (const auto& entry : m_chunks) {
+        if (entry.instanceCount > 0) {
+            transforms.push_back(entry.transform);
+        }
+    }
+    
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, transforms.size() * sizeof(glm::mat4), transforms.data());
+    
+    // Bind global VAO and transform SSBO
+    glBindVertexArray(m_globalVAO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_transformSSBO);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
+    
+    // SINGLE MDI CALL FOR ALL CHUNKS! (shadows)
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
+                                static_cast<GLsizei>(drawCount), 0);
     
     glBindVertexArray(0);
 }

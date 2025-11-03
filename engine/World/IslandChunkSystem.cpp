@@ -648,7 +648,7 @@ void IslandChunkSystem::setVoxelInIsland(uint32_t islandID, const Vec3& islandRe
         chunk = chunkPtr.get();
     }
 
-    // Set voxel and rebuild meshes outside of islands mutex to avoid deadlocks
+    // Set voxel outside of islands mutex to avoid deadlocks
     int x = static_cast<int>(localPos.x);
     int y = static_cast<int>(localPos.y);
     int z = static_cast<int>(localPos.z);
@@ -656,7 +656,8 @@ void IslandChunkSystem::setVoxelInIsland(uint32_t islandID, const Vec3& islandRe
         return;
     
     chunk->setVoxel(x, y, z, voxelType);
-    chunk->generateMesh();  // Already builds collision mesh internally
+    // Note: mesh regeneration is handled by the caller (GameClient or GameServer)
+    // to allow batch updates and neighbor chunk updates
 }
 
 void IslandChunkSystem::setVoxelWithAutoChunk(uint32_t islandID, const Vec3& islandRelativePos, uint8_t voxelType)
@@ -735,17 +736,40 @@ void IslandChunkSystem::updateIslandPhysics(float deltaTime)
     std::lock_guard<std::mutex> lock(m_islandsMutex);
     for (auto& [id, island] : m_islands)
     {
-        // Apply velocity to position
-        island.physicsCenter.x += island.velocity.x * deltaTime;
-        island.physicsCenter.y += island.velocity.y * deltaTime;
-        island.physicsCenter.z += island.velocity.z * deltaTime;
+        // Track if island actually moved/rotated this frame
+        bool moved = false;
         
-        // Apply angular velocity to rotation
-        island.rotation.x += island.angularVelocity.x * deltaTime;
-        island.rotation.y += island.angularVelocity.y * deltaTime;
-        island.rotation.z += island.angularVelocity.z * deltaTime;
+        // OPTIMIZATION: Only update if island is actually moving
+        float velocityMagnitudeSq = island.velocity.x * island.velocity.x +
+                                    island.velocity.y * island.velocity.y +
+                                    island.velocity.z * island.velocity.z;
         
-        island.needsPhysicsUpdate = true;
+        if (velocityMagnitudeSq > 0.0001f) // Threshold: ~0.01 units/sec
+        {
+            island.physicsCenter.x += island.velocity.x * deltaTime;
+            island.physicsCenter.y += island.velocity.y * deltaTime;
+            island.physicsCenter.z += island.velocity.z * deltaTime;
+            moved = true;
+        }
+        
+        // OPTIMIZATION: Only update rotation if island is actually rotating
+        float angularMagnitudeSq = island.angularVelocity.x * island.angularVelocity.x +
+                                   island.angularVelocity.y * island.angularVelocity.y +
+                                   island.angularVelocity.z * island.angularVelocity.z;
+        
+        if (angularMagnitudeSq > 0.0001f) // Threshold: ~0.01 rad/sec
+        {
+            island.rotation.x += island.angularVelocity.x * deltaTime;
+            island.rotation.y += island.angularVelocity.y * deltaTime;
+            island.rotation.z += island.angularVelocity.z * deltaTime;
+            moved = true;
+        }
+        
+        // Only mark for GPU update if island actually moved
+        if (moved)
+        {
+            island.needsPhysicsUpdate = true;
+        }
     }
 }
 
@@ -801,12 +825,17 @@ void IslandChunkSystem::syncPhysicsToChunks()
                 g_instancedQuadRenderer->updateChunkTransform(chunk.get(), chunkTransform);
             }
             
-            // === UPDATE GLB MODEL RENDERER (only for OBJ block types) ===
+            // === UPDATE GLB MODEL RENDERER (only for chunks with OBJ instances) ===
             if (g_modelRenderer && !objBlockTypes.empty())
             {
                 for (uint8_t blockID : objBlockTypes)
                 {
-                    g_modelRenderer->updateModelMatrix(blockID, chunk.get(), chunkTransform);
+                    // OPTIMIZATION: Skip chunks with zero instances of this block type
+                    const auto& instances = chunk->getModelInstances(blockID);
+                    if (!instances.empty())
+                    {
+                        g_modelRenderer->updateModelMatrix(blockID, chunk.get(), chunkTransform);
+                    }
                 }
             }
         }

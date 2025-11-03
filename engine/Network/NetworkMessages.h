@@ -70,7 +70,7 @@ struct PACKED CompressedIslandHeader {
     uint8_t type = COMPRESSED_ISLAND_DATA;
     uint32_t islandID;
     Vec3 position;
-    uint32_t originalSize;      // Uncompressed voxel data size (should be 32*32*32 = 32768)
+    uint32_t originalSize;      // Uncompressed voxel data size (VoxelChunk::VOLUME bytes)
     uint32_t compressedSize;    // Size of the compressed data that follows
     // Compressed voxel data follows this header (variable length)
 };
@@ -81,14 +81,15 @@ struct PACKED CompressedChunkHeader {
     uint32_t islandID;              // Which island this chunk belongs to
     Vec3 chunkCoord;                // Chunk coordinate within the island (0,0,0), (1,0,0), etc.
     Vec3 islandPosition;            // Island's physics center for positioning
-    uint32_t originalSize;          // Uncompressed voxel data size (should be 16*16*16 = 4096)
+    uint32_t originalSize;          // Uncompressed voxel data size (VoxelChunk::VOLUME bytes)
     uint32_t compressedSize;        // Size of the compressed data that follows
     // Compressed voxel data follows this header (variable length)
 };
 
-// Maximum size for compressed data (conservative estimate)
-constexpr uint32_t MAX_COMPRESSED_ISLAND_SIZE = 16384; // 16KB max compressed size
-constexpr uint32_t MAX_COMPRESSED_CHUNK_SIZE = 16384;  // 16KB max compressed chunk size
+// Maximum size for compressed data (conservative estimate for 128x128x128 chunks)
+// Worst case: ~2MB uncompressed, LZ4 compression typically achieves 60-80% reduction
+constexpr uint32_t MAX_COMPRESSED_ISLAND_SIZE = 1048576; // 1MB max compressed size
+constexpr uint32_t MAX_COMPRESSED_CHUNK_SIZE = 1048576;  // 1MB max compressed chunk size
 
 // Voxel change request from client to server
 struct PACKED VoxelChangeRequest {

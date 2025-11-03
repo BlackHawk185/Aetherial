@@ -36,7 +36,6 @@ public:
     
 private:
     // HUD element rendering methods
-    void renderCrosshair();
     void renderHealthBar();
     void renderDebugInfo();
     void renderCurrentBlock();

@@ -54,10 +54,10 @@ private:
     // Uniform locations
     GLint m_uViewProjection;
     GLint m_uView;
-    GLint m_uTexture;
-    GLint m_uStoneTexture;
-    GLint m_uGrassTexture;
-    GLint m_uSandTexture;
+    GLint m_uTextureStone;
+    GLint m_uTextureDirt;
+    GLint m_uTextureGrass;
+    GLint m_uTextureSand;
     
     // CSM/PCF shadow uniforms
     GLint m_uShadowMap;
@@ -65,15 +65,32 @@ private:
     GLint m_uLightDir;
     GLint m_uCascadeVP;
     
+    // MDI: DrawElementsIndirectCommand structure
+    struct DrawElementsIndirectCommand {
+        uint32_t count;         // Number of indices (always 6 for quad)
+        uint32_t instanceCount; // Number of quads in this chunk
+        uint32_t firstIndex;    // Starting index (always 0)
+        uint32_t baseVertex;    // Base vertex offset (always 0)
+        uint32_t baseInstance;  // Starting instance for this draw
+    };
+    
     // Chunk registration
     struct ChunkEntry {
         VoxelChunk* chunk;
         glm::mat4 transform;
-        GLuint instanceVBO;  // Per-chunk instance buffer
         size_t instanceCount;
+        size_t baseInstance;    // Offset into merged instance buffer
     };
     
     std::vector<ChunkEntry> m_chunks;
+    
+    // MDI buffers
+    GLuint m_globalVAO;              // Single VAO for all chunks
+    GLuint m_globalInstanceVBO;      // Merged instance data for all chunks
+    GLuint m_indirectCommandBuffer;  // GPU buffer for draw commands
+    GLuint m_transformSSBO;          // Chunk transforms for shader lookup
+    
+    bool m_mdiDirty;                 // True when buffers need rebuild
     
     // Helper methods
     void createUnitQuad();
@@ -81,6 +98,7 @@ private:
     void createDepthShader();
     GLuint compileShader(const char* source, GLenum type);
     void uploadChunkInstances(ChunkEntry& entry);
+    void rebuildMDIBuffers();  // Rebuild merged buffers for MDI
 };
 
 // Global instance

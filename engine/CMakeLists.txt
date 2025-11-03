@@ -19,7 +19,6 @@ add_library(engine STATIC
     World/VoronoiIslandPlacer.cpp
     
     # Rendering systems
-    Rendering/Renderer.cpp
     Rendering/InstancedQuadRenderer.cpp  # GPU instanced quad renderer with shared unit quad
     Rendering/TextureManager.cpp
     Rendering/ShaderManager.cpp

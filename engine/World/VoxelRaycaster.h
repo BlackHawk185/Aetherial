@@ -24,16 +24,10 @@ public:
     // Cast ray from camera to find block intersections - **INTEGRATED VERSION**
     static RayHit raycast(const Vec3& origin, const Vec3& direction, float maxDistance, IslandChunkSystem* islandSystem);
     
-    // Cast ray using VoxelChunk (deprecated compatibility method)
-    static RayHit raycast(const Vec3& origin, const Vec3& direction, float maxDistance, VoxelChunk* voxelChunk);
-    
     // Helper to get placement position (adjacent to hit face)
     static Vec3 getPlacementPosition(const RayHit& hit);
     
 private:
     // **INTEGRATED DDA** - Uses IslandChunkSystem infrastructure
     static RayHit performDDA(const Vec3& rayStart, const Vec3& rayDirection, float maxDistance, IslandChunkSystem* islandSystem);
-    
-    // **DEPRECATED** - VoxelChunk-specific version (compatibility only)
-    static RayHit performDDA(const Vec3& rayStart, const Vec3& rayDirection, float maxDistance, VoxelChunk* voxelChunk);
 };

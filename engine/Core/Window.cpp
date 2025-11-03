@@ -79,8 +79,8 @@ bool Window::initialize(int width, int height, const std::string& title, bool en
         return false;
     }
 
-    // Enable V-Sync
-    glfwSwapInterval(1);
+    // Disable V-Sync for maximum performance (uncapped FPS)
+    glfwSwapInterval(0);
 
     // Print basic system information
     std::cout << "OpenGL " << glGetString(GL_VERSION) << " (" << glGetString(GL_RENDERER) << ")" << std::endl;

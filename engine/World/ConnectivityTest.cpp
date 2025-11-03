@@ -182,9 +182,10 @@ void testBlockBreakSplit(uint32_t islandID) {
     
     std::cout << "✅ Created two cubes connected by single block at (0,0,0)" << std::endl;
     
-    // Test if breaking the bridge block would split
+    // Test if breaking the bridge block would split using new fast method
     std::cout << "Testing if breaking bridge block would cause split..." << std::endl;
-    bool wouldSplit = ConnectivityAnalyzer::wouldBreakingSplitIsland(island, criticalBlock);
+    Vec3 fragmentAnchor;
+    bool wouldSplit = ConnectivityAnalyzer::wouldBreakingCauseSplit(island, criticalBlock, fragmentAnchor);
     
     if (wouldSplit) {
         std::cout << "✅ Correctly detected: Breaking block WOULD split island!" << std::endl;

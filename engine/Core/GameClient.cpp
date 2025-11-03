@@ -17,7 +17,6 @@
 
 #include "../Network/NetworkManager.h"
 #include "../Network/NetworkMessages.h"
-#include "../Rendering/Renderer.h"
 #include "../Rendering/BlockHighlightRenderer.h"
 #include "../Rendering/SkyRenderer.h"
 #include "../UI/HUD.h"
@@ -101,8 +100,6 @@ bool GameClient::initialize(bool enableDebug)
 
     m_debugMode = enableDebug;
 
-    // Removed verbose debug output
-
     // Initialize window and graphics
     if (!initializeWindow())
     {
@@ -115,7 +112,6 @@ bool GameClient::initialize(bool enableDebug)
     }
 
     m_initialized = true;
-    // Removed verbose debug output
     return true;
 }
 
@@ -158,8 +154,6 @@ bool GameClient::connectToRemoteServer(const std::string& serverAddress, uint16_
         return false;
     }
 
-    // Removed verbose debug output
-
     // Connect to remote server
     if (!m_networkManager->joinServer(serverAddress, serverPort))
     {
@@ -169,11 +163,6 @@ bool GameClient::connectToRemoteServer(const std::string& serverAddress, uint16_
 
     m_isRemoteClient = true;
 
-    // Initial world state will be received from server after handshake protocol
-    // For now, create a minimal local state for rendering
-    // This will be replaced by data received from server
-
-    // Removed verbose debug output
     return true;
 }
 
@@ -261,8 +250,6 @@ void GameClient::shutdown()
         return;
     }
 
-    // Removed verbose debug output
-
     // Disconnect from game state
     m_gameState = nullptr;
 
@@ -296,7 +283,6 @@ void GameClient::shutdown()
     glfwTerminate();
 
     m_initialized = false;
-    // Removed verbose debug output
 }
 
 bool GameClient::shouldClose() const
@@ -413,13 +399,6 @@ bool GameClient::initializeWindow()
 
 bool GameClient::initializeGraphics()
 {
-    // Initialize renderer
-    if (!Renderer::initialize())
-    {
-        std::cerr << "Failed to initialize renderer!" << std::endl;
-        return false;
-    }
-    
     // Initialize texture manager (needed by all renderers)
     extern TextureManager* g_textureManager;
     if (!g_textureManager)
@@ -495,10 +474,9 @@ bool GameClient::initializeGraphics()
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     (void) io;
-    io.ConfigFlags |= ImGuiConfigFlags_NavNoCaptureKeyboard; // Don't capture keyboard
+    io.ConfigFlags |= ImGuiConfigFlags_NavNoCaptureKeyboard;
     ImGui::StyleColorsDark();
     
-    // Initialize ImGui backends
     ImGui_ImplGlfw_InitForOpenGL(m_window->getHandle(), true);
     ImGui_ImplOpenGL3_Init("#version 460");
 
@@ -507,22 +485,7 @@ bool GameClient::initializeGraphics()
 
 void GameClient::processKeyboard(float deltaTime)
 {
-    (void)deltaTime; // Currently unused but reserved for future input timing
-    // Time effects (temporary, will be refactored)
-    if (g_timeEffects)
-    {
-        // TODO: Implement proper time effect methods
-        // The actual method names need to be checked in TimeEffects.h
-        /*
-        if (glfwGetKey(m_window->getHandle(), GLFW_KEY_1) == GLFW_PRESS) g_timeEffects->setSlowMotion();
-        if (glfwGetKey(m_window->getHandle(), GLFW_KEY_2) == GLFW_PRESS) g_timeEffects->setBulletTime();
-        if (glfwGetKey(m_window->getHandle(), GLFW_KEY_3) == GLFW_PRESS) g_timeEffects->setTimeFreeze();
-        if (glfwGetKey(m_window->getHandle(), GLFW_KEY_4) == GLFW_PRESS) g_timeEffects->setSpeedUp();
-        if (glfwGetKey(m_window->getHandle(), GLFW_KEY_5) == GLFW_PRESS) g_timeEffects->setTimeReverse();
-        if (glfwGetKey(m_window->getHandle(), GLFW_KEY_0) == GLFW_PRESS) g_timeEffects->resetTime();
-        if (glfwGetKey(m_window->getHandle(), GLFW_KEY_T) == GLFW_PRESS) g_timeEffects->toggleTimePulse();
-        */
-    }
+    (void)deltaTime;
     
     // Tab key - toggle periodic table UI
     {
@@ -1095,8 +1058,6 @@ void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& p
         return;
     }
 
-    // Removed verbose debug output
-
     auto* islandSystem = m_gameState->getIslandSystem();
     if (!islandSystem)
     {
@@ -1105,9 +1066,7 @@ void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& p
     }
 
     // Create the island at the specified position with the server's ID
-    // We'll create it locally and map the server ID to our local island
     uint32_t localIslandID = islandSystem->createIsland(position);
-    // Removed verbose debug output
 
     // Get the island and apply the voxel data
     FloatingIsland* island = islandSystem->getIsland(localIslandID);
@@ -1361,13 +1320,3 @@ void GameClient::handleEntityStateUpdate(const EntityStateUpdate& update)
             break;
     }
 }
-
-// ================================
-// CRITICAL: Centralized Player Spawn Function
-// ================================
-// This is the ONLY function that should set player position
-// Ensures m_playerController.getCamera().position and m_physicsPosition stay in sync
-// spawnPlayerAt() removed - use PlayerController::setPosition()
-
-// Window resize callback handled via Engine::Core::Window::setResizeCallback
-

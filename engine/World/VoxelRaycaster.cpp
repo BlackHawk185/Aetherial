@@ -14,12 +14,6 @@ RayHit VoxelRaycaster::raycast(const Vec3& origin, const Vec3& direction, float 
     return performDDA(origin, direction, maxDistance, islandSystem);
 }
 
-RayHit VoxelRaycaster::raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
-                               VoxelChunk* voxelChunk)
-{
-    return performDDA(origin, direction, maxDistance, voxelChunk);
-}
-
 Vec3 VoxelRaycaster::getPlacementPosition(const RayHit& hit)
 {
     if (!hit.hit)
@@ -206,15 +200,4 @@ RayHit VoxelRaycaster::performDDA(const Vec3& rayStart, const Vec3& rayDirection
     }
     
     return closestHit; // Return closest hit across all islands (or miss if none)
-}
-
-// **SIMPLIFIED COMPATIBILITY METHOD** - Just calls the main integrated method
-RayHit VoxelRaycaster::performDDA(const Vec3& rayStart, const Vec3& rayDirection, float maxDistance,
-                                  VoxelChunk* voxelChunk)
-{
-    // This compatibility method is deprecated - VoxelChunk-specific raycasting
-    // should use the IslandChunkSystem version instead
-    RayHit result;
-    result.hit = false;
-    return result;
 }

@@ -103,7 +103,7 @@ class IslandChunkSystem;  // Forward declaration
 class VoxelChunk
 {
    public:
-    static constexpr int SIZE = 16;  // 16x16x16 chunks
+    static constexpr int SIZE = 128;  // 128x128x128 chunks for large islands
     static constexpr int VOLUME = SIZE * SIZE * SIZE;
     
     // Static island system pointer for inter-chunk queries (must be public for IslandChunkSystem to access)
