@@ -14,6 +14,7 @@
 
 #include "VoxelChunk.h"
 #include "BlockType.h"
+#include "AsyncMeshGenerator.h"
 #include "../Profiling/Profiler.h"
 #include "../Rendering/InstancedQuadRenderer.h"
 #include "../Rendering/ModelInstanceRenderer.h"
@@ -411,8 +412,31 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     auto registrationEnd = std::chrono::high_resolution_clock::now();
     auto registrationDuration = std::chrono::duration_cast<std::chrono::milliseconds>(registrationEnd - registrationStart).count();
     
-    std::cout << "� Chunk Registration: " << registrationDuration << "ms (" << chunksRegistered << " chunks)" << std::endl;
-    std::cout << "   └─ Mesh generation deferred to first render (lazy generation)" << std::endl;
+    std::cout << "📦 Chunk Registration: " << registrationDuration << "ms (" << chunksRegistered << " chunks)" << std::endl;
+    
+    // Queue chunks for async mesh generation (if available)
+    auto meshGenStart = std::chrono::high_resolution_clock::now();
+    int chunksQueued = 0;
+    
+    if (g_asyncMeshGenerator)
+    {
+        for (auto& [chunkCoord, chunk] : island->chunks)
+        {
+            if (chunk)
+            {
+                g_asyncMeshGenerator->queueChunkMeshGeneration(chunk.get());
+                chunksQueued++;
+            }
+        }
+        
+        auto meshGenEnd = std::chrono::high_resolution_clock::now();
+        auto meshGenDuration = std::chrono::duration_cast<std::chrono::milliseconds>(meshGenEnd - meshGenStart).count();
+        std::cout << "🔄 Async Mesh Queue: " << meshGenDuration << "ms (" << chunksQueued << " chunks queued)" << std::endl;
+    }
+    else
+    {
+        std::cout << "   └─ Async mesh generator not available - meshes will generate on first render" << std::endl;
+    }
     
     auto totalEnd = std::chrono::high_resolution_clock::now();
     auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(totalEnd - startTime).count();

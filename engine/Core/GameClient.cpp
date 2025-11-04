@@ -1278,37 +1278,22 @@ void GameClient::handleVoxelChangeReceived(const VoxelChangeUpdate& update)
     // Apply the authoritative voxel change from server
     m_gameState->setVoxel(update.islandID, update.localPos, update.voxelType);
 
-    // Update instanced renderer (regenerate mesh for modified chunk)
-    if (g_instancedQuadRenderer)
+    // Queue async mesh generation for ONLY the modified chunk
+    // NO neighbor updates - inter-chunk culling removed for performance
+    if (g_instancedQuadRenderer && g_asyncMeshGenerator)
     {
         auto* islandSystem = m_gameState->getIslandSystem();
         Vec3 chunkCoord = FloatingIsland::islandPosToChunkCoord(update.localPos);
         auto* chunk = islandSystem->getChunkFromIsland(update.islandID, chunkCoord);
         if (chunk)
         {
-            // Regenerate mesh for this chunk (already done by setVoxel->setVoxelInIsland->generateMesh)
-            // But we need to re-upload the mesh data to GPU
-            g_instancedQuadRenderer->rebuildChunk(chunk);
-            
-            // Also check if neighbor chunks need updating (for face culling)
-            for (int dx = -1; dx <= 1; dx++)
-            {
-                for (int dy = -1; dy <= 1; dy++)
+            // Queue async mesh generation for the modified chunk
+            g_asyncMeshGenerator->queueChunkMeshGeneration(chunk, [chunk]() {
+                if (g_instancedQuadRenderer)
                 {
-                    for (int dz = -1; dz <= 1; dz++)
-                    {
-                        if (dx == 0 && dy == 0 && dz == 0) continue;
-                        
-                        Vec3 neighborCoord(chunkCoord.x + dx, chunkCoord.y + dy, chunkCoord.z + dz);
-                        auto* neighbor = islandSystem->getChunkFromIsland(update.islandID, neighborCoord);
-                        if (neighbor)
-                        {
-                            neighbor->generateMesh(true);
-                            g_instancedQuadRenderer->rebuildChunk(neighbor);
-                        }
-                    }
+                    g_instancedQuadRenderer->rebuildChunk(chunk);
                 }
-            }
+            });
         }
     }
 

@@ -80,6 +80,7 @@ private:
         glm::mat4 transform;
         size_t instanceCount;
         size_t baseInstance;    // Offset into merged instance buffer
+        size_t allocatedSlots;  // Pre-allocated buffer space for this chunk
     };
     
     std::vector<ChunkEntry> m_chunks;
@@ -91,6 +92,7 @@ private:
     GLuint m_transformSSBO;          // Chunk transforms for shader lookup
     
     bool m_mdiDirty;                 // True when buffers need rebuild
+    size_t m_totalAllocatedInstances; // Total buffer capacity (with padding)
     
     // Helper methods
     void createUnitQuad();
@@ -98,7 +100,9 @@ private:
     void createDepthShader();
     GLuint compileShader(const char* source, GLenum type);
     void uploadChunkInstances(ChunkEntry& entry);
-    void rebuildMDIBuffers();  // Rebuild merged buffers for MDI
+    void rebuildMDIBuffers();  // Rebuild merged buffers for MDI (full)
+    void updateSingleChunkGPU(ChunkEntry& entry);  // Partial update for one chunk
+    size_t calculateChunkSlots(size_t quadCount);  // Calculate padded allocation size
 };
 
 // Global instance

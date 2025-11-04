@@ -1,4 +1,4 @@
-// VoxelChunk.cpp - 32x32x32 dynamic physics-enabled voxel chunks
+// VoxelChunk.cpp - 256x256x256 dynamic physics-enabled voxel chunks
 #include "VoxelChunk.h"
 #include "BlockType.h"
 
@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>  // For std::memset (greedy meshing optimization)
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -47,8 +46,32 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
 {
     if (x < 0 || x >= SIZE || y < 0 || y >= SIZE || z < 0 || z >= SIZE)
         return;
+    
+    uint8_t oldType = voxels[x + y * SIZE + z * SIZE * SIZE];
+    if (oldType == type) return; // No change
+    
     voxels[x + y * SIZE + z * SIZE * SIZE] = type;
-    meshDirty = true;
+    
+    // Only use incremental updates if enabled (disabled during world generation)
+    if (m_incrementalUpdatesEnabled) {
+        // Use incremental updates for runtime block changes
+        if (oldType == BlockID::AIR && type != BlockID::AIR) {
+            // Block placed - add its quads and update neighbors
+            addBlockQuads(x, y, z, type);
+            updateNeighborQuads(x, y, z, true);
+        } else if (oldType != BlockID::AIR && type == BlockID::AIR) {
+            // Block removed - remove its quads and update neighbors
+            removeBlockQuads(x, y, z);
+            updateNeighborQuads(x, y, z, false);
+        } else {
+            // Block type changed (rare) - remove old, add new
+            removeBlockQuads(x, y, z);
+            addBlockQuads(x, y, z, type);
+            // No neighbor update needed - faces stay the same
+        }
+    }
+    
+    meshDirty = true; // Keep for backwards compatibility with generateMesh()
 }
 
 void VoxelChunk::setRawVoxelData(const uint8_t* data, uint32_t size)
@@ -88,6 +111,8 @@ void VoxelChunk::generateMesh(bool generateLighting)
 {
     PROFILE_SCOPE("VoxelChunk::generateMesh");
     
+    auto t_start = std::chrono::high_resolution_clock::now();
+    
     (void)generateLighting; // Parameter kept for API compatibility but unused (real-time lighting only)
     
     // Build into a new mesh (no locks needed - parallel-safe!)
@@ -96,6 +121,8 @@ void VoxelChunk::generateMesh(bool generateLighting)
     
     // Temporary storage for model instances during mesh generation
     std::unordered_map<uint8_t, std::vector<Vec3>> tempModelInstances;
+    
+    auto t_prescan_start = std::chrono::high_resolution_clock::now();
     
     // Pre-scan for all OBJ-type blocks to create instance anchors (and ensure they are not meshed)
     auto& registry = BlockTypeRegistry::getInstance();
@@ -115,11 +142,17 @@ void VoxelChunk::generateMesh(bool generateLighting)
             }
         }
     }
+    
+    auto t_prescan_end = std::chrono::high_resolution_clock::now();
+    auto t_mesh_start = std::chrono::high_resolution_clock::now();
 
     // Simple mesh generation - one quad per exposed face
     generateSimpleMeshInto(newMesh->quads);
     
-    // Build collision mesh from generated quads
+    auto t_mesh_end = std::chrono::high_resolution_clock::now();
+    auto t_collision_start = std::chrono::high_resolution_clock::now();
+    
+    // Build collision mesh from generated quads (trivial copy)
     for (const auto& quad : newMesh->quads)
     {
         newCollisionMesh->faces.push_back({
@@ -130,16 +163,52 @@ void VoxelChunk::generateMesh(bool generateLighting)
         });
     }
     
+    auto t_collision_end = std::chrono::high_resolution_clock::now();
+    
+    // Build quad lookup map for incremental updates
+    m_quadLookup.clear();
+    for (size_t i = 0; i < newMesh->quads.size(); ++i) {
+        const auto& quad = newMesh->quads[i];
+        // Reverse-engineer voxel position from quad center position
+        int x = static_cast<int>(quad.position.x);
+        int y = static_cast<int>(quad.position.y);
+        int z = static_cast<int>(quad.position.z);
+        int face = quad.faceDir;
+        
+        // Adjust for face offset (quad center is offset from voxel corner)
+        if (face == 1) y--;       // Top face (+Y)
+        else if (face == 3) z--;  // Front face (+Z)
+        else if (face == 5) x--;  // Right face (+X)
+        
+        uint64_t key = makeQuadKey(x, y, z, face);
+        m_quadLookup[key] = i;
+    }
+    
     newMesh->needsUpdate = true;
     
-    // ATOMIC SWAP - instant switch, no locks needed!
-    setRenderMesh(newMesh);
-    setCollisionMesh(newCollisionMesh);
+    // DIRECT ASSIGNMENT - fast, no atomic overhead!
+    renderMesh = newMesh;
+    collisionMesh = newCollisionMesh;
     
     // Update model instances (protected by implicit synchronization)
     m_modelInstances = std::move(tempModelInstances);
     
     meshDirty = false;
+    
+    // Enable incremental updates after first full mesh generation
+    m_incrementalUpdatesEnabled = true;
+    
+    auto t_end = std::chrono::high_resolution_clock::now();
+    
+    // Performance tracking
+    auto prescan_ms = std::chrono::duration<double, std::milli>(t_prescan_end - t_prescan_start).count();
+    auto mesh_ms = std::chrono::duration<double, std::milli>(t_mesh_end - t_mesh_start).count();
+    auto collision_ms = std::chrono::duration<double, std::milli>(t_collision_end - t_collision_start).count();
+    auto total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    
+    std::cout << "🔧 MESH GEN: Total=" << total_ms << "ms (Prescan=" << prescan_ms 
+              << "ms, Mesh=" << mesh_ms << "ms, Collision=" << collision_ms 
+              << "ms) Quads=" << newMesh->quads.size() << std::endl;
 }
 
 void VoxelChunk::buildCollisionMesh()
@@ -234,188 +303,68 @@ bool VoxelChunk::shouldRender(const Vec3& cameraPos, float maxDistance) const
 // UNIFIED CULLING - Works for intra-chunk AND inter-chunk
 // ========================================
 
+// INTRA-CHUNK CULLING ONLY - Inter-chunk culling removed for performance
+// Boundary faces are always rendered (negligible visual difference, massive speed gain)
 bool VoxelChunk::isFaceExposed(int x, int y, int z, int face) const
 {
-    // STANDARD OpenGL/Minecraft face ordering for sanity:
-    // 0=-Y(bottom), 1=+Y(top), 2=-Z(back), 3=+Z(front), 4=-X(left), 5=+X(right)
     static const int dx[6] = { 0,  0,  0,  0, -1,  1};
     static const int dy[6] = {-1,  1,  0,  0,  0,  0};
     static const int dz[6] = { 0,  0, -1,  1,  0,  0};
     
-    // Calculate neighbor position in LOCAL chunk space
     int nx = x + dx[face];
     int ny = y + dy[face];
     int nz = z + dz[face];
     
-    // Fast path: neighbor is within this chunk
-    if (nx >= 0 && nx < SIZE && ny >= 0 && ny < SIZE && nz >= 0 && nz < SIZE)
+    // Only check within this chunk - out of bounds = exposed
+    if (nx < 0 || nx >= SIZE || ny < 0 || ny >= SIZE || nz < 0 || nz >= SIZE)
     {
-        return !isVoxelSolid(nx, ny, nz);
+        return true;  // Chunk boundary = always render face
     }
     
-    // Slow path: neighbor is in adjacent chunk - query island system
-    if (m_islandID == 0 || !s_islandSystem) return true;  // No island context = always exposed
-    
-    // Calculate which neighbor chunk we need
-    Vec3 neighborChunkCoord = m_chunkCoord;
-    int localX = nx, localY = ny, localZ = nz;
-    
-    if (nx < 0) { neighborChunkCoord.x -= 1; localX = SIZE - 1; }
-    else if (nx >= SIZE) { neighborChunkCoord.x += 1; localX = 0; }
-    
-    if (ny < 0) { neighborChunkCoord.y -= 1; localY = SIZE - 1; }
-    else if (ny >= SIZE) { neighborChunkCoord.y += 1; localY = 0; }
-    
-    if (nz < 0) { neighborChunkCoord.z -= 1; localZ = SIZE - 1; }
-    else if (nz >= SIZE) { neighborChunkCoord.z += 1; localZ = 0; }
-    
-    // Query neighbor chunk
-    VoxelChunk* neighborChunk = s_islandSystem->getChunkFromIsland(m_islandID, neighborChunkCoord);
-    if (!neighborChunk) return true;  // Neighbor doesn't exist yet = exposed
-    
-    return !neighborChunk->isVoxelSolid(localX, localY, localZ);
+    return !isVoxelSolid(nx, ny, nz);
 }
 
 // ========================================
-// GREEDY MESHING IMPLEMENTATION
+// SIMPLE MESHING - One quad per exposed face
 // ========================================
-// Merges adjacent quads of the same block type into larger rectangles
-// Reduces vertex count by 70-90% compared to simple meshing
 
 void VoxelChunk::generateSimpleMeshInto(std::vector<QuadFace>& quads)
 {
     PROFILE_SCOPE("VoxelChunk::generateSimpleMesh");
     
-    // Stack-allocated mask buffer (reused 6×SIZE times per chunk)
-    // SIZE×SIZE bytes (512×512 = 256 KB for 512³ chunks - safe for stack)
-    // Eliminates 6×SIZE heap allocations + deallocations per chunk!
-    uint8_t maskBuffer[SIZE * SIZE];
+    auto t_start = std::chrono::high_resolution_clock::now();
     
-    // For each of the 6 face directions, perform greedy meshing
-    for (int faceDir = 0; faceDir < 6; ++faceDir)
+    size_t totalQuadsGenerated = 0;
+    
+    // Iterate through all voxels once
+    for (int z = 0; z < SIZE; ++z)
     {
-        // Determine the axes based on face direction
-        // Face 0=-Y, 1=+Y, 2=-Z, 3=+Z, 4=-X, 5=+X
-        int du, dv, dn;  // Axis indices: u = width, v = height, n = depth (normal direction)
-        int nu, nv, nn;  // Dimensions along each axis
-        
-        switch (faceDir)
+        for (int y = 0; y < SIZE; ++y)
         {
-            case 0: case 1: // Y faces (top/bottom)
-                du = 0; dv = 2; dn = 1;  // u=X, v=Z, n=Y
-                nu = SIZE; nv = SIZE; nn = SIZE;
-                break;
-            case 2: case 3: // Z faces (front/back)
-                du = 0; dv = 1; dn = 2;  // u=X, v=Y, n=Z
-                nu = SIZE; nv = SIZE; nn = SIZE;
-                break;
-            case 4: case 5: // X faces (left/right)
-                du = 2; dv = 1; dn = 0;  // u=Z, v=Y, n=X
-                nu = SIZE; nv = SIZE; nn = SIZE;
-                break;
-            default:
-                continue;
-        }
-        
-        (void)du; (void)dv; (void)dn;  // Used indirectly via coordinate mapping
-        
-        // For each slice perpendicular to the normal direction
-        for (int n = 0; n < nn; ++n)
-        {
-            // Clear the mask for this slice (SIMD-optimized memset)
-            std::memset(maskBuffer, 0, nu * nv);
-            
-            for (int v = 0; v < nv; ++v)
+            for (int x = 0; x < SIZE; ++x)
             {
-                for (int u = 0; u < nu; ++u)
+                if (!isVoxelSolid(x, y, z))
+                    continue;
+                
+                uint8_t blockType = getVoxel(x, y, z);
+                
+                // Check all 6 faces and add 1x1 quads for exposed faces
+                for (int face = 0; face < 6; ++face)
                 {
-                    // Convert (u, v, n) to (x, y, z)
-                    int x = 0, y = 0, z = 0;
-                    if (faceDir == 0 || faceDir == 1) {      // Y faces
-                        x = u; z = v; y = n;
-                    } else if (faceDir == 2 || faceDir == 3) { // Z faces
-                        x = u; y = v; z = n;
-                    } else {                                  // X faces
-                        z = u; y = v; x = n;
-                    }
-                    
-                    // Check if voxel is solid and face is exposed
-                    if (isVoxelSolid(x, y, z) && isFaceExposed(x, y, z, faceDir))
+                    if (isFaceExposed(x, y, z, face))
                     {
-                        maskBuffer[u + v * nu] = getVoxel(x, y, z);
+                        addQuad(quads, static_cast<float>(x), static_cast<float>(y), 
+                                static_cast<float>(z), face, 1, 1, blockType);
+                        totalQuadsGenerated++;
                     }
-                }
-            }
-            
-            // Greedy meshing: merge adjacent quads into rectangles
-            for (int v = 0; v < nv; ++v)
-            {
-                for (int u = 0; u < nu; )
-                {
-                    uint8_t blockType = maskBuffer[u + v * nu];
-                    if (blockType == 0)
-                    {
-                        ++u;
-                        continue;
-                    }
-                    
-                    // Find the width (u direction) of this quad
-                    int width = 1;
-                    while (u + width < nu && maskBuffer[u + width + v * nu] == blockType)
-                    {
-                        ++width;
-                    }
-                    
-                    // Find the height (v direction) of this quad
-                    int height = 1;
-                    bool done = false;
-                    while (v + height < nv && !done)
-                    {
-                        // Check if the entire row matches
-                        for (int k = 0; k < width; ++k)
-                        {
-                            if (maskBuffer[u + k + (v + height) * nu] != blockType)
-                            {
-                                done = true;
-                                break;
-                            }
-                        }
-                        if (!done)
-                        {
-                            ++height;
-                        }
-                    }
-                    
-                    // Create a merged quad at (u, v) with dimensions (width x height)
-                    // Convert back to (x, y, z) coordinates
-                    int x = 0, y = 0, z = 0;
-                    if (faceDir == 0 || faceDir == 1) {      // Y faces
-                        x = u; z = v; y = n;
-                    } else if (faceDir == 2 || faceDir == 3) { // Z faces
-                        x = u; y = v; z = n;
-                    } else {                                  // X faces
-                        z = u; y = v; x = n;
-                    }
-                    
-                    // Add the greedy quad (used for both rendering and collision)
-                    addGreedyQuadTo(quads, static_cast<float>(x), static_cast<float>(y), static_cast<float>(z),
-                                  faceDir, width, height, blockType);
-                    
-                    // Clear the mask for the merged area
-                    for (int h = 0; h < height; ++h)
-                    {
-                        for (int w = 0; w < width; ++w)
-                        {
-                            maskBuffer[u + w + (v + h) * nu] = 0;
-                        }
-                    }
-                    
-                    // Move to the next unprocessed position
-                    u += width;
                 }
             }
         }
     }
+    
+    auto t_end = std::chrono::high_resolution_clock::now();
+    auto total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cout << "SIMPLE MESH: " << total_ms << "ms, " << totalQuadsGenerated << " quads" << std::endl;
 }
 
 // Model instance management (for BlockRenderType::OBJ blocks)
@@ -428,8 +377,8 @@ const std::vector<Vec3>& VoxelChunk::getModelInstances(uint8_t blockID) const
     return empty;
 }
 
-// Greedy quad generation for merged rectangles
-void VoxelChunk::addGreedyQuadTo(std::vector<QuadFace>& quads, float x, float y, float z, int face, int width, int height, uint8_t blockType)
+// Add a single quad to the mesh (width/height support for future optimizations)
+void VoxelChunk::addQuad(std::vector<QuadFace>& quads, float x, float y, float z, int face, int width, int height, uint8_t blockType)
 {
     // Quad vertices based on face direction
     // Face ordering: 0=-Y, 1=+Y, 2=-Z, 3=+Z, 4=-X, 5=+X
@@ -482,4 +431,183 @@ void VoxelChunk::addGreedyQuadTo(std::vector<QuadFace>& quads, float x, float y,
     
     quads.push_back(quadFace);
 }
+
+// ========================================
+// INCREMENTAL QUAD MANIPULATION
+// ========================================
+
+// Add quads for a single block's exposed faces
+void VoxelChunk::addBlockQuads(int x, int y, int z, uint8_t blockType)
+{
+    // Skip air blocks
+    if (blockType == BlockID::AIR) return;
+    
+    // Skip OBJ-type blocks (they use instanced models, not voxel quads)
+    auto& registry = BlockTypeRegistry::getInstance();
+    const BlockTypeInfo* blockInfo = registry.getBlockType(blockType);
+    if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
+        return;
+    }
+    
+    // Get mutable mesh (create if needed)
+    if (!renderMesh) {
+        renderMesh = std::make_shared<VoxelMesh>();
+    }
+    
+    // Add quads for all exposed faces
+    for (int face = 0; face < 6; ++face)
+    {
+        if (isFaceExposed(x, y, z, face))
+        {
+            // Store quad index in lookup map
+            uint64_t key = makeQuadKey(x, y, z, face);
+            size_t quadIndex = renderMesh->quads.size();
+            m_quadLookup[key] = quadIndex;
+            
+            // Add quad to mesh
+            addQuad(renderMesh->quads, static_cast<float>(x), static_cast<float>(y), 
+                   static_cast<float>(z), face, 1, 1, blockType);
+        }
+    }
+    
+    // Update collision mesh (simple copy)
+    auto collMesh = std::make_shared<CollisionMesh>();
+    for (const auto& quad : renderMesh->quads) {
+        collMesh->faces.push_back({quad.position, quad.normal, quad.width, quad.height});
+    }
+    collisionMesh = collMesh;
+    
+    markGPUDirty();
+}
+
+// Remove all quads for a block
+void VoxelChunk::removeBlockQuads(int x, int y, int z)
+{
+    if (!renderMesh || renderMesh->quads.empty()) return;
+    
+    // Find and remove all 6 possible face quads for this block
+    std::vector<size_t> indicesToRemove;
+    for (int face = 0; face < 6; ++face)
+    {
+        uint64_t key = makeQuadKey(x, y, z, face);
+        auto it = m_quadLookup.find(key);
+        if (it != m_quadLookup.end()) {
+            indicesToRemove.push_back(it->second);
+            m_quadLookup.erase(it);
+        }
+    }
+    
+    // Sort in reverse order to avoid index invalidation during removal
+    std::sort(indicesToRemove.rbegin(), indicesToRemove.rend());
+    
+    // Remove quads (swap-and-pop for efficiency)
+    for (size_t idx : indicesToRemove) {
+        if (idx < renderMesh->quads.size()) {
+            // Swap with last element
+            if (idx != renderMesh->quads.size() - 1) {
+                renderMesh->quads[idx] = renderMesh->quads.back();
+                // Update lookup map for the swapped quad
+                // TODO: Need to reverse-lookup the swapped quad to update its index
+            }
+            renderMesh->quads.pop_back();
+        }
+    }
+    
+    // Rebuild lookup map (safer than tracking swaps)
+    m_quadLookup.clear();
+    for (size_t i = 0; i < renderMesh->quads.size(); ++i) {
+        const auto& quad = renderMesh->quads[i];
+        // Reverse-engineer position from quad data
+        int qx = static_cast<int>(quad.position.x);
+        int qy = static_cast<int>(quad.position.y);
+        int qz = static_cast<int>(quad.position.z);
+        int qface = quad.faceDir;
+        
+        // Adjust for face offset
+        if (qface == 1) qy--;       // Top face
+        else if (qface == 3) qz--;  // Front face
+        else if (qface == 5) qx--;  // Right face
+        
+        uint64_t key = makeQuadKey(qx, qy, qz, qface);
+        m_quadLookup[key] = i;
+    }
+    
+    // Update collision mesh
+    auto collMesh = std::make_shared<CollisionMesh>();
+    for (const auto& quad : renderMesh->quads) {
+        collMesh->faces.push_back({quad.position, quad.normal, quad.width, quad.height});
+    }
+    collisionMesh = collMesh;
+    
+    markGPUDirty();
+}
+
+// Update neighbor quads when a block is added or removed
+void VoxelChunk::updateNeighborQuads(int x, int y, int z, bool blockWasAdded)
+{
+    // Face offsets and their opposite faces
+    static const int dx[6] = { 0,  0,  0,  0, -1,  1};
+    static const int dy[6] = {-1,  1,  0,  0,  0,  0};
+    static const int dz[6] = { 0,  0, -1,  1,  0,  0};
+    static const int oppositeFace[6] = {1, 0, 3, 2, 5, 4};
+    
+    for (int face = 0; face < 6; ++face)
+    {
+        int nx = x + dx[face];
+        int ny = y + dy[face];
+        int nz = z + dz[face];
+        
+        // Check if neighbor is within chunk bounds
+        if (nx < 0 || nx >= SIZE || ny < 0 || ny >= SIZE || nz < 0 || nz >= SIZE) {
+            // TODO: Cross-chunk updates - notify neighboring chunk
+            continue;
+        }
+        
+        uint8_t neighborBlock = getVoxel(nx, ny, nz);
+        if (neighborBlock == BlockID::AIR) continue;
+        
+        // Skip OBJ blocks
+        auto& registry = BlockTypeRegistry::getInstance();
+        const BlockTypeInfo* blockInfo = registry.getBlockType(neighborBlock);
+        if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
+            continue;
+        }
+        
+        int neighborFace = oppositeFace[face];
+        uint64_t key = makeQuadKey(nx, ny, nz, neighborFace);
+        
+        if (blockWasAdded) {
+            // A block was placed - neighbor face is now hidden, remove it
+            auto it = m_quadLookup.find(key);
+            if (it != m_quadLookup.end()) {
+                // Remove this specific quad (inefficient, but correct)
+                removeBlockQuads(nx, ny, nz);
+                addBlockQuads(nx, ny, nz, neighborBlock);
+            }
+        } else {
+            // A block was removed - neighbor face is now exposed, add it
+            if (m_quadLookup.find(key) == m_quadLookup.end()) {
+                // Quad doesn't exist - add it
+                if (renderMesh) {
+                    size_t quadIndex = renderMesh->quads.size();
+                    m_quadLookup[key] = quadIndex;
+                    addQuad(renderMesh->quads, static_cast<float>(nx), static_cast<float>(ny),
+                           static_cast<float>(nz), neighborFace, 1, 1, neighborBlock);
+                }
+            }
+        }
+    }
+    
+    // Update collision mesh after all neighbor updates
+    if (renderMesh) {
+        auto collMesh = std::make_shared<CollisionMesh>();
+        for (const auto& quad : renderMesh->quads) {
+            collMesh->faces.push_back({quad.position, quad.normal, quad.width, quad.height});
+        }
+        collisionMesh = collMesh;
+    }
+    
+    markGPUDirty();
+}
+
 

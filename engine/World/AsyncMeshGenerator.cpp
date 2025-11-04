@@ -7,18 +7,18 @@ AsyncMeshGenerator* g_asyncMeshGenerator = nullptr;
 AsyncMeshGenerator::AsyncMeshGenerator()
     : m_running(true), m_pendingJobs(0)
 {
-    // For large chunks (512³), mesh generation is memory-bound, not CPU-bound
-    // Single-threaded gives better cache locality and less overhead
-    // Use at most 2 threads to avoid cache thrashing
-    unsigned int threadCount = 1;  // Single-threaded mesh generation
+    // For large chunks (256³+), use multiple threads for block place/break responsiveness
+    // Each mesh generation is ~30-50ms, so parallel processing is critical
+    unsigned int threadCount = std::max(2u, std::thread::hardware_concurrency() / 2);
+    threadCount = std::min(threadCount, 8u);  // Cap at 8 threads max
     
     const char* meshThreadsEnv = std::getenv("MESH_THREADS");
     if (meshThreadsEnv) {
         threadCount = std::max(1u, static_cast<unsigned int>(std::atoi(meshThreadsEnv)));
-        threadCount = std::min(threadCount, 4u);  // Cap at 4 threads max
+        threadCount = std::min(threadCount, 8u);
     }
 
-    std::cout << "[ASYNC MESH] Starting " << threadCount << " worker thread(s)" << std::endl;
+    std::cout << "[ASYNC MESH] Starting " << threadCount << " worker thread(s) for 256³ chunks" << std::endl;
 
     for (unsigned int i = 0; i < threadCount; ++i) {
         m_workers.emplace_back(&AsyncMeshGenerator::workerThreadFunc, this);

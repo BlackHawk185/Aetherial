@@ -42,8 +42,8 @@ struct CollisionFace
 {
     Vec3 position;  // Center position of the face
     Vec3 normal;    // Normal vector of the face
-    float width;    // Width of the face (for greedy merged quads)
-    float height;   // Height of the face (for greedy merged quads)
+    float width;    // Width of the quad
+    float height;   // Height of the quad
 };
 
 struct CollisionMesh
@@ -96,6 +96,21 @@ class VoxelChunk
 
     // Mesh generation and management
     void generateMesh(bool generateLighting = true);
+    
+    // Incremental quad manipulation (for direct block modifications)
+    void addBlockQuads(int x, int y, int z, uint8_t blockType);
+    void removeBlockQuads(int x, int y, int z);
+    void updateNeighborQuads(int x, int y, int z, bool blockWasAdded);
+    
+    // GPU state management
+    bool isGPUDirty() const { return m_gpuDirty; }
+    void markGPUDirty() { m_gpuDirty = true; }
+    void clearGPUDirty() { m_gpuDirty = false; }
+    
+    // Control incremental updates (disable during world generation)
+    void enableIncrementalUpdates() { m_incrementalUpdatesEnabled = true; }
+    void disableIncrementalUpdates() { m_incrementalUpdatesEnabled = false; }
+    bool areIncrementalUpdatesEnabled() const { return m_incrementalUpdatesEnabled; }
 
     // Mesh state
     bool isDirty() const
@@ -107,36 +122,20 @@ class VoxelChunk
     int calculateLOD(const Vec3& cameraPos) const;
     bool shouldRender(const Vec3& cameraPos, float maxDistance = 1024.0f) const;
 
-    // Collision detection methods - thread-safe atomic access
-    std::shared_ptr<const CollisionMesh> getCollisionMesh() const
-    {
-        return std::atomic_load(&collisionMesh);
-    }
+    // Direct mesh access (fast - no atomic overhead)
+    std::shared_ptr<CollisionMesh> getCollisionMesh() const { return collisionMesh; }
+    void setCollisionMesh(std::shared_ptr<CollisionMesh> newMesh) { collisionMesh = newMesh; }
     
-    void setCollisionMesh(std::shared_ptr<CollisionMesh> newMesh)
-    {
-        std::atomic_store(&collisionMesh, newMesh);
-    }
-    
-    // Mesh access for VBO rendering - thread-safe atomic access (no mutex needed!)
-    std::shared_ptr<const VoxelMesh> getRenderMesh() const
-    {
-        return std::atomic_load(&renderMesh);
-    }
+    std::shared_ptr<VoxelMesh> getRenderMesh() const { return renderMesh; }
+    void setRenderMesh(std::shared_ptr<VoxelMesh> newMesh) { renderMesh = newMesh; }
     
     // Lazy mesh generation - generates mesh on first access if dirty
-    std::shared_ptr<const VoxelMesh> getRenderMeshLazy()
+    std::shared_ptr<VoxelMesh> getRenderMeshLazy()
     {
-        auto mesh = std::atomic_load(&renderMesh);
-        if (!mesh || meshDirty) {
+        if (!renderMesh || meshDirty) {
             generateMesh(false);  // Generate without lighting (real-time lighting)
         }
-        return std::atomic_load(&renderMesh);
-    }
-    
-    void setRenderMesh(std::shared_ptr<VoxelMesh> newMesh)
-    {
-        std::atomic_store(&renderMesh, newMesh);
+        return renderMesh;
     }
 
     // Decorative/model instance positions (generic per block type)
@@ -155,8 +154,8 @@ class VoxelChunk
 
    private:
     std::array<uint8_t, VOLUME> voxels;
-    std::shared_ptr<VoxelMesh> renderMesh;  // Thread-safe atomic access - no mutex needed!
-    std::shared_ptr<CollisionMesh> collisionMesh;  // Thread-safe atomic access via getCollisionMesh/setCollisionMesh
+    std::shared_ptr<VoxelMesh> renderMesh;  // Direct access (no atomic overhead)
+    std::shared_ptr<CollisionMesh> collisionMesh;  // Direct access (no atomic overhead)
     bool meshDirty = true;
     
     // Island context for inter-chunk culling
@@ -166,13 +165,27 @@ class VoxelChunk
     // NEW: Per-block-type model instance positions (for BlockRenderType::OBJ blocks)
     // Key: BlockID, Value: list of instance positions within this chunk
     std::unordered_map<uint8_t, std::vector<Vec3>> m_modelInstances;
+    
+    // Fast quad lookup for incremental updates: (x, y, z, face) -> quad index
+    std::unordered_map<uint64_t, size_t> m_quadLookup;
+    
+    // GPU dirty flag for incremental updates
+    bool m_gpuDirty = false;
+    
+    // Disable incremental updates during bulk operations (world generation)
+    bool m_incrementalUpdatesEnabled = false;
+    
+    // Helper: Pack voxel coord + face direction into lookup key
+    static inline uint64_t makeQuadKey(int x, int y, int z, int face) {
+        return ((uint64_t)x << 48) | ((uint64_t)y << 32) | ((uint64_t)z << 16) | (uint64_t)face;
+    }
 
-    // Greedy meshing helpers
-    void addGreedyQuadTo(std::vector<QuadFace>& quads, float x, float y, float z, int face, int width, int height, uint8_t blockType);
+    // Quad generation helper
+    void addQuad(std::vector<QuadFace>& quads, float x, float y, float z, int face, int width, int height, uint8_t blockType);
     
     bool isVoxelSolid(int x, int y, int z) const;
     
-    // Unified culling - works for intra-chunk AND inter-chunk
+    // Intra-chunk culling only (inter-chunk culling removed for performance)
     bool isFaceExposed(int x, int y, int z, int face) const;
     
     // Simple meshing implementation
