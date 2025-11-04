@@ -128,6 +128,9 @@ private:
     std::unique_ptr<TimeManager> m_timeManager;
     std::unique_ptr<NetworkManager> m_networkManager;  // Re-enabled with ENet integration
     
+    // Server-side physics (separate from client)
+    PhysicsSystem m_serverPhysics;
+    
     // Networking
     bool m_networkingEnabled = false;
     

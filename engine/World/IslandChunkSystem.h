@@ -60,6 +60,13 @@ struct FloatingIsland
         );
     }
     
+    // Helper: Get chunk transform matrix (island transform + chunk offset)
+    glm::mat4 getChunkTransform(const Vec3& chunkCoord) const {
+        Vec3 chunkLocalPos = chunkCoordToWorldPos(chunkCoord);
+        return getTransformMatrix() * 
+            glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
+    }
+    
     // Get the complete transformation matrix for this island (position + rotation)
     // This is the single source of truth for how island-space transforms to world-space
     glm::mat4 getTransformMatrix() const {
@@ -135,6 +142,10 @@ class IslandChunkSystem
    public:
     IslandChunkSystem();
     ~IslandChunkSystem();
+    
+    // Set whether this is a client-side system (chunks need GPU upload)
+    void setIsClient(bool isClient) { m_isClient = isClient; }
+    bool isClient() const { return m_isClient; }
 
     // Island management
     uint32_t createIsland(const Vec3& physicsCenter);
@@ -165,7 +176,6 @@ class IslandChunkSystem
 
     // Physics integration
     void updateIslandPhysics(float deltaTime);
-    void syncPhysicsToChunks();  // Update chunk world positions from physics
 
     // Player-relative chunk loading (for infinite worlds)
     void updatePlayerChunks(const Vec3& playerPosition);
@@ -192,6 +202,7 @@ class IslandChunkSystem
     uint32_t m_nextIslandID = 1;
     int m_renderDistance = 8;
     mutable std::mutex m_islandsMutex;
+    bool m_isClient = false;  // Whether this system is client-side (chunks need GPU upload)
 
     // Generate chunks around a center point (for infinite worlds)
     void generateChunksAroundPoint(const Vec3& center);

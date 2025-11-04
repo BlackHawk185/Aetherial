@@ -69,6 +69,11 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
             addBlockQuads(x, y, z, type);
             // No neighbor update needed - faces stay the same
         }
+        
+        // EVENT-DRIVEN: Immediately notify renderer of mesh changes (zero latency)
+        if (m_meshUpdateCallback) {
+            m_meshUpdateCallback(this);
+        }
     }
     
     meshDirty = true; // Keep for backwards compatibility with generateMesh()
@@ -146,7 +151,7 @@ void VoxelChunk::generateMesh(bool generateLighting)
     auto t_prescan_end = std::chrono::high_resolution_clock::now();
     auto t_mesh_start = std::chrono::high_resolution_clock::now();
 
-    // Simple mesh generation - one quad per exposed face
+    // Generate quads into the new mesh (core implementation in generateSimpleMeshInto)
     generateSimpleMeshInto(newMesh->quads);
     
     auto t_mesh_end = std::chrono::high_resolution_clock::now();
@@ -184,8 +189,6 @@ void VoxelChunk::generateMesh(bool generateLighting)
         m_quadLookup[key] = i;
     }
     
-    newMesh->needsUpdate = true;
-    
     // DIRECT ASSIGNMENT - fast, no atomic overhead!
     renderMesh = newMesh;
     collisionMesh = newCollisionMesh;
@@ -209,12 +212,6 @@ void VoxelChunk::generateMesh(bool generateLighting)
     std::cout << "🔧 MESH GEN: Total=" << total_ms << "ms (Prescan=" << prescan_ms 
               << "ms, Mesh=" << mesh_ms << "ms, Collision=" << collision_ms 
               << "ms) Quads=" << newMesh->quads.size() << std::endl;
-}
-
-void VoxelChunk::buildCollisionMesh()
-{
-    // Wrapper for backwards compatibility - regenerate entire mesh
-    generateMesh(true);
 }
 
 bool VoxelChunk::checkRayCollision(const Vec3& rayOrigin, const Vec3& rayDirection,
@@ -364,7 +361,8 @@ void VoxelChunk::generateSimpleMeshInto(std::vector<QuadFace>& quads)
     
     auto t_end = std::chrono::high_resolution_clock::now();
     auto total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    std::cout << "SIMPLE MESH: " << total_ms << "ms, " << totalQuadsGenerated << " quads" << std::endl;
+    const char* side = m_isClientChunk ? "CLIENT" : "SERVER";
+    std::cout << "[" << side << "] SIMPLE MESH: " << total_ms << "ms, " << totalQuadsGenerated << " quads" << std::endl;
 }
 
 // Model instance management (for BlockRenderType::OBJ blocks)
@@ -476,8 +474,6 @@ void VoxelChunk::addBlockQuads(int x, int y, int z, uint8_t blockType)
         collMesh->faces.push_back({quad.position, quad.normal, quad.width, quad.height});
     }
     collisionMesh = collMesh;
-    
-    markGPUDirty();
 }
 
 // Remove all quads for a block
@@ -538,8 +534,6 @@ void VoxelChunk::removeBlockQuads(int x, int y, int z)
         collMesh->faces.push_back({quad.position, quad.normal, quad.width, quad.height});
     }
     collisionMesh = collMesh;
-    
-    markGPUDirty();
 }
 
 // Update neighbor quads when a block is added or removed
@@ -606,8 +600,8 @@ void VoxelChunk::updateNeighborQuads(int x, int y, int z, bool blockWasAdded)
         }
         collisionMesh = collMesh;
     }
-    
-    markGPUDirty();
 }
+
+
 
 

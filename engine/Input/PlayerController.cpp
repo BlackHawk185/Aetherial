@@ -29,7 +29,7 @@ void PlayerController::initialize(const Vec3& initialPosition)
     m_jumpPressed = false;
 }
 
-void PlayerController::update(GLFWwindow* window, float deltaTime, IslandChunkSystem* islandSystem)
+void PlayerController::update(GLFWwindow* window, float deltaTime, IslandChunkSystem* islandSystem, PhysicsSystem* physics)
 {
     if (m_noclipMode)
     {
@@ -37,7 +37,7 @@ void PlayerController::update(GLFWwindow* window, float deltaTime, IslandChunkSy
     }
     else
     {
-        updatePhysics(window, deltaTime, islandSystem);
+        updatePhysics(window, deltaTime, islandSystem, physics);
     }
     
     // Always update camera position based on physics position
@@ -126,10 +126,13 @@ void PlayerController::updateNoclip(GLFWwindow* window, float deltaTime)
     m_camera.position = m_physicsPosition; // No eye offset in noclip
 }
 
-void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, IslandChunkSystem* islandSystem)
+void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, IslandChunkSystem* islandSystem, PhysicsSystem* physics)
 {
     PROFILE_FUNCTION();
     (void)islandSystem; // Reserved for future island-specific physics interactions
+    
+    if (!physics)
+        return; // Cannot update physics without physics system
     
     // ==========================================
     // PHASE 0: UPDATE STEP-UP ANIMATION
@@ -181,7 +184,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
     // ==========================================
     
     const float raycastMargin = 0.1f;
-    GroundInfo groundInfo = g_physics.detectGroundCapsule(m_physicsPosition, m_capsuleRadius,
+    GroundInfo groundInfo = physics->detectGroundCapsule(m_physicsPosition, m_capsuleRadius,
                                                           m_capsuleHeight, raycastMargin);
     m_isGrounded = groundInfo.isGrounded;
     
@@ -222,7 +225,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
             // Try moving forward slightly to detect wall collision
             Vec3 forwardTest = m_physicsPosition + (inputDirection.normalized() * 0.3f);
             Vec3 climbNormal;
-            if (g_physics.checkCapsuleCollision(forwardTest, m_capsuleRadius, m_capsuleHeight, climbNormal, nullptr))
+            if (physics->checkCapsuleCollision(forwardTest, m_capsuleRadius, m_capsuleHeight, climbNormal, nullptr))
             {
                 // Wall detected! Check if we can climb over it (max 3 blocks)
                 // Check 1 block forward and 1 block above player's top
@@ -230,7 +233,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
                 climbCheckPos.y += (m_capsuleHeight * 0.5f) + 1.0f; // Top of capsule + 1 block
                 
                 Vec3 topCheckNormal;
-                if (!g_physics.checkCapsuleCollision(climbCheckPos, m_capsuleRadius, m_capsuleHeight, topCheckNormal, nullptr))
+                if (!physics->checkCapsuleCollision(climbCheckPos, m_capsuleRadius, m_capsuleHeight, topCheckNormal, nullptr))
                 {
                     // No obstruction above - can climb!
                     m_playerVelocity.y = m_climbSpeed;
@@ -267,7 +270,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
     
     Vec3 collisionNormal;
     const FloatingIsland* collidingIsland = nullptr;
-    if (g_physics.checkCapsuleCollision(intendedPosition, m_capsuleRadius, m_capsuleHeight,
+    if (physics->checkCapsuleCollision(intendedPosition, m_capsuleRadius, m_capsuleHeight,
                                        collisionNormal, &collidingIsland))
     {
         // Collision detected - use axis-separated movement
@@ -279,7 +282,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
         
         // Try Y (vertical movement - jumping/falling/climbing)
         testPos = m_physicsPosition + Vec3(0, relativeMovement.y, 0);
-        if (!g_physics.checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
+        if (!physics->checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
         {
             m_physicsPosition = testPos;
         }
@@ -290,7 +293,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
         
         // Try X with step-up
         testPos = m_physicsPosition + Vec3(relativeMovement.x, 0, 0);
-        if (!g_physics.checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
+        if (!physics->checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
         {
             m_physicsPosition = testPos;
         }
@@ -304,7 +307,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
                 for (float stepHeight = 0.1f; stepHeight <= m_maxStepHeight; stepHeight += 0.1f)
                 {
                     Vec3 stepUpPos = m_physicsPosition + Vec3(relativeMovement.x, stepHeight, 0);
-                    if (!g_physics.checkCapsuleCollision(stepUpPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
+                    if (!physics->checkCapsuleCollision(stepUpPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
                     {
                         // Initialize step-up animation
                         m_isStepping = true;
@@ -328,7 +331,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
         
         // Try Z with step-up
         testPos = m_physicsPosition + Vec3(0, 0, relativeMovement.z);
-        if (!g_physics.checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
+        if (!physics->checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
         {
             m_physicsPosition = testPos;
         }
@@ -342,7 +345,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
                 for (float stepHeight = 0.1f; stepHeight <= m_maxStepHeight; stepHeight += 0.1f)
                 {
                     Vec3 stepUpPos = m_physicsPosition + Vec3(0, stepHeight, relativeMovement.z);
-                    if (!g_physics.checkCapsuleCollision(stepUpPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
+                    if (!physics->checkCapsuleCollision(stepUpPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
                     {
                         // Initialize step-up animation
                         m_isStepping = true;

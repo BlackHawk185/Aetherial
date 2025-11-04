@@ -550,9 +550,9 @@ bool ModelInstanceRenderer::ensureChunkInstancesUploaded(uint8_t blockID, VoxelC
         }
     }
     
-    // Check if we need to update (thread-safe atomic mesh access)
+    // Check if we need to update (mesh may be null during async generation)
     auto mesh = chunk->getRenderMesh();
-    bool needsUpdate = !mesh || mesh->needsUpdate;
+    bool needsUpdate = !mesh;
     
     // Only upload if data hasn't been uploaded yet or chunk mesh needs update
     if (buf.isUploaded && !needsUpdate && buf.count == count) {

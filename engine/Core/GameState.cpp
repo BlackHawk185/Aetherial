@@ -74,8 +74,8 @@ void GameState::updateSimulation(float deltaTime)
         return;
     }
 
-    // Update physics first
-    updatePhysics(deltaTime);
+    // Physics is now updated by GameServer with its own physics instance
+    // (not called here to avoid global g_physics dependency)
 
     // Update player
     updatePlayer(deltaTime);
@@ -120,12 +120,12 @@ void GameState::createDefaultWorld()
     // ═══════════════════════════════════════════════════════════════
     struct WorldGenConfig {
         // World boundaries
-        float regionSize = 2000.0f;          // World region size (1000x1000 units)
+        float regionSize = 2000.0f;          // World size/region size (1000x1000 units)
         
         // Island generation (density-based for infinite scaling)
         float islandDensity = 3.0f;          // Islands per 1000x1000 area (scales infinitely!)
         float minIslandRadius = 100.0f;       // Minimum island size
-        float maxIslandRadius = 200.0f;      // Maximum island size
+        float maxIslandRadius = 1500.0f;      // Maximum island size
         
         // Advanced Voronoi tuning
         float verticalSpread = 100.0f;       // Vertical Y-axis spread (±units)
@@ -208,6 +208,24 @@ void GameState::createDefaultWorld()
     
     std::cout << "[WORLD] All islands generated!" << std::endl;
 
+    // Enable incremental updates on all chunks now that initial generation is complete
+    std::cout << "[WORLD] Enabling incremental updates on all chunks..." << std::endl;
+    for (uint32_t islandID : islandIDs)
+    {
+        FloatingIsland* island = m_islandSystem.getIsland(islandID);
+        if (island)
+        {
+            for (auto& chunkPair : island->chunks)
+            {
+                VoxelChunk* chunk = chunkPair.second.get();
+                if (chunk)
+                {
+                    chunk->enableIncrementalUpdates();
+                }
+            }
+        }
+    }
+
     // Log collision mesh generation for each island
     for (uint32_t islandID : m_islandIDs)
     {
@@ -264,10 +282,13 @@ void GameState::createDefaultWorld()
               << m_playerSpawnPosition.y << ", " << m_playerSpawnPosition.z << ")" << std::endl;
 }
 
-void GameState::updatePhysics(float deltaTime)
+void GameState::updatePhysics(float deltaTime, PhysicsSystem* physics)
 {
+    if (!physics)
+        return;
+    
     // Update generic entity physics (including fluid particles)
-    g_physics.update(deltaTime);
+    physics->update(deltaTime);
 }
 
 void GameState::updatePlayer(float deltaTime)

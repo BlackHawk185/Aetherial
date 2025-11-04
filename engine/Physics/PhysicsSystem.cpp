@@ -10,7 +10,7 @@
 #include "../World/VoxelRaycaster.h"  // For DDA-based ground detection
 #include "../Profiling/Profiler.h"
 
-PhysicsSystem g_physics;
+// Global g_physics removed - GameClient and GameServer now have separate instances
 
 PhysicsSystem::PhysicsSystem() {}
 

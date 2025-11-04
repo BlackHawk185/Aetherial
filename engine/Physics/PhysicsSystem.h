@@ -56,5 +56,4 @@ class PhysicsSystem
                                    Vec3& outNormal, float radius, float height);
 };
 
-// Global physics system
-extern PhysicsSystem g_physics;
+// Global g_physics removed - GameClient and GameServer now have separate physics instances

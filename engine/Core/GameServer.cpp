@@ -40,7 +40,7 @@ bool GameServer::initialize(float targetTickRate, bool enableNetworking, uint16_
 
     // Log island generation mode once (noise is now default)
     // Connect physics system to island system for server-side collision detection
-    g_physics.setIslandSystem(m_gameState->getIslandSystem());
+    m_serverPhysics.setIslandSystem(m_gameState->getIslandSystem());
 
     // Initialize networking if requested
     if (m_networkingEnabled)
@@ -243,6 +243,7 @@ void GameServer::processTick(float deltaTime)
     if (m_gameState)
     {
         PROFILE_SCOPE("GameState::updateSimulation");
+        m_gameState->updatePhysics(deltaTime, &m_serverPhysics);
         m_gameState->updateSimulation(deltaTime);
     }
 
@@ -395,16 +396,14 @@ void GameServer::handleVoxelChangeRequest(ENetPeer* peer, const VoxelChangeReque
                 {
                     std::cout << "🌊 Block break will cause island split! Extracting fragment..." << std::endl;
                     
-                    // Remove the block first
-                    m_gameState->setVoxel(request.islandID, request.localPos, request.voxelType);
-                    
-                    // Regenerate mesh on server for the modified chunk
-                    Vec3 chunkCoord = FloatingIsland::islandPosToChunkCoord(request.localPos);
-                    auto* chunk = islandSystem->getChunkFromIsland(request.islandID, chunkCoord);
-                    if (chunk)
+                    // Remove the block first - broadcast and apply to game state
+                    m_gameState->setVoxel(request.islandID, request.localPos, 0);
+                    if (auto server = m_networkManager->getServer())
                     {
-                        chunk->generateMesh(false);  // Skip lighting on server (headless)
+                        server->broadcastVoxelChange(request.islandID, request.localPos, 0, 0);
                     }
+                    
+                    // Incremental updates already handled by setVoxel() - no need to regenerate mesh
                     
                     // Extract the fragment to a new island
                     std::vector<Vec3> removedVoxels;
@@ -489,15 +488,7 @@ void GameServer::handleVoxelChangeRequest(ENetPeer* peer, const VoxelChangeReque
     // Normal block change (no split detected)
     m_gameState->setVoxel(request.islandID, request.localPos, request.voxelType);
 
-    // Regenerate mesh on server for collision detection
-    {
-        Vec3 chunkCoord = FloatingIsland::islandPosToChunkCoord(request.localPos);
-        auto* chunk = islandSystem->getChunkFromIsland(request.islandID, chunkCoord);
-        if (chunk)
-        {
-            chunk->generateMesh(false);  // Skip lighting on server (headless)
-        }
-    }
+    // Incremental updates already handled by setVoxel() - no need to regenerate mesh
 
     // Broadcast the change to all connected clients (including the sender for confirmation)
     if (auto server = m_networkManager->getServer())

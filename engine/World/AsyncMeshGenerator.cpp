@@ -115,7 +115,7 @@ void AsyncMeshGenerator::workerThreadFunc()
         auto newCollisionMesh = std::make_shared<CollisionMesh>();
         std::unordered_map<uint8_t, std::vector<Vec3>> tempModelInstances;
 
-        // Copy the chunk's mesh generation logic here
+        // Scan for OBJ-type model instances
         auto& registry = BlockTypeRegistry::getInstance();
         for (int z = 0; z < VoxelChunk::SIZE; ++z) {
             for (int y = 0; y < VoxelChunk::SIZE; ++y) {
@@ -132,9 +132,12 @@ void AsyncMeshGenerator::workerThreadFunc()
             }
         }
 
+        // Use shared mesh generation logic instead of duplicating it
         job.chunk->generateSimpleMeshInto(newMesh->quads);
 
-        for (const auto& quad : newMesh->quads) {
+        // Build collision mesh from quads
+        for (const auto& quad : newMesh->quads)
+        {
             newCollisionMesh->faces.push_back({
                 quad.position,
                 quad.normal,
@@ -142,8 +145,6 @@ void AsyncMeshGenerator::workerThreadFunc()
                 quad.height
             });
         }
-
-        newMesh->needsUpdate = true;
 
         // Add to completed queue
         {

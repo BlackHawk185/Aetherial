@@ -169,6 +169,7 @@ void IslandChunkSystem::addChunkToIsland(uint32_t islandID, const Vec3& chunkCoo
     // Create new chunk and set island context
     auto newChunk = std::make_unique<VoxelChunk>();
     newChunk->setIslandContext(islandID, chunkCoord);
+    newChunk->setIsClient(m_isClient);  // Inherit client flag from island system
     island->chunks[chunkCoord] = std::move(newChunk);
 }
 
@@ -386,33 +387,8 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     auto decorationDuration = std::chrono::duration_cast<std::chrono::milliseconds>(decorationEnd - decorationStart).count();
     std::cout << "🌿 Decoration: " << decorationDuration << "ms (" << grassPlaced << " grass)" << std::endl;
     
-    // Register chunks with renderer (mesh generation is deferred to first render frame)
-    auto registrationStart = std::chrono::high_resolution_clock::now();
-    
-    int chunksRegistered = 0;
-    
-    for (auto& [chunkCoord, chunk] : island->chunks)
-    {
-        if (chunk && g_instancedQuadRenderer)
-        {
-            Vec3 chunkLocalPos(
-                chunkCoord.x * VoxelChunk::SIZE,
-                chunkCoord.y * VoxelChunk::SIZE,
-                chunkCoord.z * VoxelChunk::SIZE
-            );
-            
-            glm::mat4 chunkTransform = island->getTransformMatrix() * 
-                glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
-            
-            g_instancedQuadRenderer->registerChunk(chunk.get(), chunkTransform);
-            chunksRegistered++;
-        }
-    }
-    
-    auto registrationEnd = std::chrono::high_resolution_clock::now();
-    auto registrationDuration = std::chrono::duration_cast<std::chrono::milliseconds>(registrationEnd - registrationStart).count();
-    
-    std::cout << "📦 Chunk Registration: " << registrationDuration << "ms (" << chunksRegistered << " chunks)" << std::endl;
+    // Chunks will be registered with renderer when client receives them via network
+    // (Don't register here - renderer may not exist yet, and this violates separation of concerns)
     
     // Queue chunks for async mesh generation (if available)
     auto meshGenStart = std::chrono::high_resolution_clock::now();
@@ -505,6 +481,7 @@ void IslandChunkSystem::setVoxelInIsland(uint32_t islandID, const Vec3& islandRe
         {
             chunkPtr = std::make_unique<VoxelChunk>();
             chunkPtr->setIslandContext(islandID, chunkCoord);
+            chunkPtr->setIsClient(m_isClient);  // Inherit client flag from island system
             isNewChunk = true;
         }
         chunk = chunkPtr.get();
@@ -549,6 +526,7 @@ void IslandChunkSystem::setVoxelWithAutoChunk(uint32_t islandID, const Vec3& isl
         if (!chunkPtr) {
             chunkPtr = std::make_unique<VoxelChunk>();
             chunkPtr->setIslandContext(islandID, chunkCoord);
+            chunkPtr->setIsClient(m_isClient);  // Inherit client flag from island system
         }
         chunk = chunkPtr.get();
     }
@@ -632,78 +610,6 @@ void IslandChunkSystem::updateIslandPhysics(float deltaTime)
         {
             island.needsPhysicsUpdate = true;
         }
-    }
-}
-
-void IslandChunkSystem::syncPhysicsToChunks()
-{
-    // UNIFIED TRANSFORM UPDATE: Updates transforms for instanced renderer and GLB models
-    // Event-driven: Only update chunks whose islands have actually moved
-    std::lock_guard<std::mutex> lock(m_islandsMutex);
-    
-    // Cache OBJ block types once instead of querying every iteration
-    static std::vector<uint8_t> objBlockTypes;
-    static bool objBlockTypesCached = false;
-    if (!objBlockTypesCached)
-    {
-        auto& registry = BlockTypeRegistry::getInstance();
-        for (const auto& blockType : registry.getAllBlockTypes())
-        {
-            if (blockType.renderType == BlockRenderType::OBJ)
-            {
-                objBlockTypes.push_back(blockType.id);
-            }
-        }
-        objBlockTypesCached = true;
-    }
-    
-    for (auto& [id, island] : m_islands)
-    {
-        // Skip islands that haven't moved
-        if (!island.needsPhysicsUpdate) continue;
-        
-        // Calculate island transform once (includes rotation + translation)
-        glm::mat4 islandTransform = island.getTransformMatrix();
-        
-        // Update transforms for all chunks in this island
-        for (auto& [chunkCoord, chunk] : island.chunks)
-        {
-            if (!chunk) continue;
-            
-            // Compute chunk local position
-            Vec3 chunkLocalPos(
-                chunkCoord.x * VoxelChunk::SIZE,
-                chunkCoord.y * VoxelChunk::SIZE,
-                chunkCoord.z * VoxelChunk::SIZE
-            );
-            
-            // Compute full transform: island transform * chunk local offset
-            glm::mat4 chunkTransform = islandTransform * 
-                glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
-            
-            // === UPDATE INSTANCED RENDERER (voxel chunks) ===
-            if (g_instancedQuadRenderer)
-            {
-                g_instancedQuadRenderer->updateChunkTransform(chunk.get(), chunkTransform);
-            }
-            
-            // === UPDATE GLB MODEL RENDERER (only for chunks with OBJ instances) ===
-            if (g_modelRenderer && !objBlockTypes.empty())
-            {
-                for (uint8_t blockID : objBlockTypes)
-                {
-                    // OPTIMIZATION: Skip chunks with zero instances of this block type
-                    const auto& instances = chunk->getModelInstances(blockID);
-                    if (!instances.empty())
-                    {
-                        g_modelRenderer->updateModelMatrix(blockID, chunk.get(), chunkTransform);
-                    }
-                }
-            }
-        }
-        
-        // Clear update flag after processing
-        island.needsPhysicsUpdate = false;
     }
 }
 

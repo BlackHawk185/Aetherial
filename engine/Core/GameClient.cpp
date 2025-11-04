@@ -135,7 +135,9 @@ bool GameClient::connectToGameState(GameState* gameState)
     // **NEW: Connect physics system to island system for collision detection**
     if (gameState && gameState->getIslandSystem())
     {
-        g_physics.setIslandSystem(gameState->getIslandSystem());
+        m_clientPhysics.setIslandSystem(gameState->getIslandSystem());
+        // Mark chunks as client-side (need GPU upload)
+        gameState->getIslandSystem()->setIsClient(true);
     }
 
     // Use calculated spawn position from world generation
@@ -330,7 +332,7 @@ void GameClient::processInput(float deltaTime)
         m_playerController.processMouse(m_window->getHandle());
         
         // Update player controller (physics and camera)
-        m_playerController.update(m_window->getHandle(), deltaTime, m_gameState->getIslandSystem());
+        m_playerController.update(m_window->getHandle(), deltaTime, m_gameState->getIslandSystem(), &m_clientPhysics);
         
         // Send movement to server if remote client
         if (m_isRemoteClient && m_networkManager)
@@ -584,7 +586,7 @@ void GameClient::processKeyboard(float deltaTime)
     
     if (isDebugKeyPressed && !wasDebugKeyPressed)
     {
-        g_physics.debugCollisionInfo(m_playerController.getCamera().position, 0.5f);
+        m_clientPhysics.debugCollisionInfo(m_playerController.getCamera().position, 0.5f);
     }
     wasDebugKeyPressed = isDebugKeyPressed;
     
@@ -708,7 +710,11 @@ void GameClient::processBlockInteraction(float deltaTime)
 
         if (m_inputState.cachedTargetBlock.hit)
         {
-            // Send network request for block break
+            // OPTIMISTIC UPDATE: Apply change immediately on client
+            m_gameState->setVoxel(m_inputState.cachedTargetBlock.islandID,
+                                  m_inputState.cachedTargetBlock.localBlockPos, 0);
+            
+            // Send network request for server validation
             if (m_networkManager && m_networkManager->getClient() &&
                 m_networkManager->getClient()->isConnected())
             {
@@ -717,7 +723,7 @@ void GameClient::processBlockInteraction(float deltaTime)
                     m_inputState.cachedTargetBlock.localBlockPos, 0);
             }
 
-            // Server will respond with authoritative update - no client-side optimistic update
+            // Server will confirm or revert via VoxelChangeUpdate
 
             // Clear the cached target block immediately to remove the yellow outline
             m_inputState.cachedTargetBlock = RayHit();
@@ -768,7 +774,10 @@ void GameClient::processBlockInteraction(float deltaTime)
                 // Use locked recipe block
                 uint8_t blockToPlace = m_lockedRecipe->blockID;
                 
-                // Send network request for block place
+                // OPTIMISTIC UPDATE: Apply change immediately on client
+                m_gameState->setVoxel(m_inputState.cachedTargetBlock.islandID, placePos, blockToPlace);
+                
+                // Send network request for server validation
                 if (m_networkManager && m_networkManager->getClient() &&
                     m_networkManager->getClient()->isConnected())
                 {
@@ -776,7 +785,7 @@ void GameClient::processBlockInteraction(float deltaTime)
                         m_inputState.cachedTargetBlock.islandID, placePos, blockToPlace);
                 }
 
-                // Server will respond with authoritative update - no client-side optimistic update
+                // Server will confirm or revert via VoxelChangeUpdate
                 
                 // Keep recipe locked for continuous placement
                 std::cout << "Block placed (" << m_lockedRecipe->name << " still locked)" << std::endl;
@@ -809,7 +818,7 @@ void GameClient::renderWorld()
     // Sync island physics to chunk transforms (updates GLB instances)
     {
         PROFILE_SCOPE("syncPhysicsToChunks");
-        m_gameState->getIslandSystem()->syncPhysicsToChunks();
+        syncPhysicsToChunks();
     }
 
     // Get camera matrices once
@@ -1053,8 +1062,7 @@ void GameClient::onWindowResize(int width, int height)
 void GameClient::handleWorldStateReceived(const WorldStateMessage& worldState)
 {
     // Create a new GameState for the client based on server data
-    m_gameState =
-        new GameState();  // Note: This creates a raw pointer, we might want to use unique_ptr later
+    m_gameState = new GameState();
 
     if (!m_gameState->initialize(false))
     {  // Don't create default world, we'll use server data
@@ -1064,8 +1072,90 @@ void GameClient::handleWorldStateReceived(const WorldStateMessage& worldState)
         return;
     }
 
+    // Connect physics system to CLIENT's island system for collision detection
+    if (m_gameState && m_gameState->getIslandSystem())
+    {
+        m_clientPhysics.setIslandSystem(m_gameState->getIslandSystem());
+        // Mark chunks as client-side (need GPU upload)
+        m_gameState->getIslandSystem()->setIsClient(true);
+    }
+
     // Spawn player at server-provided location
     m_playerController.setPosition(worldState.playerSpawnPosition);
+}
+
+void GameClient::registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* island, const Vec3& chunkCoord)
+{
+    if (!g_instancedQuadRenderer || !chunk || !island)
+        return;
+    
+    glm::mat4 chunkTransform = island->getChunkTransform(chunkCoord);
+    g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+}
+
+void GameClient::syncPhysicsToChunks()
+{
+    if (!m_gameState || !g_instancedQuadRenderer)
+        return;
+    
+    auto* islandSystem = m_gameState->getIslandSystem();
+    if (!islandSystem)
+        return;
+    
+    // Cache OBJ block types once instead of querying every iteration
+    static std::vector<uint8_t> objBlockTypes;
+    static bool objBlockTypesCached = false;
+    if (!objBlockTypesCached)
+    {
+        auto& registry = BlockTypeRegistry::getInstance();
+        for (const auto& blockType : registry.getAllBlockTypes())
+        {
+            if (blockType.renderType == BlockRenderType::OBJ)
+            {
+                objBlockTypes.push_back(blockType.id);
+            }
+        }
+        objBlockTypesCached = true;
+    }
+    
+    // Update transforms for islands that have moved
+    for (auto& [id, island] : islandSystem->getIslands())
+    {
+        // Skip islands that haven't moved (need const_cast because getIslands() returns const ref)
+        if (!island.needsPhysicsUpdate) continue;
+        
+        // Calculate island transform once (includes rotation + translation)
+        glm::mat4 islandTransform = island.getTransformMatrix();
+        
+        // Update transforms for all chunks in this island
+        for (auto& [chunkCoord, chunk] : island.chunks)
+        {
+            if (!chunk) continue;
+            
+            // Use helper to compute chunk transform
+            glm::mat4 chunkTransform = island.getChunkTransform(chunkCoord);
+            
+            // === UPDATE INSTANCED RENDERER (voxel chunks) ===
+            g_instancedQuadRenderer->updateChunkTransform(chunk.get(), chunkTransform);
+            
+            // === UPDATE GLB MODEL RENDERER (only for chunks with OBJ instances) ===
+            if (g_modelRenderer && !objBlockTypes.empty())
+            {
+                for (uint8_t blockID : objBlockTypes)
+                {
+                    // OPTIMIZATION: Skip chunks with zero instances of this block type
+                    const auto& instances = chunk->getModelInstances(blockID);
+                    if (!instances.empty())
+                    {
+                        g_modelRenderer->updateModelMatrix(blockID, chunk.get(), chunkTransform);
+                    }
+                }
+            }
+        }
+        
+        // Clear update flag after processing (need mutable access)
+        const_cast<FloatingIsland&>(island).needsPhysicsUpdate = false;
+    }
 }
 
 void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& position,
@@ -1107,20 +1197,8 @@ void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& p
             chunk->setRawVoxelData(voxelData, dataSize);
             chunk->generateMesh();  // Already builds collision mesh internally
             
-            // Register chunk with instanced renderer
-            if (g_instancedQuadRenderer)
-            {
-                Vec3 chunkLocalPos(
-                    originChunk.x * VoxelChunk::SIZE,
-                    originChunk.y * VoxelChunk::SIZE,
-                    originChunk.z * VoxelChunk::SIZE
-                );
-                
-                glm::mat4 chunkTransform = island->getTransformMatrix() * 
-                    glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
-                
-                g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
-            }
+            // Register chunk with renderer
+            registerChunkWithRenderer(chunk, island, originChunk);
         }
         else
         {
@@ -1180,84 +1258,13 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
         // Apply the voxel data directly
         chunk->setRawVoxelData(voxelData, dataSize);
         
-        // Queue async mesh generation instead of blocking main thread
+        // IMMEDIATELY register chunk with renderer (callback must be set before any modifications)
+        registerChunkWithRenderer(chunk, island, chunkCoord);
+        
+        // Queue async mesh generation (will update the already-registered chunk)
         if (g_asyncMeshGenerator)
         {
-            g_asyncMeshGenerator->queueChunkMeshGeneration(chunk, [this, islandID, chunk, island, chunkCoord]() {
-                // This callback runs on main thread after mesh is ready
-                if (g_instancedQuadRenderer && island)
-                {
-                    Vec3 chunkLocalPos(
-                        chunkCoord.x * VoxelChunk::SIZE,
-                        chunkCoord.y * VoxelChunk::SIZE,
-                        chunkCoord.z * VoxelChunk::SIZE
-                    );
-                    
-                    glm::mat4 chunkTransform = island->getTransformMatrix() * 
-                        glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
-                    
-                    g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
-                }
-                
-                // Queue neighbor regeneration asynchronously (spread the load)
-                static const Vec3 neighborOffsets[6] = {
-                    Vec3(0, -1, 0), Vec3(0, 1, 0),
-                    Vec3(0, 0, -1), Vec3(0, 0, 1),
-                    Vec3(-1, 0, 0), Vec3(1, 0, 0)
-                };
-                
-                auto* islandSystem = m_gameState ? m_gameState->getIslandSystem() : nullptr;
-                if (islandSystem)
-                {
-                    for (int i = 0; i < 6; ++i)
-                    {
-                        Vec3 neighborCoord = chunkCoord + neighborOffsets[i];
-                        VoxelChunk* neighbor = islandSystem->getChunkFromIsland(islandID, neighborCoord);
-                        if (neighbor && g_asyncMeshGenerator)
-                        {
-                            g_asyncMeshGenerator->queueChunkMeshGeneration(neighbor);
-                        }
-                    }
-                }
-            });
-        }
-        else
-        {
-            // Fallback to synchronous generation if async system not available
-            chunk->generateMesh();
-            
-            // DEFERRED INTER-CHUNK CULLING: Regenerate all 6 neighbors
-            // This allows them to cull faces that touch this new chunk
-            static const Vec3 neighborOffsets[6] = {
-                Vec3(0, -1, 0), Vec3(0, 1, 0),   // -Y, +Y
-                Vec3(0, 0, -1), Vec3(0, 0, 1),   // -Z, +Z
-                Vec3(-1, 0, 0), Vec3(1, 0, 0)    // -X, +X
-            };
-            
-            for (int i = 0; i < 6; ++i)
-            {
-                Vec3 neighborCoord = chunkCoord + neighborOffsets[i];
-                VoxelChunk* neighbor = islandSystem->getChunkFromIsland(islandID, neighborCoord);
-                if (neighbor)
-                {
-                    neighbor->generateMesh();
-                }
-            }
-            
-            // Register chunk with instanced renderer immediately
-            if (g_instancedQuadRenderer && island)
-            {
-                Vec3 chunkLocalPos(
-                    chunkCoord.x * VoxelChunk::SIZE,
-                    chunkCoord.y * VoxelChunk::SIZE,
-                    chunkCoord.z * VoxelChunk::SIZE
-                );
-                
-                glm::mat4 chunkTransform = island->getTransformMatrix() * 
-                    glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
-                
-                g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
-            }
+            g_asyncMeshGenerator->queueChunkMeshGeneration(chunk, nullptr);
         }
     }
     else
@@ -1276,26 +1283,11 @@ void GameClient::handleVoxelChangeReceived(const VoxelChangeUpdate& update)
     }
 
     // Apply the authoritative voxel change from server
+    // This uses incremental quad updates (addBlockQuads/removeBlockQuads) automatically
     m_gameState->setVoxel(update.islandID, update.localPos, update.voxelType);
 
-    // Queue async mesh generation for ONLY the modified chunk
-    // NO neighbor updates - inter-chunk culling removed for performance
-    if (g_instancedQuadRenderer && g_asyncMeshGenerator)
-    {
-        auto* islandSystem = m_gameState->getIslandSystem();
-        Vec3 chunkCoord = FloatingIsland::islandPosToChunkCoord(update.localPos);
-        auto* chunk = islandSystem->getChunkFromIsland(update.islandID, chunkCoord);
-        if (chunk)
-        {
-            // Queue async mesh generation for the modified chunk
-            g_asyncMeshGenerator->queueChunkMeshGeneration(chunk, [chunk]() {
-                if (g_instancedQuadRenderer)
-                {
-                    g_instancedQuadRenderer->rebuildChunk(chunk);
-                }
-            });
-        }
-    }
+    // Incremental updates already handled by setVoxel() - no need to queue mesh generation!
+    // The quad modifications are immediate and GPU upload happens on next render frame.
 
     // **FIXED**: Always force immediate raycast update when server sends voxel changes
     // This ensures block selection is immediately accurate after server updates

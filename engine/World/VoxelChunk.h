@@ -11,6 +11,7 @@
 #include <string>
 #include <memory>
 #include <atomic>
+#include <functional>
 
 // Forward declaration for OpenGL types
 using GLuint = uint32_t;
@@ -35,7 +36,6 @@ struct VoxelMesh
     // Quad-based mesh for instanced rendering
     std::vector<QuadFace> quads;
     GLuint instanceVBO = 0;  // Instance buffer for QuadFace data
-    bool needsUpdate = true;
 };
 
 struct CollisionFace
@@ -74,6 +74,14 @@ class VoxelChunk
 
     VoxelChunk();
     ~VoxelChunk();
+    
+    // Set whether this chunk is on the client (needs GPU upload) or server (CPU only)
+    void setIsClient(bool isClient) { m_isClientChunk = isClient; }
+    bool isClient() const { return m_isClientChunk; }
+    
+    // Event-driven GPU update callback - called immediately when mesh changes
+    using MeshUpdateCallback = std::function<void(VoxelChunk*)>;
+    void setMeshUpdateCallback(MeshUpdateCallback callback) { m_meshUpdateCallback = callback; }
 
     // Voxel data access (ID-based - clean and efficient)
     uint8_t getVoxel(int x, int y, int z) const;
@@ -101,11 +109,6 @@ class VoxelChunk
     void addBlockQuads(int x, int y, int z, uint8_t blockType);
     void removeBlockQuads(int x, int y, int z);
     void updateNeighborQuads(int x, int y, int z, bool blockWasAdded);
-    
-    // GPU state management
-    bool isGPUDirty() const { return m_gpuDirty; }
-    void markGPUDirty() { m_gpuDirty = true; }
-    void clearGPUDirty() { m_gpuDirty = false; }
     
     // Control incremental updates (disable during world generation)
     void enableIncrementalUpdates() { m_incrementalUpdatesEnabled = true; }
@@ -141,7 +144,6 @@ class VoxelChunk
     // Decorative/model instance positions (generic per block type)
     const std::vector<Vec3>& getModelInstances(uint8_t blockID) const;
     
-    void buildCollisionMesh();
     bool checkRayCollision(const Vec3& rayOrigin, const Vec3& rayDirection, float maxDistance,
                            Vec3& hitPoint, Vec3& hitNormal) const;
 
@@ -169,11 +171,14 @@ class VoxelChunk
     // Fast quad lookup for incremental updates: (x, y, z, face) -> quad index
     std::unordered_map<uint64_t, size_t> m_quadLookup;
     
-    // GPU dirty flag for incremental updates
-    bool m_gpuDirty = false;
-    
     // Disable incremental updates during bulk operations (world generation)
     bool m_incrementalUpdatesEnabled = false;
+    
+    // Client/Server flag - only client chunks upload to GPU
+    bool m_isClientChunk = false;
+    
+    // Event-driven GPU update callback
+    MeshUpdateCallback m_meshUpdateCallback;
     
     // Helper: Pack voxel coord + face direction into lookup key
     static inline uint64_t makeQuadKey(int x, int y, int z, int face) {

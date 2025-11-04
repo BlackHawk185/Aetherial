@@ -127,6 +127,9 @@ private:
     // Game state connection
     GameState* m_gameState = nullptr;  // Not owned by client
     
+    // Client-side physics (separate from server)
+    PhysicsSystem m_clientPhysics;
+    
     // Networking - Re-enabled with ENet integration
     std::unique_ptr<NetworkManager> m_networkManager;
     bool m_isRemoteClient = false;
@@ -220,6 +223,16 @@ private:
      * Handle received entity state updates from server
      */
     void handleEntityStateUpdate(const EntityStateUpdate& update);
+    
+    /**
+     * Helper: Register a chunk with the renderer and set up callbacks
+     */
+    void registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* island, const Vec3& chunkCoord);
+    
+    /**
+     * Sync island transforms to chunk renderers (event-driven, only updates moved islands)
+     */
+    void syncPhysicsToChunks();
     
     /**
      * CRITICAL: Centralized spawn function - ONLY place where player position should be set

@@ -41,8 +41,9 @@ public:
      * @param window - GLFW window for input
      * @param deltaTime - Time since last frame
      * @param islandSystem - Island system for collision detection
+     * @param physics - Physics system for collision queries
      */
-    void update(GLFWwindow* window, float deltaTime, IslandChunkSystem* islandSystem);
+    void update(GLFWwindow* window, float deltaTime, IslandChunkSystem* islandSystem, PhysicsSystem* physics);
     
     /**
      * Process mouse input for camera rotation
@@ -151,7 +152,7 @@ private:
     /**
      * Handle physics-based player movement
      */
-    void updatePhysics(GLFWwindow* window, float deltaTime, IslandChunkSystem* islandSystem);
+    void updatePhysics(GLFWwindow* window, float deltaTime, IslandChunkSystem* islandSystem, PhysicsSystem* physics);
     
     /**
      * Gather input direction from keyboard

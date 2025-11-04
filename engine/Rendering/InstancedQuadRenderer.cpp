@@ -491,6 +491,19 @@ void InstancedQuadRenderer::registerChunk(VoxelChunk* chunk, const glm::mat4& tr
         return;
     }
     
+    // EVENT-DRIVEN: Set up callback for immediate GPU upload on mesh changes
+    // Do this FIRST before checking if already registered to ensure callback is always set
+    chunk->setMeshUpdateCallback([this](VoxelChunk* modifiedChunk) {
+        // Find the chunk entry
+        for (auto& chunkEntry : m_chunks) {
+            if (chunkEntry.chunk == modifiedChunk) {
+                // Immediate GPU upload (zero latency)
+                this->updateSingleChunkGPU(chunkEntry);
+                return;
+            }
+        }
+    });
+    
     // Check if chunk is already registered - update instead of duplicate
     for (auto& entry : m_chunks) {
         if (entry.chunk == chunk) {
@@ -717,7 +730,6 @@ void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
     // The mesh should already be generated (either async or by caller)
     auto mesh = entry.chunk->getRenderMesh();
     if (!mesh) {
-        std::cout << "⚠️ updateSingleChunkGPU: Mesh not ready yet!" << std::endl;
         return;  // Mesh not ready yet - skip this update
     }
     

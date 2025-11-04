@@ -107,6 +107,11 @@ public:
      */
     Vec3 getPlayerSpawnPosition() const { return m_playerSpawnPosition; }
     
+    /**
+     * Update physics systems (called by GameServer with server physics)
+     */
+    void updatePhysics(float deltaTime, PhysicsSystem* physics);
+    
 private:
     // Core systems
     IslandChunkSystem m_islandSystem;
@@ -127,11 +132,6 @@ private:
      * Create the default 3-island world for testing
      */
     void createDefaultWorld();
-    
-    /**
-     * Update physics systems
-     */
-    void updatePhysics(float deltaTime);
     
     /**
      * Update player systems
