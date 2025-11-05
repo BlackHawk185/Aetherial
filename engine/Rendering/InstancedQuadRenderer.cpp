@@ -6,6 +6,7 @@
 #include "../Time/DayNightController.h"
 
 #include <iostream>
+#include <fstream>
 #include <glm/gtc/type_ptr.hpp>
 
 // Global instance
@@ -285,7 +286,9 @@ void main() {
 
 InstancedQuadRenderer::InstancedQuadRenderer()
     : m_unitQuadVAO(0), m_unitQuadVBO(0), m_unitQuadEBO(0), m_shaderProgram(0), m_depthProgram(0),
-      m_globalVAO(0), m_globalInstanceVBO(0), m_indirectCommandBuffer(0), m_transformSSBO(0), 
+      m_globalVAO(0), m_globalInstanceVBO(0), m_indirectCommandBuffer(0), m_transformSSBO(0),
+      m_quadMergeProgram(0), m_inputQuadSSBO(0),
+      m_outputCounterSSBO(0), m_processedFlagsSSBO(0),
       m_mdiDirty(false), m_totalAllocatedInstances(0)
 {
 }
@@ -301,7 +304,8 @@ bool InstancedQuadRenderer::initialize()
     
     createUnitQuad();
     createShader();
-    createDepthShader();  // For shadow casting
+    createDepthShader();
+    createQuadMergeShader();
     
     // Load block textures
     extern TextureManager* g_textureManager;
@@ -465,6 +469,65 @@ void InstancedQuadRenderer::createDepthShader()
     std::cout << "   └─ Depth shader compiled and linked (MDI + SSBO)" << std::endl;
 }
 
+void InstancedQuadRenderer::createQuadMergeShader()
+{
+    std::ifstream file("shaders/quad_merge.comp");
+    if (!file.is_open()) {
+        std::cerr << "❌ Failed to open quad_merge.comp - greedy meshing disabled" << std::endl;
+        m_quadMergeProgram = 0;
+        return;
+    }
+    
+    std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    
+    m_quadMergeProgram = compileComputeShader(source.c_str());
+    
+    if (m_quadMergeProgram == 0) {
+        std::cerr << "❌ Greedy mesh shader compilation failed - greedy meshing disabled" << std::endl;
+        return;
+    }
+    
+    glGenBuffers(1, &m_inputQuadSSBO);
+    glGenBuffers(1, &m_outputCounterSSBO);
+    glGenBuffers(1, &m_processedFlagsSSBO);
+    
+    std::cout << "   └─ Greedy mesh compute shader compiled" << std::endl;
+}
+
+GLuint InstancedQuadRenderer::compileComputeShader(const char* source)
+{
+    GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    
+    GLint success;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        char infoLog[1024];
+        glGetShaderInfoLog(shader, 1024, nullptr, infoLog);
+        std::cerr << "❌ COMPUTE shader compilation FAILED:\n" << infoLog << std::endl;
+        glDeleteShader(shader);
+        return 0;
+    }
+    
+    GLuint program = glCreateProgram();
+    glAttachShader(program, shader);
+    glLinkProgram(program);
+    
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        char infoLog[1024];
+        glGetProgramInfoLog(program, 1024, nullptr, infoLog);
+        std::cerr << "❌ COMPUTE shader linking FAILED:\n" << infoLog << std::endl;
+        glDeleteProgram(program);
+        glDeleteShader(shader);
+        return 0;
+    }
+    
+    glDeleteShader(shader);
+    return program;
+}
+
 GLuint InstancedQuadRenderer::compileShader(const char* source, GLenum type)
 {
     GLuint shader = glCreateShader(type);
@@ -504,11 +567,11 @@ void InstancedQuadRenderer::registerChunk(VoxelChunk* chunk, const glm::mat4& tr
         }
     });
     
-    // Check if chunk is already registered - update instead of duplicate
+    // Check if chunk is already registered - update transform only (no buffer rebuild needed)
     for (auto& entry : m_chunks) {
         if (entry.chunk == chunk) {
             entry.transform = transform;
-            m_mdiDirty = true;  // Mark for rebuild
+            // NOTE: Don't set m_mdiDirty here - transform changes don't require buffer rebuild
             return;
         }
     }
@@ -561,8 +624,7 @@ void InstancedQuadRenderer::rebuildChunk(VoxelChunk* chunk)
 {
     for (auto& entry : m_chunks) {
         if (entry.chunk == chunk) {
-            // Use fast partial update instead of full rebuild
-            updateSingleChunkGPU(entry);
+            entry.transform = transform;
             return;
         }
     }
@@ -588,8 +650,7 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
     
     for (auto& entry : m_chunks) {
         if (entry.chunk) {
-            // Lazy mesh generation - generates mesh on first access if needed
-            auto mesh = entry.chunk->getRenderMeshLazy();
+            auto mesh = entry.chunk->getRenderMesh();
             if (mesh) {
                 entry.instanceCount = mesh->quads.size();
                 entry.allocatedSlots = calculateChunkSlots(entry.instanceCount);
@@ -606,30 +667,21 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
     
     if (totalActiveInstances == 0) return;
     
-    // 2. Build merged instance buffer with PADDED allocation
-    std::vector<QuadFace> mergedInstances;
-    mergedInstances.resize(m_totalAllocatedInstances);  // Pre-allocate with padding
+    // 2. Allocate global instance buffer (no data upload - will be filled by GPU passthrough)
+    glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
+    glBufferData(GL_ARRAY_BUFFER, m_totalAllocatedInstances * sizeof(QuadFace), 
+                 nullptr, GL_DYNAMIC_DRAW);  // Allocate empty buffer
     
-    size_t writeOffset = 0;
-    for (const auto& entry : m_chunks) {
+    // 3. Upload all chunk data via GPU passthrough ONLY for new chunks
+    // (Existing chunks already have their data from updateSingleChunkGPU callbacks)
+    // We need to upload all chunks here because buffer was just reallocated
+    for (auto& entry : m_chunks) {
         if (entry.chunk && entry.instanceCount > 0) {
-            // Thread-safe atomic mesh access - no mutex needed!
-            auto mesh = entry.chunk->getRenderMesh();
-            if (mesh && entry.baseInstance == writeOffset) {
-                // Copy active quads
-                std::copy(mesh->quads.begin(), mesh->quads.end(), 
-                         mergedInstances.begin() + writeOffset);
-                writeOffset += entry.allocatedSlots;  // Skip to next chunk's slot
-            }
+            gpuMergeQuads(entry);
         }
     }
     
-    // 3. Upload merged instance data to GPU (now with padding for future updates)
-    glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
-    glBufferData(GL_ARRAY_BUFFER, m_totalAllocatedInstances * sizeof(QuadFace), 
-                 mergedInstances.data(), GL_DYNAMIC_DRAW);
-    
-    // 4. Configure global VAO (one-time setup, or when first built)
+    // 4. Configure global VAO (one-time setup)
     static bool vaoConfigured = false;
     if (!vaoConfigured) {
         glBindVertexArray(m_globalVAO);
@@ -719,37 +771,87 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
     m_mdiDirty = false;
 }
 
+void InstancedQuadRenderer::gpuMergeQuads(ChunkEntry& entry)
+{
+    if (m_quadMergeProgram == 0) {
+        std::cerr << "❌ GPU quad merge: Shader program not loaded!" << std::endl;
+        return;
+    }
+    
+    auto mesh = entry.chunk->getRenderMesh();
+    if (!mesh || mesh->quads.empty()) return;
+    
+    uint32_t inputCount = static_cast<uint32_t>(mesh->quads.size());
+    size_t targetOffset = entry.baseInstance * sizeof(QuadFace);
+    size_t targetSize = entry.allocatedSlots * sizeof(QuadFace);
+    
+    // Validate buffer range
+    size_t totalBufferSize = m_totalAllocatedInstances * sizeof(QuadFace);
+    if (targetOffset + targetSize > totalBufferSize) {
+        std::cerr << "❌ ERROR: Buffer overflow! Offset=" << targetOffset << " + Size=" << targetSize 
+                  << " > TotalBuffer=" << totalBufferSize << std::endl;
+        return;
+    }
+    
+    // Upload input quads as raw bytes (binding 3 and 4 for raw data)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_inputQuadSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, inputCount * sizeof(QuadFace), mesh->quads.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_inputQuadSSBO);
+    
+    // Check alignment requirements for glBindBufferRange
+    GLint alignment = 0;
+    glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &alignment);
+    if (targetOffset % alignment != 0) {
+        std::cerr << "❌ ERROR: Buffer offset " << targetOffset << " not aligned to " << alignment << " bytes!" << std::endl;
+        return;
+    }
+    
+    // Verify size is positive
+    if (targetSize == 0) {
+        std::cerr << "❌ ERROR: Target size is zero!" << std::endl;
+        return;
+    }
+    
+    // Output directly to this chunk's section of global instance buffer (as raw data)
+    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 4, m_globalInstanceVBO, 
+                      targetOffset, targetSize);
+    
+    // Dispatch compute shader (passthrough: no counter needed)
+    glUseProgram(m_quadMergeProgram);
+    glUniform1ui(glGetUniformLocation(m_quadMergeProgram, "inputCount"), inputCount);
+    
+    uint32_t numWorkGroups = (inputCount + 255) / 256;
+    glDispatchCompute(numWorkGroups, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+    
+    // Check for GPU errors after dispatch
+    GLenum dispatchErr = glGetError();
+    if (dispatchErr != GL_NO_ERROR) {
+        std::cerr << "❌ OpenGL ERROR after compute dispatch: " << dispatchErr << std::endl;
+    }
+    
+    // Passthrough mode: output count always equals input count
+    entry.instanceCount = inputCount;
+}
+
 // CRITICAL OPTIMIZATION: Update single chunk without rebuilding entire buffer
 void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
 {
     if (!entry.chunk) return;
     
-    auto t_start = std::chrono::high_resolution_clock::now();
-    
-    // DON'T use getRenderMeshLazy() - it triggers synchronous mesh generation!
-    // The mesh should already be generated (either async or by caller)
     auto mesh = entry.chunk->getRenderMesh();
     if (!mesh) {
-        return;  // Mesh not ready yet - skip this update
+        return;
     }
     
-    size_t newQuadCount = mesh->quads.size();
+    // Run GPU passthrough - this uploads quads and writes merged result to GPU
+    gpuMergeQuads(entry);
     
-    auto t_check = std::chrono::high_resolution_clock::now();
+    size_t newQuadCount = entry.instanceCount; // Use the count from gpuMergeQuads (passthrough = same as input)
     
     // Check if we can fit within allocated space
     if (newQuadCount <= entry.allocatedSlots) {
-        // FAST PATH: Partial update with glBufferSubData
-        auto t_upload_start = std::chrono::high_resolution_clock::now();
-        
-        glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
-        glBufferSubData(GL_ARRAY_BUFFER, 
-                       entry.baseInstance * sizeof(QuadFace),
-                       newQuadCount * sizeof(QuadFace),
-                       mesh->quads.data());
-        
-        auto t_upload_end = std::chrono::high_resolution_clock::now();
-        auto t_cmd_start = std::chrono::high_resolution_clock::now();
+        // GPU passthrough already wrote the data, just update the indirect command
         
         // Update instance count in indirect command buffer
         size_t chunkIndex = &entry - m_chunks.data();
@@ -766,21 +868,7 @@ void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
                        sizeof(DrawElementsIndirectCommand),
                        &cmd);
         
-        auto t_cmd_end = std::chrono::high_resolution_clock::now();
-        
         entry.instanceCount = newQuadCount;
-        
-        auto t_end = std::chrono::high_resolution_clock::now();
-        
-        auto check_ms = std::chrono::duration<double, std::milli>(t_check - t_start).count();
-        auto upload_ms = std::chrono::duration<double, std::milli>(t_upload_end - t_upload_start).count();
-        auto cmd_ms = std::chrono::duration<double, std::milli>(t_cmd_end - t_cmd_start).count();
-        auto total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-        
-        size_t uploadBytes = newQuadCount * sizeof(QuadFace);
-        std::cout << "🚀 GPU UPLOAD: " << total_ms << "ms (Check=" << check_ms 
-                  << "ms, Upload=" << upload_ms << "ms [" << (uploadBytes/1024) << "KB], Cmd=" 
-                  << cmd_ms << "ms) Quads=" << newQuadCount << std::endl;
     } else {
         // SLOW PATH: Chunk grew beyond allocated space - need full rebuild
         std::cout << "⚠️ Chunk grew beyond padding - triggering full rebuild" << std::endl;
@@ -935,6 +1023,21 @@ void InstancedQuadRenderer::shutdown()
         m_transformSSBO = 0;
     }
     
+    if (m_inputQuadSSBO != 0) {
+        glDeleteBuffers(1, &m_inputQuadSSBO);
+        m_inputQuadSSBO = 0;
+    }
+    
+    if (m_outputCounterSSBO != 0) {
+        glDeleteBuffers(1, &m_outputCounterSSBO);
+        m_outputCounterSSBO = 0;
+    }
+    
+    if (m_processedFlagsSSBO != 0) {
+        glDeleteBuffers(1, &m_processedFlagsSSBO);
+        m_processedFlagsSSBO = 0;
+    }
+    
     if (m_shaderProgram != 0) {
         glDeleteProgram(m_shaderProgram);
         m_shaderProgram = 0;
@@ -943,6 +1046,11 @@ void InstancedQuadRenderer::shutdown()
     if (m_depthProgram != 0) {
         glDeleteProgram(m_depthProgram);
         m_depthProgram = 0;
+    }
+    
+    if (m_quadMergeProgram != 0) {
+        glDeleteProgram(m_quadMergeProgram);
+        m_quadMergeProgram = 0;
     }
 }
 

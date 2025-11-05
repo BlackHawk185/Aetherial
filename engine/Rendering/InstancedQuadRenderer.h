@@ -91,6 +91,12 @@ private:
     GLuint m_indirectCommandBuffer;  // GPU buffer for draw commands
     GLuint m_transformSSBO;          // Chunk transforms for shader lookup
     
+    // GPU quad merging compute shader
+    GLuint m_quadMergeProgram;
+    GLuint m_inputQuadSSBO;
+    GLuint m_outputCounterSSBO;
+    GLuint m_processedFlagsSSBO;
+    
     bool m_mdiDirty;                 // True when buffers need rebuild
     size_t m_totalAllocatedInstances; // Total buffer capacity (with padding)
     
@@ -98,7 +104,10 @@ private:
     void createUnitQuad();
     void createShader();
     void createDepthShader();
+    void createQuadMergeShader();
     GLuint compileShader(const char* source, GLenum type);
+    GLuint compileComputeShader(const char* source);
+    void gpuMergeQuads(ChunkEntry& entry);
     void uploadChunkInstances(ChunkEntry& entry);
     void rebuildMDIBuffers();  // Rebuild merged buffers for MDI (full)
     void updateSingleChunkGPU(ChunkEntry& entry);  // Partial update for one chunk

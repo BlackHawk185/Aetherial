@@ -23,6 +23,17 @@ add_executable(MMORPGEngine
 )
 target_link_libraries(MMORPGEngine PRIVATE engine)
 
+# Copy shaders to build directory
+file(GLOB SHADER_FILES "${CMAKE_SOURCE_DIR}/shaders/*")
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/bin/shaders)
+foreach(SHADER ${SHADER_FILES})
+    get_filename_component(SHADER_NAME ${SHADER} NAME)
+    configure_file(${SHADER} ${CMAKE_BINARY_DIR}/bin/shaders/${SHADER_NAME} COPYONLY)
+endforeach()
+
+# Remove old shader files that were renamed
+file(REMOVE ${CMAKE_BINARY_DIR}/bin/shaders/greedy_mesh.comp)
+
 # Third-party libraries
 add_subdirectory(libs)
 # Some libraries like imgui are not standard CMake projects, so link manually in engine/CMakeLists.txt.

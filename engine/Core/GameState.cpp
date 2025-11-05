@@ -125,7 +125,7 @@ void GameState::createDefaultWorld()
         // Island generation (density-based for infinite scaling)
         float islandDensity = 3.0f;          // Islands per 1000x1000 area (scales infinitely!)
         float minIslandRadius = 100.0f;       // Minimum island size
-        float maxIslandRadius = 1500.0f;      // Maximum island size
+        float maxIslandRadius = 500.0f;      // Maximum island size
         
         // Advanced Voronoi tuning
         float verticalSpread = 100.0f;       // Vertical Y-axis spread (±units)
