@@ -12,7 +12,7 @@ void BlockTypeRegistry::registerBlockType(uint8_t id, const std::string& name, B
     }
     
     m_blockTypes[id] = BlockTypeInfo(id, name, renderType, assetPath, properties);
-    std::cout << "Registered block type: " << name << " (ID: " << (int)id << ")" << std::endl;
+    // std::cout << "Registered block type: " << name << " (ID: " << (int)id << ")" << std::endl;
 }
 
 const BlockTypeInfo* BlockTypeRegistry::getBlockType(uint8_t id) const {

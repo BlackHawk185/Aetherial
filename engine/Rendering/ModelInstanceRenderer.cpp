@@ -230,6 +230,37 @@ void main(){
 }
 )GLSL";
 
+    // ========== G-BUFFER SHADERS (for deferred rendering) ==========
+    static const char* kGBuffer_FS = R"GLSL(
+#version 460 core
+in vec2 vUV;
+in vec3 vNormalWS;
+in vec3 vWorldPos;
+in vec4 vLightSpacePos;
+in float vViewZ;
+
+uniform sampler2D uGrassTexture;
+
+// G-buffer outputs (MRT)
+layout(location = 0) out vec3 gAlbedo;    // Base color
+layout(location = 1) out vec3 gNormal;    // World-space normal
+layout(location = 2) out vec3 gPosition;  // World position
+layout(location = 3) out vec4 gMetadata;  // Reserved for future use
+
+void main(){
+    vec4 albedo = texture(uGrassTexture, vUV);
+    
+    // Alpha cutout
+    if (albedo.a < 0.3) discard;
+    
+    // Write to G-buffer
+    gAlbedo = albedo.rgb;
+    gNormal = normalize(vNormalWS);
+    gPosition = vWorldPos;
+    gMetadata = vec4(0.0);  // Reserved (could store material properties later)
+}
+)GLSL";
+
 }
 
 static GLuint Compile(GLuint type, const char* src) {
@@ -321,6 +352,12 @@ void ModelInstanceRenderer::shutdown() {
         if (shaderPair.second) glDeleteProgram(shaderPair.second);
     }
     m_shaders.clear();
+    
+    // Clean up G-buffer shaders
+    for (auto& shaderPair : m_gbufferShaders) {
+        if (shaderPair.second) glDeleteProgram(shaderPair.second);
+    }
+    m_gbufferShaders.clear();
     
     // Clean up depth shader
     if (m_depthProgram) { glDeleteProgram(m_depthProgram); m_depthProgram = 0; }
@@ -706,6 +743,102 @@ void ModelInstanceRenderer::renderAll(const glm::mat4& view, const glm::mat4& pr
             glUniformMatrix4fv(loc_Model, 1, GL_FALSE, &buf.modelMatrix[0][0]);
             
             // Render instanced models using per-chunk VAOs
+            for (size_t i = 0; i < buf.vaos.size() && i < model.primitives.size(); ++i) {
+                glBindVertexArray(buf.vaos[i]);
+                glDrawElementsInstanced(GL_TRIANGLES, model.primitives[i].indexCount, GL_UNSIGNED_INT, 0, buf.count);
+            }
+        }
+    }
+    
+    // Cleanup
+    glBindVertexArray(0);
+    if (wasCull) glEnable(GL_CULL_FACE);
+}
+
+void ModelInstanceRenderer::renderToGBuffer(const glm::mat4& view, const glm::mat4& proj) {
+    // Disable culling for foliage rendering
+    GLboolean wasCull = glIsEnabled(GL_CULL_FACE);
+    if (wasCull) glDisable(GL_CULL_FACE);
+    
+    // Extract camera position for distance culling
+    glm::mat4 invView = glm::inverse(view);
+    glm::vec3 cameraPos = glm::vec3(invView[3]);
+    const float maxRenderDistance = 512.0f;
+    const float maxRenderDistanceSq = maxRenderDistance * maxRenderDistance;
+    
+    // Iterate through each block type
+    for (const auto& [blockID, model] : m_models) {
+        if (!model.valid) continue;
+        
+        // Get or compile G-buffer shader for this block type
+        GLuint shader = 0;
+        auto shaderIt = m_gbufferShaders.find(blockID);
+        if (shaderIt == m_gbufferShaders.end()) {
+            // Compile G-buffer shader (uses same vertex shader, different fragment shader)
+            const char* vs = (blockID == 13) ? kVS_Wind : kVS_Static;
+            GLuint vsShader = Compile(GL_VERTEX_SHADER, vs);
+            GLuint fsShader = Compile(GL_FRAGMENT_SHADER, kGBuffer_FS);
+            if (vsShader && fsShader) {
+                shader = Link(vsShader, fsShader);
+                glDeleteShader(vsShader);
+                glDeleteShader(fsShader);
+                m_gbufferShaders[blockID] = shader;
+            } else {
+                continue;
+            }
+        } else {
+            shader = shaderIt->second;
+        }
+        
+        if (!shader) continue;
+        
+        // Bind shader
+        glUseProgram(shader);
+        
+        // Set uniforms
+        int loc_View = glGetUniformLocation(shader, "uView");
+        int loc_Proj = glGetUniformLocation(shader, "uProjection");
+        int loc_Model = glGetUniformLocation(shader, "uModel");
+        int loc_Time = glGetUniformLocation(shader, "uTime");
+        int loc_Texture = glGetUniformLocation(shader, "uGrassTexture");
+        
+        glUniformMatrix4fv(loc_View, 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(loc_Proj, 1, GL_FALSE, &proj[0][0]);
+        glUniform1f(loc_Time, m_time);
+        
+        // Bind texture
+        if (loc_Texture >= 0) {
+            glActiveTexture(GL_TEXTURE5);
+            GLuint tex = 0;
+            if (blockID == 13 && m_engineGrassTex) {
+                tex = m_engineGrassTex;
+            } else {
+                auto texIt = m_albedoTextures.find(blockID);
+                if (texIt != m_albedoTextures.end()) {
+                    tex = texIt->second;
+                }
+            }
+            if (tex) {
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glUniform1i(loc_Texture, 5);
+            }
+        }
+        
+        // Render all chunks with this block type
+        for (auto& [key, buf] : m_chunkInstances) {
+            if (key.second != blockID) continue;
+            if (buf.count == 0 || !buf.isUploaded) continue;
+            
+            // Distance culling
+            glm::vec3 chunkPos = glm::vec3(buf.modelMatrix[3]);
+            glm::vec3 delta = cameraPos - chunkPos;
+            float distanceSq = glm::dot(delta, delta);
+            if (distanceSq > maxRenderDistanceSq) continue;
+            
+            // Set model matrix
+            glUniformMatrix4fv(loc_Model, 1, GL_FALSE, &buf.modelMatrix[0][0]);
+            
+            // Render instances
             for (size_t i = 0; i < buf.vaos.size() && i < model.primitives.size(); ++i) {
                 glBindVertexArray(buf.vaos[i]);
                 glDrawElementsInstanced(GL_TRIANGLES, model.primitives[i].indexCount, GL_UNSIGNED_INT, 0, buf.count);

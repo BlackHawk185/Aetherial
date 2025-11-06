@@ -24,11 +24,11 @@ public:
     // Update chunk transform (for moving islands)
     void updateChunkTransform(VoxelChunk* chunk, const glm::mat4& transform);
     
-    // Rebuild chunk instance data (call when mesh changes)
-    void rebuildChunk(VoxelChunk* chunk);
-    
     // Render all registered chunks with CSM/PCF shadows
     void render(const glm::mat4& viewProjection, const glm::mat4& view);
+    
+    // Render to G-buffer (deferred rendering)
+    void renderToGBuffer(const glm::mat4& viewProjection, const glm::mat4& view);
     
     // Shadow depth pass (for casting shadows)
     void beginDepthPass(const glm::mat4& lightVP, int cascadeIndex);
@@ -46,6 +46,14 @@ private:
     
     // Shader program
     GLuint m_shaderProgram;
+    
+    // G-buffer shader (deferred rendering)
+    GLuint m_gbufferProgram;
+    GLint m_gbuffer_uViewProjection;
+    GLint m_gbuffer_uTextureStone;
+    GLint m_gbuffer_uTextureDirt;
+    GLint m_gbuffer_uTextureGrass;
+    GLint m_gbuffer_uTextureSand;
     
     // Depth-only shader for shadow map rendering
     GLuint m_depthProgram;
@@ -91,26 +99,19 @@ private:
     GLuint m_indirectCommandBuffer;  // GPU buffer for draw commands
     GLuint m_transformSSBO;          // Chunk transforms for shader lookup
     
-    // GPU quad merging compute shader
-    GLuint m_quadMergeProgram;
-    GLuint m_inputQuadSSBO;
-    GLuint m_outputCounterSSBO;
-    GLuint m_processedFlagsSSBO;
-    
     bool m_mdiDirty;                 // True when buffers need rebuild
     size_t m_totalAllocatedInstances; // Total buffer capacity (with padding)
     
     // Helper methods
     void createUnitQuad();
     void createShader();
+    void createGBufferShader();
     void createDepthShader();
-    void createQuadMergeShader();
     GLuint compileShader(const char* source, GLenum type);
-    GLuint compileComputeShader(const char* source);
-    void gpuMergeQuads(ChunkEntry& entry);
     void uploadChunkInstances(ChunkEntry& entry);
     void rebuildMDIBuffers();  // Rebuild merged buffers for MDI (full)
     void updateSingleChunkGPU(ChunkEntry& entry);  // Partial update for one chunk
+    void rebuildChunk(VoxelChunk* chunk);  // Rebuild specific chunk
     size_t calculateChunkSlots(size_t quadCount);  // Calculate padded allocation size
 };
 

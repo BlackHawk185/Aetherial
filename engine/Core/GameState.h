@@ -4,9 +4,11 @@
 
 #include "../Math/Vec3.h"
 #include "../World/IslandChunkSystem.h"
+#include "../World/VoronoiIslandPlacer.h"  // For IslandDefinition
 #include "../Physics/PhysicsSystem.h"  // Re-enabled with fixed BodyID handling
 #include <memory>
 #include <vector>
+#include <unordered_set>
 
 /**
  * GameState manages the authoritative game world state.
@@ -103,6 +105,11 @@ public:
     const std::vector<uint32_t>& getAllIslandIDs() const { return m_islandIDs; }
     
     /**
+     * Get all island definitions (both realized and unrealized)
+     */
+    const std::vector<IslandDefinition>& getAllIslandDefinitions() const { return m_islandDefinitions; }
+    
+    /**
      * Get the calculated player spawn position (set during world generation)
      */
     Vec3 getPlayerSpawnPosition() const { return m_playerSpawnPosition; }
@@ -112,6 +119,11 @@ public:
      */
     void updatePhysics(float deltaTime, PhysicsSystem* physics);
     
+    /**
+     * Check and activate islands near player position
+     */
+    void updateIslandActivation(const Vec3& playerPosition);
+    
 private:
     // Core systems
     IslandChunkSystem m_islandSystem;
@@ -120,6 +132,12 @@ private:
     // World state
     std::vector<uint32_t> m_islandIDs;  // Track all created islands
     Vec3 m_playerSpawnPosition;          // Calculated spawn position above first island
+    
+    // Deferred island generation
+    std::vector<IslandDefinition> m_islandDefinitions;  // All island blueprints (realized + unrealized)
+    std::unordered_set<size_t> m_realizedIslandIndices;  // Indices of islands that have been generated
+    float m_islandActivationRadius = 500.0f;  // Distance at which islands activate
+    Vec3 m_lastPlayerPosition;  // Track player position for activation checks
     
     // State flags
     bool m_initialized = false;
@@ -137,4 +155,9 @@ private:
      * Update player systems
      */
     void updatePlayer(float deltaTime);
+    
+    /**
+     * Realize (generate voxels for) an island from its definition
+     */
+    void realizeIsland(size_t definitionIndex);
 };

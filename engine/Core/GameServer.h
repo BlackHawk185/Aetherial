@@ -151,6 +151,10 @@ private:
         uint8_t voxelType;
     };
     
+    // Player tracking (for island activation)
+    Vec3 m_lastKnownPlayerPosition;
+    bool m_hasPlayerPosition = false;
+    
     struct PlayerMovementCommand {
         Vec3 movement;
     };

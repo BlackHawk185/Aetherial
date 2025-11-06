@@ -13,6 +13,7 @@
 #include "../Math/Vec3.h"
 #include "VoxelChunk.h"
 #include "BlockType.h"
+#include "BiomeSystem.h"
 
 // An Island is a collection of chunks that move together as one physics body
 struct FloatingIsland
@@ -190,7 +191,7 @@ class IslandChunkSystem
 
     // **ORGANIC ISLAND GENERATION** (Creates chunks dynamically based on island shape)
     // This is now the primary and only island generation method
-    void generateFloatingIslandOrganic(uint32_t islandID, uint32_t seed, float radius = 48.0f);
+    void generateFloatingIslandOrganic(uint32_t islandID, uint32_t seed, float radius = 48.0f, BiomeType biome = BiomeType::GRASSLAND);
 
     // Island queries
     Vec3 getIslandCenter(uint32_t islandID) const;    // Get current physics center of island

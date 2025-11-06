@@ -205,7 +205,7 @@ VoxelChunk* IslandChunkSystem::getChunkFromIsland(uint32_t islandID, const Vec3&
     return nullptr;
 }
 
-void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_t seed, float radius)
+void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_t seed, float radius, BiomeType biome)
 {
     PROFILE_SCOPE("IslandChunkSystem::generateFloatingIslandOrganic");
     
@@ -214,6 +214,12 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     FloatingIsland* island = getIsland(islandID);
     if (!island)
         return;
+
+    // Get biome palette for block selection
+    BiomeSystem biomeSystem;
+    BiomePalette palette = biomeSystem.getPalette(biome);
+    
+    std::cout << "[BIOME] Island " << islandID << " - " << biomeSystem.getBiomeName(biome) << std::endl;
 
     // Start with a center chunk at origin to ensure we have at least one chunk
     addChunkToIsland(islandID, Vec3(0, 0, 0));
@@ -270,7 +276,7 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     Vec3 startPos(0, 0, 0);
     frontier.push(startPos);
     visited.insert(encodePos(startPos));
-    setBlockIDWithAutoChunk(islandID, startPos, BlockID::DIRT);
+    setBlockIDWithAutoChunk(islandID, startPos, palette.deepBlock);  // Use biome deep block
     voxelsGenerated++;
     
     while (!frontier.empty())
@@ -327,7 +333,25 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
             
             if (finalDensity > densityThreshold)
             {
-                setBlockIDWithAutoChunk(islandID, neighbor, BlockID::DIRT);
+                // Determine block type based on biome and depth from surface
+                uint8_t blockType = palette.deepBlock;  // Default to deep block
+                
+                // Calculate approximate depth from surface
+                float surfaceDist = radius - distanceFromCenter;
+                
+                if (surfaceDist < 3.0f)
+                {
+                    // Top 3 voxels: surface block
+                    blockType = palette.surfaceBlock;
+                }
+                else if (surfaceDist < 8.0f)
+                {
+                    // Next 5 voxels: subsurface block
+                    blockType = palette.subsurfaceBlock;
+                }
+                // else: use deep block (already set)
+                
+                setBlockIDWithAutoChunk(islandID, neighbor, blockType);
                 frontier.push(neighbor);
                 voxelsGenerated++;
             }
@@ -341,51 +365,51 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
               << island->chunks.size() << " chunks)" << std::endl;
     std::cout << "   └─ Positions Sampled: " << voxelsSampled << " (connectivity-aware)" << std::endl;
     
-    // Decoration pass - scan chunks directly for exposed top surfaces (no mutex spam!)
-    auto decorationStart = std::chrono::high_resolution_clock::now();
-    
-    int grassPlaced = 0;
-    
-    // Direct chunk iteration - we already have the island pointer, no locks needed
-    for (auto& [chunkCoord, chunk] : island->chunks) {
-        if (!chunk) continue;
-        
-        // Scan each voxel in this chunk
-        for (int z = 0; z < VoxelChunk::SIZE; ++z) {
-            for (int x = 0; x < VoxelChunk::SIZE; ++x) {
-                for (int y = VoxelChunk::SIZE - 1; y >= 0; --y) {  // Scan top-down
-                    uint8_t blockID = chunk->getVoxel(x, y, z);
-                    if (blockID == BlockID::AIR) continue;
-                    
-                    // Found solid block - check if surface is exposed
-                    if (y + 1 < VoxelChunk::SIZE) {
-                        uint8_t blockAbove = chunk->getVoxel(x, y + 1, z);
-                        if (blockAbove == BlockID::AIR && (std::rand() % 100) < 25) {
-                            chunk->setVoxel(x, y + 1, z, BlockID::DECOR_GRASS);
-                            grassPlaced++;
-                        }
-                    } else {
-                        // Edge of chunk - check neighboring chunk above (rare case)
-                        Vec3 aboveChunkCoord = chunkCoord + Vec3(0, 1, 0);
-                        auto itAbove = island->chunks.find(aboveChunkCoord);
-                        if (itAbove != island->chunks.end() && itAbove->second) {
-                            uint8_t blockAbove = itAbove->second->getVoxel(x, 0, z);
-                            if (blockAbove == BlockID::AIR && (std::rand() % 100) < 25) {
-                                itAbove->second->setVoxel(x, 0, z, BlockID::DECOR_GRASS);
-                                grassPlaced++;
-                            }
-                        }
-                    }
-                    
-                    break;  // Found topmost solid block in this column, move to next
-                }
-            }
-        }
-    }
-    
-    auto decorationEnd = std::chrono::high_resolution_clock::now();
-    auto decorationDuration = std::chrono::duration_cast<std::chrono::milliseconds>(decorationEnd - decorationStart).count();
-    std::cout << "🌿 Decoration: " << decorationDuration << "ms (" << grassPlaced << " grass)" << std::endl;
+    // TEMPORARILY DISABLED: Grass decoration pass
+    // auto decorationStart = std::chrono::high_resolution_clock::now();
+    // 
+    // int grassPlaced = 0;
+    // 
+    // // Direct chunk iteration - we already have the island pointer, no locks needed
+    // for (auto& [chunkCoord, chunk] : island->chunks) {
+    //     if (!chunk) continue;
+    //     
+    //     // Scan each voxel in this chunk
+    //     for (int z = 0; z < VoxelChunk::SIZE; ++z) {
+    //         for (int x = 0; x < VoxelChunk::SIZE; ++x) {
+    //             for (int y = VoxelChunk::SIZE - 1; y >= 0; --y) {  // Scan top-down
+    //                 uint8_t blockID = chunk->getVoxel(x, y, z);
+    //                 if (blockID == BlockID::AIR) continue;
+    //                 
+    //                 // Found solid block - check if surface is exposed
+    //                 if (y + 1 < VoxelChunk::SIZE) {
+    //                     uint8_t blockAbove = chunk->getVoxel(x, y + 1, z);
+    //                     if (blockAbove == BlockID::AIR && (std::rand() % 100) < 25) {
+    //                         chunk->setVoxel(x, y + 1, z, BlockID::DECOR_GRASS);
+    //                         grassPlaced++;
+    //                     }
+    //                 } else {
+    //                     // Edge of chunk - check neighboring chunk above (rare case)
+    //                     Vec3 aboveChunkCoord = chunkCoord + Vec3(0, 1, 0);
+    //                     auto itAbove = island->chunks.find(aboveChunkCoord);
+    //                     if (itAbove != island->chunks.end() && itAbove->second) {
+    //                         uint8_t blockAbove = itAbove->second->getVoxel(x, 0, z);
+    //                         if (blockAbove == BlockID::AIR && (std::rand() % 100) < 25) {
+    //                             itAbove->second->setVoxel(x, 0, z, BlockID::DECOR_GRASS);
+    //                             grassPlaced++;
+    //                         }
+    //                     }
+    //                 }
+    //                 
+    //                 break;  // Found topmost solid block in this column, move to next
+    //             }
+    //         }
+    //     }
+    // }
+    // 
+    // auto decorationEnd = std::chrono::high_resolution_clock::now();
+    // auto decorationDuration = std::chrono::duration_cast<std::chrono::milliseconds>(decorationEnd - decorationStart).count();
+    // std::cout << "🌿 Decoration: " << decorationDuration << "ms (" << grassPlaced << " grass)" << std::endl;
     
     // Chunks will be registered with renderer when client receives them via network
     // (Don't register here - renderer may not exist yet, and this violates separation of concerns)
@@ -419,9 +443,7 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     
     std::cout << "✅ Island Generation Complete: " << totalDuration << "ms total" << std::endl;
     std::cout << "   └─ Breakdown: Voxels=" << voxelGenDuration << "ms (" 
-              << (voxelGenDuration * 100 / std::max(1LL, totalDuration)) << "%), Decoration=" 
-              << decorationDuration << "ms (" << (decorationDuration * 100 / std::max(1LL, totalDuration)) 
-              << "%)" << std::endl;
+              << (voxelGenDuration * 100 / std::max(1LL, totalDuration)) << "%)" << std::endl;
 }
 
 uint8_t IslandChunkSystem::getVoxelFromIsland(uint32_t islandID, const Vec3& islandRelativePosition) const

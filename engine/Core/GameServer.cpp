@@ -37,6 +37,10 @@ bool GameServer::initialize(float targetTickRate, bool enableNetworking, uint16_
         std::cerr << "Failed to initialize game state!" << std::endl;
         return false;
     }
+    
+    // Initialize player position for integrated mode
+    m_lastKnownPlayerPosition = m_gameState->getPlayerSpawnPosition();
+    m_hasPlayerPosition = true;
 
     // Log island generation mode once (noise is now default)
     // Connect physics system to island system for server-side collision detection
@@ -71,6 +75,13 @@ bool GameServer::initialize(float targetTickRate, bool enableNetworking, uint16_
 
             server->onPilotingInput = [this](ENetPeer* peer, const PilotingInputMessage& input)
             { this->handlePilotingInput(peer, input); };
+            
+            // Track player position for island activation
+            server->onPlayerMovementRequest = [this](ENetPeer* /* peer */, const PlayerMovementRequest& request)
+            {
+                m_lastKnownPlayerPosition = request.intendedPosition;
+                m_hasPlayerPosition = true;
+            };
         }
 
         // Removed verbose debug output
@@ -245,6 +256,12 @@ void GameServer::processTick(float deltaTime)
         PROFILE_SCOPE("GameState::updateSimulation");
         m_gameState->updatePhysics(deltaTime, &m_serverPhysics);
         m_gameState->updateSimulation(deltaTime);
+        
+        // Check for island activation based on player position
+        if (m_hasPlayerPosition)
+        {
+            m_gameState->updateIslandActivation(m_lastKnownPlayerPosition);
+        }
     }
 
     // Broadcast island state updates to clients
@@ -327,7 +344,7 @@ void GameServer::sendWorldStateToClient(ENetPeer* peer)
 
     // Get actual island positions from the island system
     const std::vector<uint32_t>& islandIDs = m_gameState->getAllIslandIDs();
-    for (int i = 0; i < 3 && i < islandIDs.size(); i++)
+    for (size_t i = 0; i < 3 && i < islandIDs.size(); i++)
     {
         Vec3 islandCenter = islandSystem->getIslandCenter(islandIDs[i]);
         worldState.islandPositions[i] = islandCenter;

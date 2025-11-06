@@ -18,7 +18,8 @@
 #include "../Network/NetworkManager.h"
 #include "../Network/NetworkMessages.h"
 #include "../Rendering/BlockHighlightRenderer.h"
-#include "../Rendering/SkyRenderer.h"
+#include "../Rendering/GBuffer.h"
+#include "../Rendering/DeferredLightingPass.h"
 #include "../UI/HUD.h"
 #include "../UI/PeriodicTableUI.h"  // NEW: Periodic table UI for hotbar binding
 #include "../Core/Window.h"
@@ -354,7 +355,7 @@ void GameClient::render()
 {
     PROFILE_SCOPE("GameClient::render");
     
-    // Clear depth buffer only (sky will replace clear color)
+    // Clear depth buffer only (gradient sky will be rendered by deferred lighting shader)
     glClear(GL_DEPTH_BUFFER_BIT);
 
     // Set up 3D projection
@@ -366,18 +367,6 @@ void GameClient::render()
         
         // Update frustum culling
         m_frustumCuller.updateFromCamera(m_playerController.getCamera(), aspect, fov);
-    }
-    
-    // Get camera matrices for rendering
-    float aspect = (float)m_windowWidth / (float)m_windowHeight;
-    glm::mat4 projectionMatrix = m_playerController.getCamera().getProjectionMatrix(aspect);
-    glm::mat4 viewMatrix = m_playerController.getCamera().getViewMatrix();
-    
-    // Render sky FIRST (replaces the solid blue clear color)
-    if (m_skyRenderer && m_dayNightController)
-    {
-        PROFILE_SCOPE("SkyRenderer::render");
-        m_skyRenderer->render(glm::value_ptr(viewMatrix), glm::value_ptr(projectionMatrix), *m_dayNightController);
     }
 
     // Render world (only if we have local game state)
@@ -445,6 +434,20 @@ bool GameClient::initializeGraphics()
         return false;
     }
 
+    // Initialize G-buffer for deferred rendering
+    if (!g_gBuffer.initialize(m_windowWidth, m_windowHeight))
+    {
+        std::cerr << "❌ Failed to initialize G-buffer!" << std::endl;
+        return false;
+    }
+
+    // Initialize deferred lighting pass
+    if (!g_deferredLighting.initialize())
+    {
+        std::cerr << "❌ Failed to initialize deferred lighting pass!" << std::endl;
+        return false;
+    }
+
     // Initialize model instancing renderer (decorative GLB like grass)
     g_modelRenderer = std::make_unique<ModelInstanceRenderer>();
     if (!g_modelRenderer->initialize())
@@ -481,15 +484,6 @@ bool GameClient::initializeGraphics()
     
     // Initialize Periodic Table UI
     m_periodicTableUI = std::make_unique<PeriodicTableUI>();
-    
-    // Initialize atmospheric rendering systems
-    m_skyRenderer = std::make_unique<SkyRenderer>();
-    if (!m_skyRenderer->initialize()) {
-        std::cerr << "Warning: Failed to initialize SkyRenderer" << std::endl;
-        m_skyRenderer.reset();
-    } else {
-        std::cout << "✅ SkyRenderer initialized" << std::endl;
-    }
 
     // Initialize ImGui
     IMGUI_CHECKVERSION();
@@ -833,25 +827,56 @@ void GameClient::renderWorld()
         renderShadowPass();
     }
 
-    // Render all islands with instanced quads (single shared mesh + per-instance data)
+    // === DEFERRED RENDERING PIPELINE ===
+    
+    // 1. G-Buffer Pass: Render scene geometry to G-buffer (albedo, normal, position, metadata)
     {
-        PROFILE_SCOPE("InstancedQuad_renderAll");
+        PROFILE_SCOPE("GBuffer_Pass");
         
-        if (!g_instancedQuadRenderer)
-        {
-            std::cerr << "❌ InstancedQuadRenderer not initialized! Cannot render world." << std::endl;
-            return;
-        }
+        g_gBuffer.bindForGeometryPass();
         
         glm::mat4 viewProjection = projectionMatrix * viewMatrix;
-        g_instancedQuadRenderer->render(viewProjection, viewMatrix);
         
-        // Render GLB model instances with batched rendering
+        // Render voxel quads to G-buffer
+        if (g_instancedQuadRenderer)
+        {
+            g_instancedQuadRenderer->renderToGBuffer(viewProjection, viewMatrix);
+        }
+        
+        // Render GLB models to G-buffer
         if (g_modelRenderer)
         {
-            PROFILE_SCOPE("GLB model rendering");
-            g_modelRenderer->renderAll(viewMatrix, projectionMatrix);
+            g_modelRenderer->renderToGBuffer(viewMatrix, projectionMatrix);
         }
+        
+        g_gBuffer.unbind();
+    }
+    
+    // 2. Lighting Pass: Read G-buffer, apply shadows + lighting, output final color to screen
+    {
+        PROFILE_SCOPE("Deferred_Lighting_Pass");
+        
+        // Get sun direction for lighting
+        Vec3 sunDir = m_dayNightController ? m_dayNightController->getSunDirection() : Vec3(-0.3f, -1.0f, -0.2f).normalized();
+        glm::vec3 sunDirGLM(sunDir.x, sunDir.y, sunDir.z);
+        
+        // Ambient strength from day/night cycle
+        float ambientStrength = m_dayNightController ? m_dayNightController->getAmbientIntensity() : 0.3f;
+        
+        // Update cascade data in deferred lighting pass
+        for (int i = 0; i < g_shadowMap.getNumCascades(); ++i)
+        {
+            const CascadeData& cascade = g_shadowMap.getCascade(i);
+            g_deferredLighting.setCascadeData(i, cascade.viewProj, cascade.splitDistance);
+        }
+        
+        // Render full-screen quad with deferred lighting
+        g_deferredLighting.render(sunDirGLM, ambientStrength);
+    }
+    
+    // 3. Forward Pass: Render transparent/special objects (block highlight, UI)
+    {
+        PROFILE_SCOPE("Forward_Pass");
         
         // Render block highlight (yellow wireframe cube on selected block)
         if (m_blockHighlighter && m_inputState.cachedTargetBlock.hit)
@@ -967,10 +992,8 @@ void GameClient::renderShadowPass()
 
 void GameClient::renderWaitingScreen()
 {
-    // Simple text rendering for waiting screen
-    // TODO: Replace with proper ImGui or text rendering system
-    // For now, just clear to a different color to show we're in remote mode
-    glClearColor(0.1f, 0.1f, 0.3f, 1.0f);  // Dark blue background
+    // Simple waiting screen for remote clients
+    // The gradient sky will be rendered by the deferred lighting shader automatically
 }
 
 void GameClient::renderUI()
@@ -1057,6 +1080,9 @@ void GameClient::onWindowResize(int width, int height)
     m_windowWidth = width;
     m_windowHeight = height;
     glViewport(0, 0, width, height);
+    
+    // Resize G-buffer to match new window size
+    g_gBuffer.resize(width, height);
 }
 
 void GameClient::handleWorldStateReceived(const WorldStateMessage& worldState)

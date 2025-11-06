@@ -2,6 +2,7 @@
 #pragma once
 
 #include "../Math/Vec3.h"
+#include "BiomeSystem.h"
 #include <vector>
 #include <cstdint>
 
@@ -9,6 +10,7 @@ struct IslandDefinition {
     Vec3 position;      // Island center position
     float radius;       // Island size/radius
     uint32_t seed;      // Unique seed for terrain generation
+    BiomeType biome;    // Biome type for this island
 };
 
 class VoronoiIslandPlacer {

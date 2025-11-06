@@ -4,6 +4,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <ctime>
+#include <chrono>
 #include <future>
 #include <vector>
 
@@ -87,6 +88,37 @@ void GameState::updateSimulation(float deltaTime)
     // Server doesn't have a renderer, so it shouldn't sync physics to rendering
 }
 
+void GameState::updateIslandActivation(const Vec3& playerPosition)
+{
+    // Check if player has moved significantly
+    float movementDistance = (playerPosition - m_lastPlayerPosition).length();
+    if (movementDistance < 10.0f && !m_realizedIslandIndices.empty())
+    {
+        return;  // Skip check if player hasn't moved much
+    }
+    
+    m_lastPlayerPosition = playerPosition;
+    
+    // Check each unrealized island
+    for (size_t i = 0; i < m_islandDefinitions.size(); ++i)
+    {
+        // Skip if already realized
+        if (m_realizedIslandIndices.count(i) > 0)
+            continue;
+        
+        const IslandDefinition& def = m_islandDefinitions[i];
+        float distance = (def.position - playerPosition).length();
+        
+        // Activate if within range
+        if (distance < m_islandActivationRadius)
+        {
+            std::cout << "[ACTIVATION] Realizing island " << i 
+                      << " at distance " << distance << " units" << std::endl;
+            realizeIsland(i);
+        }
+    }
+}
+
 void GameState::setPrimaryPlayerPosition(const Vec3& position)
 {
     // Player position is now managed by PlayerController in GameClient
@@ -120,12 +152,12 @@ void GameState::createDefaultWorld()
     // ═══════════════════════════════════════════════════════════════
     struct WorldGenConfig {
         // World boundaries
-        float regionSize = 2000.0f;          // World size/region size (1000x1000 units)
+        float regionSize = 3000.0f;          // World size/region size (1000x1000 units)
         
         // Island generation (density-based for infinite scaling)
         float islandDensity = 3.0f;          // Islands per 1000x1000 area (scales infinitely!)
         float minIslandRadius = 100.0f;       // Minimum island size
-        float maxIslandRadius = 500.0f;      // Maximum island size
+        float maxIslandRadius = 1500.0f;      // Maximum island size
         
         // Advanced Voronoi tuning
         float verticalSpread = 100.0f;       // Vertical Y-axis spread (±units)
@@ -166,116 +198,29 @@ void GameState::createDefaultWorld()
     
     std::cout << "[WORLD] Voronoi placement generated " << islandDefs.size() << " islands" << std::endl;
     
-    // Create islands from definitions
-    std::vector<uint32_t> islandIDs;
-    islandIDs.reserve(islandDefs.size());
+    // Store island definitions for deferred generation
+    m_islandDefinitions = std::move(islandDefs);
     
-    for (const auto& def : islandDefs) {
-        uint32_t islandID = m_islandSystem.createIsland(def.position);
-        islandIDs.push_back(islandID);
-        m_islandIDs.push_back(islandID);
-        
-        std::cout << "[WORLD] Island " << islandID 
-                  << " @ (" << def.position.x << ", " << def.position.y << ", " << def.position.z << ")"
-                  << " radius=" << def.radius << std::endl;
-    }
-    
-    // **PARALLEL ISLAND GENERATION** using std::async
-    std::cout << "[WORLD] Generating islands in parallel..." << std::endl;
-    
-    std::vector<std::future<void>> generationFutures;
-    generationFutures.reserve(islandDefs.size());
-    
-    // Launch all island generations asynchronously
-    for (size_t i = 0; i < islandDefs.size(); ++i) {
-        const IslandDefinition& def = islandDefs[i];
-        uint32_t islandID = islandIDs[i];
-        
-        generationFutures.push_back(std::async(std::launch::async, 
-            [this, islandID, def]() {
-                std::cout << "[WORLD] Generating island " << islandID 
-                          << " (radius=" << def.radius << ")..." << std::endl;
-                m_islandSystem.generateFloatingIslandOrganic(islandID, def.seed, def.radius);
-            }
-        ));
-    }
-    
-    // Wait for all islands to finish generating
-    for (auto& future : generationFutures)
+    // Realize the first island immediately (for player spawn)
+    if (!m_islandDefinitions.empty())
     {
-        future.get();
+        std::cout << "[WORLD] Immediately realizing first island for spawn..." << std::endl;
+        realizeIsland(0);  // First island always realized at startup
     }
     
-    std::cout << "[WORLD] All islands generated!" << std::endl;
-
-    // Enable incremental updates on all chunks now that initial generation is complete
-    std::cout << "[WORLD] Enabling incremental updates on all chunks..." << std::endl;
-    for (uint32_t islandID : islandIDs)
-    {
-        FloatingIsland* island = m_islandSystem.getIsland(islandID);
-        if (island)
-        {
-            for (auto& chunkPair : island->chunks)
-            {
-                VoxelChunk* chunk = chunkPair.second.get();
-                if (chunk)
-                {
-                    chunk->enableIncrementalUpdates();
-                }
-            }
-        }
-    }
-
-    // Log collision mesh generation for each island
-    for (uint32_t islandID : m_islandIDs)
-    {
-        const FloatingIsland* island = m_islandSystem.getIsland(islandID);
-        if (island)
-        {
-            // Count solid voxels across all chunks in this island
-            int solidVoxels = 0;
-            int totalChunks = 0;
-            
-            for (const auto& [chunkCoord, chunk] : island->chunks)
-            {
-                if (chunk)
-                {
-                    totalChunks++;
-                    for (int x = 0; x < 32; x++)
-                    {
-                        for (int y = 0; y < 32; y++)
-                        {
-                            for (int z = 0; z < 32; z++)
-                            {
-                                if (chunk->getVoxel(x, y, z) > 0)
-                                    solidVoxels++;
-                            }
-                        }
-                    }
-                }
-            }
-            
-            std::cout << "[SERVER] Island " << islandID << " has " << totalChunks << " chunks with " << solidVoxels << " solid voxels total" << std::endl;
-            
-            // Log collision mesh info from first chunk (for backward compatibility)
-            if (!island->chunks.empty())
-            {
-                const auto& firstChunk = island->chunks.begin()->second;
-                auto mesh = firstChunk->getCollisionMesh();
-                std::cout << "[SERVER] Generated island " << islandID << " with collision mesh ("
-                          << (mesh ? mesh->faces.size() : 0) << " faces in first chunk)"
-                          << std::endl;
-            }
-        }
-    }
+    std::cout << "[WORLD] World generation complete! " << m_islandDefinitions.size() 
+              << " islands defined, " << m_realizedIslandIndices.size() << " realized." << std::endl;
+    std::cout << "[WORLD] Remaining islands will activate within " 
+              << m_islandActivationRadius << " units of player" << std::endl;
     
     // Calculate player spawn position above the first island
     m_playerSpawnPosition = Vec3(0.0f, 64.0f, 0.0f);  // Default fallback
     
-    if (!islandDefs.empty()) {
+    if (!m_islandDefinitions.empty()) {
         // Spawn above the first island
-        Vec3 firstIslandCenter = islandDefs[0].position;
+        Vec3 firstIslandCenter = m_islandDefinitions[0].position;
         m_playerSpawnPosition = Vec3(firstIslandCenter.x, firstIslandCenter.y + 64.0f, firstIslandCenter.z);
+        m_lastPlayerPosition = m_playerSpawnPosition;  // Initialize player position tracking
     }
 
     std::cout << "🎯 Player spawn: (" << m_playerSpawnPosition.x << ", " 
@@ -295,4 +240,80 @@ void GameState::updatePlayer(float deltaTime)
 {
     // Player update is now managed by PlayerController in GameClient
     (void)deltaTime;
+}
+
+void GameState::realizeIsland(size_t definitionIndex)
+{
+    if (definitionIndex >= m_islandDefinitions.size())
+    {
+        std::cerr << "[ERROR] Invalid island definition index: " << definitionIndex << std::endl;
+        return;
+    }
+    
+    if (m_realizedIslandIndices.count(definitionIndex) > 0)
+    {
+        return;  // Already realized
+    }
+    
+    const IslandDefinition& def = m_islandDefinitions[definitionIndex];
+    
+    auto startTime = std::chrono::high_resolution_clock::now();
+    
+    // Create island structure
+    uint32_t islandID = m_islandSystem.createIsland(def.position);
+    m_islandIDs.push_back(islandID);
+    
+    std::cout << "[REALIZE] Island " << islandID 
+              << " @ (" << def.position.x << ", " << def.position.y << ", " << def.position.z << ")"
+              << " radius=" << def.radius << std::endl;
+    
+    // Generate voxels with biome
+    m_islandSystem.generateFloatingIslandOrganic(islandID, def.seed, def.radius, def.biome);
+    
+    // Enable incremental updates on all chunks
+    FloatingIsland* island = m_islandSystem.getIsland(islandID);
+    if (island)
+    {
+        for (auto& chunkPair : island->chunks)
+        {
+            VoxelChunk* chunk = chunkPair.second.get();
+            if (chunk)
+            {
+                chunk->enableIncrementalUpdates();
+            }
+        }
+        
+        // Log collision mesh stats
+        int solidVoxels = 0;
+        int totalChunks = 0;
+        
+        for (const auto& [chunkCoord, chunk] : island->chunks)
+        {
+            if (chunk)
+            {
+                totalChunks++;
+                for (int x = 0; x < 32; x++)
+                {
+                    for (int y = 0; y < 32; y++)
+                    {
+                        for (int z = 0; z < 32; z++)
+                        {
+                            if (chunk->getVoxel(x, y, z) > 0)
+                                solidVoxels++;
+                        }
+                    }
+                }
+            }
+        }
+        
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+        
+        std::cout << "[REALIZE] Island " << islandID << " complete: " 
+                  << totalChunks << " chunks, " << solidVoxels << " voxels, "
+                  << duration << "ms" << std::endl;
+    }
+    
+    // Mark as realized
+    m_realizedIslandIndices.insert(definitionIndex);
 }

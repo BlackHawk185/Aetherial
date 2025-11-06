@@ -15,7 +15,6 @@
 // Forward declarations
 class GameState;
 class BlockHighlightRenderer;
-class SkyRenderer;
 class HUD;
 class PeriodicTableUI;
 struct GLFWwindow;
@@ -141,9 +140,8 @@ private:
     std::unique_ptr<HUD> m_hud;
     std::unique_ptr<PeriodicTableUI> m_periodicTableUI;
     
-    // NEW: Day/night cycle and atmospheric rendering
+    // NEW: Day/night cycle (atmospheric colors rendered in deferred shader)
     std::unique_ptr<DayNightController> m_dayNightController;
-    std::unique_ptr<SkyRenderer> m_skyRenderer;
     
     // FPS tracking
     float m_lastFrameDeltaTime = 0.016f; // Start at ~60 FPS

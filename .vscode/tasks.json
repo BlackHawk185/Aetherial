@@ -4,14 +4,35 @@
 		{
 			"label": "Build",
 			"type": "shell",
-			"command": ".\\scripts\\ai-friendly-build.ps1",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"build",
+				"--config",
+				"Debug",
+				"--"
+			],
 			"group": {
 				"kind": "build",
 				"isDefault": true
 			},
-			"problemMatcher": [
-				"$msCompile"
-			],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": {
+				"owner": "cpp",
+				"source": "clang",
+				"fileLocation": "absolute",
+				"severity": "error",
+				"pattern": {
+					"regexp": "^(.+?):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+					"file": 1,
+					"line": 2,
+					"column": 3,
+					"severity": 4,
+					"message": 5
+				}
+			},
 			"presentation": {
 				"echo": true,
 				"reveal": "always",
@@ -22,11 +43,17 @@
 			}
 		},
 		{
+			"label": "Refresh IntelliSense",
+			"command": "${command:C_Cpp.RescanWorkspace}",
+			"problemMatcher": []
+		},
+		{
 			"label": "Run",
 			"type": "shell",
 			"command": "$proc = Get-Process -Name 'MMORPGEngine' -ErrorAction SilentlyContinue; if ($proc) { Write-Host 'Terminating previous instance...' -ForegroundColor Yellow; $proc | Stop-Process -Force; Start-Sleep -Milliseconds 500 }; Write-Host 'Starting MMORPG Engine...' -ForegroundColor Green; .\\build\\bin\\MMORPGEngine.exe; Write-Host 'Application exited' -ForegroundColor Yellow",
 			"group": "test",
-			"dependsOn": "Build",
+			"dependsOn": ["Build", "Refresh IntelliSense"],
+			"dependsOrder": "sequence",
 			"presentation": {
 				"echo": true,
 				"reveal": "always",

@@ -6,7 +6,6 @@
 #include "../Time/DayNightController.h"
 
 #include <iostream>
-#include <fstream>
 #include <glm/gtc/type_ptr.hpp>
 
 // Global instance
@@ -284,11 +283,117 @@ void main() {
 }
 )";
 
+// G-Buffer shaders (deferred rendering)
+static const char* GBUFFER_VERTEX_SHADER = R"(
+#version 460 core
+
+// Unit quad vertex attributes
+layout(location = 0) in vec3 aPosition;
+
+// Instance attributes
+layout(location = 1) in vec3 aInstancePosition;
+layout(location = 2) in vec3 aInstanceNormal;
+layout(location = 3) in float aInstanceWidth;
+layout(location = 4) in float aInstanceHeight;
+layout(location = 5) in uint aInstanceBlockType;
+layout(location = 6) in uint aInstanceFaceDir;
+
+// Chunk transforms in SSBO
+layout(std430, binding = 0) readonly buffer TransformBuffer {
+    mat4 chunkTransforms[];
+};
+
+uniform mat4 uViewProjection;
+
+out vec2 TexCoord;
+out vec3 Normal;
+out vec3 WorldPos;
+flat out uint BlockType;
+flat out uint FaceDir;
+
+void main() {
+    mat4 uChunkTransform = chunkTransforms[gl_DrawID];
+    
+    // Same vertex transformation as forward pass
+    vec3 scaledPos = vec3(
+        aPosition.x * aInstanceWidth,
+        aPosition.y * aInstanceHeight,
+        0.0
+    );
+    
+    vec3 rotatedPos;
+    if (aInstanceFaceDir == 0u) {
+        rotatedPos = vec3(scaledPos.x, 0.0, scaledPos.y);
+    } else if (aInstanceFaceDir == 1u) {
+        rotatedPos = vec3(-scaledPos.x, 0.0, scaledPos.y);
+    } else if (aInstanceFaceDir == 2u) {
+        rotatedPos = vec3(-scaledPos.x, scaledPos.y, 0.0);
+    } else if (aInstanceFaceDir == 3u) {
+        rotatedPos = vec3(scaledPos.x, scaledPos.y, 0.0);
+    } else if (aInstanceFaceDir == 4u) {
+        rotatedPos = vec3(0.0, scaledPos.y, scaledPos.x);
+    } else {
+        rotatedPos = vec3(0.0, scaledPos.y, -scaledPos.x);
+    }
+    
+    vec3 localPos = aInstancePosition + rotatedPos;
+    vec4 worldPos4 = uChunkTransform * vec4(localPos, 1.0);
+    WorldPos = worldPos4.xyz;
+    gl_Position = uViewProjection * worldPos4;
+    
+    TexCoord = (aPosition.xy + 0.5) * vec2(aInstanceWidth, aInstanceHeight);
+    Normal = mat3(uChunkTransform) * aInstanceNormal;
+    BlockType = aInstanceBlockType;
+    FaceDir = aInstanceFaceDir;
+}
+)";
+
+static const char* GBUFFER_FRAGMENT_SHADER = R"(
+#version 460 core
+
+in vec2 TexCoord;
+in vec3 Normal;
+in vec3 WorldPos;
+flat in uint BlockType;
+flat in uint FaceDir;
+
+uniform sampler2D uTextureStone;
+uniform sampler2D uTextureDirt;
+uniform sampler2D uTextureGrass;
+uniform sampler2D uTextureSand;
+
+// G-buffer outputs (MRT)
+layout(location = 0) out vec3 gAlbedo;    // Base color
+layout(location = 1) out vec3 gNormal;    // World-space normal
+layout(location = 2) out vec3 gPosition;  // World position
+layout(location = 3) out vec4 gMetadata;  // BlockType (R), FaceDir (G)
+
+void main() {
+    // Sample texture based on block type
+    vec4 texColor;
+    if (BlockType == 1u) {
+        texColor = texture(uTextureStone, TexCoord);
+    } else if (BlockType == 2u) {
+        texColor = texture(uTextureDirt, TexCoord);
+    } else if (BlockType == 3u) {
+        texColor = texture(uTextureGrass, TexCoord);
+    } else if (BlockType == 25u) {
+        texColor = texture(uTextureSand, TexCoord);
+    } else {
+        texColor = texture(uTextureStone, TexCoord);
+    }
+    
+    // Write to G-buffer
+    gAlbedo = texColor.rgb;
+    gNormal = normalize(Normal);
+    gPosition = WorldPos;
+    gMetadata = vec4(float(BlockType) / 255.0, float(FaceDir) / 255.0, 0.0, 1.0);
+}
+)";
+
 InstancedQuadRenderer::InstancedQuadRenderer()
-    : m_unitQuadVAO(0), m_unitQuadVBO(0), m_unitQuadEBO(0), m_shaderProgram(0), m_depthProgram(0),
-      m_globalVAO(0), m_globalInstanceVBO(0), m_indirectCommandBuffer(0), m_transformSSBO(0),
-      m_quadMergeProgram(0), m_inputQuadSSBO(0),
-      m_outputCounterSSBO(0), m_processedFlagsSSBO(0),
+    : m_unitQuadVAO(0), m_unitQuadVBO(0), m_unitQuadEBO(0), m_shaderProgram(0), m_gbufferProgram(0), m_depthProgram(0),
+      m_globalVAO(0), m_globalInstanceVBO(0), m_indirectCommandBuffer(0), m_transformSSBO(0), 
       m_mdiDirty(false), m_totalAllocatedInstances(0)
 {
 }
@@ -304,8 +409,8 @@ bool InstancedQuadRenderer::initialize()
     
     createUnitQuad();
     createShader();
-    createDepthShader();
-    createQuadMergeShader();
+    createGBufferShader();  // For deferred rendering
+    createDepthShader();    // For shadow casting
     
     // Load block textures
     extern TextureManager* g_textureManager;
@@ -469,63 +574,36 @@ void InstancedQuadRenderer::createDepthShader()
     std::cout << "   └─ Depth shader compiled and linked (MDI + SSBO)" << std::endl;
 }
 
-void InstancedQuadRenderer::createQuadMergeShader()
+void InstancedQuadRenderer::createGBufferShader()
 {
-    std::ifstream file("shaders/quad_merge.comp");
-    if (!file.is_open()) {
-        std::cerr << "❌ Failed to open quad_merge.comp - greedy meshing disabled" << std::endl;
-        m_quadMergeProgram = 0;
-        return;
-    }
+    GLuint vertexShader = compileShader(GBUFFER_VERTEX_SHADER, GL_VERTEX_SHADER);
+    GLuint fragmentShader = compileShader(GBUFFER_FRAGMENT_SHADER, GL_FRAGMENT_SHADER);
     
-    std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    m_gbufferProgram = glCreateProgram();
+    glAttachShader(m_gbufferProgram, vertexShader);
+    glAttachShader(m_gbufferProgram, fragmentShader);
+    glLinkProgram(m_gbufferProgram);
     
-    m_quadMergeProgram = compileComputeShader(source.c_str());
-    
-    if (m_quadMergeProgram == 0) {
-        std::cerr << "❌ Greedy mesh shader compilation failed - greedy meshing disabled" << std::endl;
-        return;
-    }
-    
-    glGenBuffers(1, &m_inputQuadSSBO);
-    glGenBuffers(1, &m_outputCounterSSBO);
-    glGenBuffers(1, &m_processedFlagsSSBO);
-    
-    std::cout << "   └─ Greedy mesh compute shader compiled" << std::endl;
-}
-
-GLuint InstancedQuadRenderer::compileComputeShader(const char* source)
-{
-    GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
-    glShaderSource(shader, 1, &source, nullptr);
-    glCompileShader(shader);
-    
+    // Check linking
     GLint success;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    glGetProgramiv(m_gbufferProgram, GL_LINK_STATUS, &success);
     if (!success) {
-        char infoLog[1024];
-        glGetShaderInfoLog(shader, 1024, nullptr, infoLog);
-        std::cerr << "❌ COMPUTE shader compilation FAILED:\n" << infoLog << std::endl;
-        glDeleteShader(shader);
-        return 0;
+        char infoLog[512];
+        glGetProgramInfoLog(m_gbufferProgram, 512, nullptr, infoLog);
+        std::cerr << "❌ G-buffer shader linking FAILED:\n" << infoLog << std::endl;
     }
     
-    GLuint program = glCreateProgram();
-    glAttachShader(program, shader);
-    glLinkProgram(program);
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
     
-    glGetProgramiv(program, GL_LINK_STATUS, &success);
-    if (!success) {
-        char infoLog[1024];
-        glGetProgramInfoLog(program, 1024, nullptr, infoLog);
-        std::cerr << "❌ COMPUTE shader linking FAILED:\n" << infoLog << std::endl;
-        glDeleteProgram(program);
-        glDeleteShader(shader);
-        return 0;
-    }
+    // Get uniform locations
+    m_gbuffer_uViewProjection = glGetUniformLocation(m_gbufferProgram, "uViewProjection");
+    m_gbuffer_uTextureStone = glGetUniformLocation(m_gbufferProgram, "uTextureStone");
+    m_gbuffer_uTextureDirt = glGetUniformLocation(m_gbufferProgram, "uTextureDirt");
+    m_gbuffer_uTextureGrass = glGetUniformLocation(m_gbufferProgram, "uTextureGrass");
+    m_gbuffer_uTextureSand = glGetUniformLocation(m_gbufferProgram, "uTextureSand");
     
-    glDeleteShader(shader);
-    return program;
+    std::cout << "   └─ G-buffer shader compiled and linked (deferred rendering)" << std::endl;
 }
 
 GLuint InstancedQuadRenderer::compileShader(const char* source, GLenum type)
@@ -567,11 +645,11 @@ void InstancedQuadRenderer::registerChunk(VoxelChunk* chunk, const glm::mat4& tr
         }
     });
     
-    // Check if chunk is already registered - update transform only (no buffer rebuild needed)
+    // Check if chunk is already registered - update instead of duplicate
     for (auto& entry : m_chunks) {
         if (entry.chunk == chunk) {
             entry.transform = transform;
-            // NOTE: Don't set m_mdiDirty here - transform changes don't require buffer rebuild
+            m_mdiDirty = true;  // Mark for rebuild
             return;
         }
     }
@@ -624,7 +702,8 @@ void InstancedQuadRenderer::rebuildChunk(VoxelChunk* chunk)
 {
     for (auto& entry : m_chunks) {
         if (entry.chunk == chunk) {
-            entry.transform = transform;
+            // Use fast partial update instead of full rebuild
+            updateSingleChunkGPU(entry);
             return;
         }
     }
@@ -650,7 +729,8 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
     
     for (auto& entry : m_chunks) {
         if (entry.chunk) {
-            auto mesh = entry.chunk->getRenderMesh();
+            // Lazy mesh generation - generates mesh on first access if needed
+            auto mesh = entry.chunk->getRenderMeshLazy();
             if (mesh) {
                 entry.instanceCount = mesh->quads.size();
                 entry.allocatedSlots = calculateChunkSlots(entry.instanceCount);
@@ -667,21 +747,30 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
     
     if (totalActiveInstances == 0) return;
     
-    // 2. Allocate global instance buffer (no data upload - will be filled by GPU passthrough)
-    glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
-    glBufferData(GL_ARRAY_BUFFER, m_totalAllocatedInstances * sizeof(QuadFace), 
-                 nullptr, GL_DYNAMIC_DRAW);  // Allocate empty buffer
+    // 2. Build merged instance buffer with PADDED allocation
+    std::vector<QuadFace> mergedInstances;
+    mergedInstances.resize(m_totalAllocatedInstances);  // Pre-allocate with padding
     
-    // 3. Upload all chunk data via GPU passthrough ONLY for new chunks
-    // (Existing chunks already have their data from updateSingleChunkGPU callbacks)
-    // We need to upload all chunks here because buffer was just reallocated
-    for (auto& entry : m_chunks) {
+    size_t writeOffset = 0;
+    for (const auto& entry : m_chunks) {
         if (entry.chunk && entry.instanceCount > 0) {
-            gpuMergeQuads(entry);
+            // Thread-safe atomic mesh access - no mutex needed!
+            auto mesh = entry.chunk->getRenderMesh();
+            if (mesh && entry.baseInstance == writeOffset) {
+                // Copy active quads
+                std::copy(mesh->quads.begin(), mesh->quads.end(), 
+                         mergedInstances.begin() + writeOffset);
+                writeOffset += entry.allocatedSlots;  // Skip to next chunk's slot
+            }
         }
     }
     
-    // 4. Configure global VAO (one-time setup)
+    // 3. Upload merged instance data to GPU (now with padding for future updates)
+    glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
+    glBufferData(GL_ARRAY_BUFFER, m_totalAllocatedInstances * sizeof(QuadFace), 
+                 mergedInstances.data(), GL_DYNAMIC_DRAW);
+    
+    // 4. Configure global VAO (one-time setup, or when first built)
     static bool vaoConfigured = false;
     if (!vaoConfigured) {
         glBindVertexArray(m_globalVAO);
@@ -771,87 +860,37 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
     m_mdiDirty = false;
 }
 
-void InstancedQuadRenderer::gpuMergeQuads(ChunkEntry& entry)
-{
-    if (m_quadMergeProgram == 0) {
-        std::cerr << "❌ GPU quad merge: Shader program not loaded!" << std::endl;
-        return;
-    }
-    
-    auto mesh = entry.chunk->getRenderMesh();
-    if (!mesh || mesh->quads.empty()) return;
-    
-    uint32_t inputCount = static_cast<uint32_t>(mesh->quads.size());
-    size_t targetOffset = entry.baseInstance * sizeof(QuadFace);
-    size_t targetSize = entry.allocatedSlots * sizeof(QuadFace);
-    
-    // Validate buffer range
-    size_t totalBufferSize = m_totalAllocatedInstances * sizeof(QuadFace);
-    if (targetOffset + targetSize > totalBufferSize) {
-        std::cerr << "❌ ERROR: Buffer overflow! Offset=" << targetOffset << " + Size=" << targetSize 
-                  << " > TotalBuffer=" << totalBufferSize << std::endl;
-        return;
-    }
-    
-    // Upload input quads as raw bytes (binding 3 and 4 for raw data)
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_inputQuadSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, inputCount * sizeof(QuadFace), mesh->quads.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_inputQuadSSBO);
-    
-    // Check alignment requirements for glBindBufferRange
-    GLint alignment = 0;
-    glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &alignment);
-    if (targetOffset % alignment != 0) {
-        std::cerr << "❌ ERROR: Buffer offset " << targetOffset << " not aligned to " << alignment << " bytes!" << std::endl;
-        return;
-    }
-    
-    // Verify size is positive
-    if (targetSize == 0) {
-        std::cerr << "❌ ERROR: Target size is zero!" << std::endl;
-        return;
-    }
-    
-    // Output directly to this chunk's section of global instance buffer (as raw data)
-    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 4, m_globalInstanceVBO, 
-                      targetOffset, targetSize);
-    
-    // Dispatch compute shader (passthrough: no counter needed)
-    glUseProgram(m_quadMergeProgram);
-    glUniform1ui(glGetUniformLocation(m_quadMergeProgram, "inputCount"), inputCount);
-    
-    uint32_t numWorkGroups = (inputCount + 255) / 256;
-    glDispatchCompute(numWorkGroups, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
-    
-    // Check for GPU errors after dispatch
-    GLenum dispatchErr = glGetError();
-    if (dispatchErr != GL_NO_ERROR) {
-        std::cerr << "❌ OpenGL ERROR after compute dispatch: " << dispatchErr << std::endl;
-    }
-    
-    // Passthrough mode: output count always equals input count
-    entry.instanceCount = inputCount;
-}
-
 // CRITICAL OPTIMIZATION: Update single chunk without rebuilding entire buffer
 void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
 {
     if (!entry.chunk) return;
     
+    auto t_start = std::chrono::high_resolution_clock::now();
+    
+    // DON'T use getRenderMeshLazy() - it triggers synchronous mesh generation!
+    // The mesh should already be generated (either async or by caller)
     auto mesh = entry.chunk->getRenderMesh();
     if (!mesh) {
-        return;
+        return;  // Mesh not ready yet - skip this update
     }
     
-    // Run GPU passthrough - this uploads quads and writes merged result to GPU
-    gpuMergeQuads(entry);
+    size_t newQuadCount = mesh->quads.size();
     
-    size_t newQuadCount = entry.instanceCount; // Use the count from gpuMergeQuads (passthrough = same as input)
+    auto t_check = std::chrono::high_resolution_clock::now();
     
     // Check if we can fit within allocated space
     if (newQuadCount <= entry.allocatedSlots) {
-        // GPU passthrough already wrote the data, just update the indirect command
+        // FAST PATH: Partial update with glBufferSubData
+        auto t_upload_start = std::chrono::high_resolution_clock::now();
+        
+        glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
+        glBufferSubData(GL_ARRAY_BUFFER, 
+                       entry.baseInstance * sizeof(QuadFace),
+                       newQuadCount * sizeof(QuadFace),
+                       mesh->quads.data());
+        
+        auto t_upload_end = std::chrono::high_resolution_clock::now();
+        auto t_cmd_start = std::chrono::high_resolution_clock::now();
         
         // Update instance count in indirect command buffer
         size_t chunkIndex = &entry - m_chunks.data();
@@ -868,7 +907,21 @@ void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
                        sizeof(DrawElementsIndirectCommand),
                        &cmd);
         
+        auto t_cmd_end = std::chrono::high_resolution_clock::now();
+        
         entry.instanceCount = newQuadCount;
+        
+        auto t_end = std::chrono::high_resolution_clock::now();
+        
+        auto check_ms = std::chrono::duration<double, std::milli>(t_check - t_start).count();
+        auto upload_ms = std::chrono::duration<double, std::milli>(t_upload_end - t_upload_start).count();
+        auto cmd_ms = std::chrono::duration<double, std::milli>(t_cmd_end - t_cmd_start).count();
+        auto total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        
+        size_t uploadBytes = newQuadCount * sizeof(QuadFace);
+        std::cout << "🚀 GPU UPLOAD: " << total_ms << "ms (Check=" << check_ms 
+                  << "ms, Upload=" << upload_ms << "ms [" << (uploadBytes/1024) << "KB], Cmd=" 
+                  << cmd_ms << "ms) Quads=" << newQuadCount << std::endl;
     } else {
         // SLOW PATH: Chunk grew beyond allocated space - need full rebuild
         std::cout << "⚠️ Chunk grew beyond padding - triggering full rebuild" << std::endl;
@@ -976,6 +1029,79 @@ void InstancedQuadRenderer::render(const glm::mat4& viewProjection, const glm::m
     glBindVertexArray(0);
 }
 
+void InstancedQuadRenderer::renderToGBuffer(const glm::mat4& viewProjection, const glm::mat4& view)
+{
+    (void)view;  // Not needed for G-buffer pass
+    
+    if (m_chunks.empty())
+        return;
+    
+    // Enable face culling
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    
+    glUseProgram(m_gbufferProgram);
+    glUniformMatrix4fv(m_gbuffer_uViewProjection, 1, GL_FALSE, glm::value_ptr(viewProjection));
+    
+    // Bind textures
+    extern TextureManager* g_textureManager;
+    
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("stone.png"));
+    glUniform1i(m_gbuffer_uTextureStone, 0);
+    
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("dirt.png"));
+    glUniform1i(m_gbuffer_uTextureDirt, 1);
+    
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("grass.png"));
+    glUniform1i(m_gbuffer_uTextureGrass, 2);
+    
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("sand.png"));
+    glUniform1i(m_gbuffer_uTextureSand, 3);
+    
+    // Rebuild MDI buffers if dirty
+    if (m_mdiDirty) {
+        rebuildMDIBuffers();
+    }
+    
+    // Count non-empty draws
+    size_t drawCount = 0;
+    for (const auto& entry : m_chunks) {
+        if (entry.instanceCount > 0) drawCount++;
+    }
+    
+    if (drawCount == 0) {
+        return;
+    }
+    
+    // Update transforms
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
+    glm::mat4* mappedTransforms = (glm::mat4*)glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_WRITE_ONLY);
+    if (mappedTransforms) {
+        size_t index = 0;
+        for (const auto& entry : m_chunks) {
+            if (entry.instanceCount > 0) {
+                mappedTransforms[index++] = entry.transform;
+            }
+        }
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    }
+    
+    // Bind global VAO and transform SSBO
+    glBindVertexArray(m_globalVAO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_transformSSBO);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
+    
+    // SINGLE MDI CALL - writes to G-buffer
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
+                                static_cast<GLsizei>(drawCount), 0);
+    
+    glBindVertexArray(0);
+}
+
 void InstancedQuadRenderer::clear()
 {
     // No per-chunk VAOs/VBOs to delete - just clear the list
@@ -1023,40 +1149,25 @@ void InstancedQuadRenderer::shutdown()
         m_transformSSBO = 0;
     }
     
-    if (m_inputQuadSSBO != 0) {
-        glDeleteBuffers(1, &m_inputQuadSSBO);
-        m_inputQuadSSBO = 0;
-    }
-    
-    if (m_outputCounterSSBO != 0) {
-        glDeleteBuffers(1, &m_outputCounterSSBO);
-        m_outputCounterSSBO = 0;
-    }
-    
-    if (m_processedFlagsSSBO != 0) {
-        glDeleteBuffers(1, &m_processedFlagsSSBO);
-        m_processedFlagsSSBO = 0;
-    }
-    
     if (m_shaderProgram != 0) {
         glDeleteProgram(m_shaderProgram);
         m_shaderProgram = 0;
+    }
+    
+    if (m_gbufferProgram != 0) {
+        glDeleteProgram(m_gbufferProgram);
+        m_gbufferProgram = 0;
     }
     
     if (m_depthProgram != 0) {
         glDeleteProgram(m_depthProgram);
         m_depthProgram = 0;
     }
-    
-    if (m_quadMergeProgram != 0) {
-        glDeleteProgram(m_quadMergeProgram);
-        m_quadMergeProgram = 0;
-    }
 }
 
 // ========== SHADOW DEPTH PASS METHODS ==========
 
-void InstancedQuadRenderer::beginDepthPass(const glm::mat4& lightVP, int cascadeIndex)
+void InstancedQuadRenderer::beginDepthPass(const glm::mat4& lightVP, int /*cascadeIndex*/)
 {
     if (m_depthProgram == 0) return;  // Not initialized
     

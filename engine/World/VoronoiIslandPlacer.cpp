@@ -1,5 +1,6 @@
 // VoronoiIslandPlacer.cpp - Implementation of Voronoi-based island placement
 #include "VoronoiIslandPlacer.h"
+#include "BiomeSystem.h"
 #include "../../libs/FastNoiseLite/FastNoiseLite.h"
 #include <cmath>
 #include <algorithm>
@@ -22,6 +23,9 @@ std::vector<IslandDefinition> VoronoiIslandPlacer::generateIslands(
     
     std::vector<IslandDefinition> islands;
     islands.reserve(targetIslandCount);
+    
+    // Create biome system for assigning biomes
+    BiomeSystem biomeSystem;
     
     // Calculate cell size for Voronoi distribution
     // We want roughly 'targetIslandCount' cells in the region
@@ -148,7 +152,10 @@ std::vector<IslandDefinition> VoronoiIslandPlacer::generateIslands(
         islandSeed ^= static_cast<uint32_t>(pos.y * 668265263.0f);
         islandSeed ^= static_cast<uint32_t>(pos.z * 1274126177.0f);
         
-        islands.push_back({pos, radius, islandSeed});
+        // Determine biome based on world position
+        BiomeType biome = biomeSystem.getBiomeForPosition(pos, worldSeed);
+        
+        islands.push_back({pos, radius, islandSeed, biome});
     }
     
     return islands;

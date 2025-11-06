@@ -72,6 +72,9 @@ public:
 
     // Batched rendering - render ALL chunks for ALL block types efficiently
     void renderAll(const glm::mat4& view, const glm::mat4& proj);
+    
+    // G-buffer rendering (deferred rendering)
+    void renderToGBuffer(const glm::mat4& view, const glm::mat4& proj);
 
     // Update model matrix without rendering (stores pre-calculated chunk transform)
     void updateModelMatrix(uint8_t blockID, VoxelChunk* chunk, const glm::mat4& chunkTransform);
@@ -85,6 +88,9 @@ private:
     // Internal GL helpers
     // Per-model shaders (wind vs static)
     std::unordered_map<uint8_t, GLuint> m_shaders;
+    
+    // G-buffer shaders (deferred rendering)
+    std::unordered_map<uint8_t, GLuint> m_gbufferShaders;
     
     // Depth pass shader (for shadow map rendering)
     GLuint m_depthProgram = 0;
