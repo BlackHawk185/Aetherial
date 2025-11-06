@@ -38,8 +38,7 @@ class PhysicsSystem
     bool checkCapsuleCollision(const Vec3& capsuleCenter, float radius, float height, Vec3& outNormal, const FloatingIsland** outIsland = nullptr);
     GroundInfo detectGroundCapsule(const Vec3& capsuleCenter, float radius, float height, float rayMargin = 0.1f);
     
-    // Raycasting
-    bool checkRayCollision(const Vec3& rayOrigin, const Vec3& rayDirection, float maxDistance, Vec3& hitPoint, Vec3& hitNormal);
+    // NOTE: For raycasting, use VoxelRaycaster::raycast() directly - it's faster and already handles rotated islands
     
     // Island system integration
     void setIslandSystem(IslandChunkSystem* islandSystem) { m_islandSystem = islandSystem; }

@@ -249,9 +249,15 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
     
     m_jumpPressed = jumpThisFrame;
     
-    // Apply input acceleration (with slowdown during stepping)
+    // Apply input acceleration (with slowdown during stepping and in air)
     float controlStrength = m_isGrounded ? 1.0f : m_airControl;
     float speedMultiplier = m_isStepping ? m_stepSlowdown : 1.0f;
+    
+    // Reduce max speed in air (70% of ground speed)
+    if (!m_isGrounded) {
+        speedMultiplier *= 0.7f;
+    }
+    
     Vec3 targetHorizontalVelocity = inputDirection * m_moveSpeed * speedMultiplier;
     Vec3 currentHorizontalVelocity = Vec3(m_playerVelocity.x, 0, m_playerVelocity.z);
     
@@ -291,7 +297,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
             m_playerVelocity.y = 0;
         }
         
-        // Try X with step-up
+        // Try X with step-up (includes unstuck logic)
         testPos = m_physicsPosition + Vec3(relativeMovement.x, 0, 0);
         if (!physics->checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
         {
@@ -301,10 +307,15 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
         {
             // Collision detected - try step-up
             bool stepped = false;
-            if (m_isGrounded && !m_isStepping) // Only step up when on ground and not already stepping
+            
+            // Step-up works in TWO cases:
+            // 1. When grounded (normal terrain climbing)
+            // 2. When stuck inside terrain (unstuck mechanism - always enabled)
+            if (!m_isStepping) // Don't interrupt existing step
             {
                 // Try stepping up in increments to find the minimum step height
-                for (float stepHeight = 0.1f; stepHeight <= m_maxStepHeight; stepHeight += 0.1f)
+                // Use 0.4f increment (4x more aggressive) for faster unstuck
+                for (float stepHeight = 0.4f; stepHeight <= m_maxStepHeight; stepHeight += 0.4f)
                 {
                     Vec3 stepUpPos = m_physicsPosition + Vec3(relativeMovement.x, stepHeight, 0);
                     if (!physics->checkCapsuleCollision(stepUpPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
@@ -329,7 +340,7 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
             }
         }
         
-        // Try Z with step-up
+        // Try Z with step-up (includes unstuck logic)
         testPos = m_physicsPosition + Vec3(0, 0, relativeMovement.z);
         if (!physics->checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
         {
@@ -339,7 +350,11 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
         {
             // Collision detected - try step-up
             bool stepped = false;
-            if (m_isGrounded && !m_isStepping) // Only step up when on ground and not already stepping
+            
+            // Step-up works in TWO cases:
+            // 1. When grounded (normal terrain climbing)
+            // 2. When stuck inside terrain (unstuck mechanism - always enabled)
+            if (!m_isStepping) // Don't interrupt existing step
             {
                 // Try stepping up in increments to find the minimum step height
                 for (float stepHeight = 0.1f; stepHeight <= m_maxStepHeight; stepHeight += 0.1f)

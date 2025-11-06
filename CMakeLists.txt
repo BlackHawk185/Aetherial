@@ -34,6 +34,15 @@ endforeach()
 # Remove old shader files that were renamed
 file(REMOVE ${CMAKE_BINARY_DIR}/bin/shaders/greedy_mesh.comp)
 
+# Copy assets to build directory
+file(GLOB_RECURSE ASSET_FILES "${CMAKE_SOURCE_DIR}/assets/*")
+foreach(ASSET ${ASSET_FILES})
+    file(RELATIVE_PATH REL_PATH ${CMAKE_SOURCE_DIR}/assets ${ASSET})
+    get_filename_component(ASSET_DIR ${REL_PATH} DIRECTORY)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/bin/assets/${ASSET_DIR})
+    configure_file(${ASSET} ${CMAKE_BINARY_DIR}/bin/assets/${REL_PATH} COPYONLY)
+endforeach()
+
 # Third-party libraries
 add_subdirectory(libs)
 # Some libraries like imgui are not standard CMake projects, so link manually in engine/CMakeLists.txt.

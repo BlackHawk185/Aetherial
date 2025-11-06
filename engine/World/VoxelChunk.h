@@ -144,8 +144,7 @@ class VoxelChunk
     // Decorative/model instance positions (generic per block type)
     const std::vector<Vec3>& getModelInstances(uint8_t blockID) const;
     
-    bool checkRayCollision(const Vec3& rayOrigin, const Vec3& rayDirection, float maxDistance,
-                           Vec3& hitPoint, Vec3& hitNormal) const;
+    // NOTE: For raycasting, use VoxelRaycaster::raycast() - it's DDA-based and handles rotated islands
 
    public:
     // Island context for inter-chunk culling

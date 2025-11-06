@@ -20,6 +20,9 @@
 #include "../Rendering/BlockHighlightRenderer.h"
 #include "../Rendering/GBuffer.h"
 #include "../Rendering/DeferredLightingPass.h"
+#include "../Rendering/PostProcessingPipeline.h"
+#include "../Rendering/HDRFramebuffer.h"
+#include "../Rendering/SkyRenderer.h"
 #include "../UI/HUD.h"
 #include "../UI/PeriodicTableUI.h"  // NEW: Periodic table UI for hotbar binding
 #include "../Core/Window.h"
@@ -428,7 +431,7 @@ bool GameClient::initializeGraphics()
     std::cout << "✅ InstancedQuadRenderer initialized - shared unit quad ready!" << std::endl;
 
     // Initialize shadow map system (must happen before renderers that use it)
-    if (!g_shadowMap.initialize(16384, 2))
+    if (!g_shadowMap.initialize(8192, 2))
     {
         std::cerr << "❌ Failed to initialize shadow map system!" << std::endl;
         return false;
@@ -445,6 +448,27 @@ bool GameClient::initializeGraphics()
     if (!g_deferredLighting.initialize())
     {
         std::cerr << "❌ Failed to initialize deferred lighting pass!" << std::endl;
+        return false;
+    }
+
+    // Initialize HDR framebuffer for lighting output
+    if (!g_hdrFramebuffer.initialize(m_windowWidth, m_windowHeight))
+    {
+        std::cerr << "❌ Failed to initialize HDR framebuffer!" << std::endl;
+        return false;
+    }
+
+    // Initialize sky renderer
+    if (!g_skyRenderer.initialize())
+    {
+        std::cerr << "❌ Failed to initialize sky renderer!" << std::endl;
+        return false;
+    }
+
+    // Initialize post-processing pipeline (godrays, tone mapping)
+    if (!g_postProcessing.initialize(m_windowWidth, m_windowHeight))
+    {
+        std::cerr << "❌ Failed to initialize post-processing pipeline!" << std::endl;
         return false;
     }
 
@@ -633,6 +657,41 @@ void GameClient::processKeyboard(float deltaTime)
         }
     }
     wasEKeyPressed = isEKeyPressed;
+
+    // Post-processing controls
+    // Toggle post-processing (press P)
+    static bool wasPostProcessingKeyPressed = false;
+    bool isPostProcessingKeyPressed = glfwGetKey(m_window->getHandle(), GLFW_KEY_P) == GLFW_PRESS;
+    
+    if (isPostProcessingKeyPressed && !wasPostProcessingKeyPressed)
+    {
+        g_postProcessing.setEnabled(!g_postProcessing.isEnabled());
+        std::cout << (g_postProcessing.isEnabled() ? "🌈 Post-processing enabled (godrays + tone mapping)" : "🌈 Post-processing disabled (raw scene)") << std::endl;
+    }
+    wasPostProcessingKeyPressed = isPostProcessingKeyPressed;
+
+    // Adjust godray intensity ([ and ] keys)
+    static bool wasBracketLeftPressed = false;
+    static bool wasBracketRightPressed = false;
+    bool isBracketLeftPressed = glfwGetKey(m_window->getHandle(), GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS;
+    bool isBracketRightPressed = glfwGetKey(m_window->getHandle(), GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS;
+    
+    if (isBracketLeftPressed && !wasBracketLeftPressed)
+    {
+        float currentIntensity = g_postProcessing.getGodrayIntensity();
+        float newIntensity = std::max(0.0f, currentIntensity - 0.1f);
+        g_postProcessing.setGodrayIntensity(newIntensity);
+        std::cout << "☀️ Godray intensity decreased to " << newIntensity << std::endl;
+    }
+    if (isBracketRightPressed && !wasBracketRightPressed)
+    {
+        float currentIntensity = g_postProcessing.getGodrayIntensity();
+        float newIntensity = std::min(2.0f, currentIntensity + 0.1f);
+        g_postProcessing.setGodrayIntensity(newIntensity);
+        std::cout << "☀️ Godray intensity increased to " << newIntensity << std::endl;
+    }
+    wasBracketLeftPressed = isBracketLeftPressed;
+    wasBracketRightPressed = isBracketRightPressed;
 
     // Apply piloting controls (arrow keys for movement and rotation)
     // Send inputs to server instead of directly modifying island
@@ -852,16 +911,16 @@ void GameClient::renderWorld()
         g_gBuffer.unbind();
     }
     
-    // 2. Lighting Pass: Read G-buffer, apply shadows + lighting, output final color to screen
+    // Get shared data for lighting and sky rendering
+    Vec3 sunDir = m_dayNightController ? m_dayNightController->getSunDirection() : Vec3(-0.3f, -1.0f, -0.2f).normalized();
+    glm::vec3 sunDirGLM(sunDir.x, sunDir.y, sunDir.z);
+    
+    const Vec3& camPos = m_playerController.getCamera().position;
+    glm::vec3 cameraPosGLM(camPos.x, camPos.y, camPos.z);
+
+    // 2. Lighting Pass: Read G-buffer, apply shadows + lighting, output to HDR framebuffer
     {
         PROFILE_SCOPE("Deferred_Lighting_Pass");
-        
-        // Get sun direction for lighting
-        Vec3 sunDir = m_dayNightController ? m_dayNightController->getSunDirection() : Vec3(-0.3f, -1.0f, -0.2f).normalized();
-        glm::vec3 sunDirGLM(sunDir.x, sunDir.y, sunDir.z);
-        
-        // Ambient strength from day/night cycle
-        float ambientStrength = m_dayNightController ? m_dayNightController->getAmbientIntensity() : 0.3f;
         
         // Update cascade data in deferred lighting pass
         for (int i = 0; i < g_shadowMap.getNumCascades(); ++i)
@@ -870,11 +929,41 @@ void GameClient::renderWorld()
             g_deferredLighting.setCascadeData(i, cascade.viewProj, cascade.splitDistance);
         }
         
-        // Render full-screen quad with deferred lighting
-        g_deferredLighting.render(sunDirGLM, ambientStrength);
+        // Render full-screen quad with deferred lighting to HDR framebuffer
+        g_deferredLighting.render(sunDirGLM, cameraPosGLM);
     }
     
-    // 3. Forward Pass: Render transparent/special objects (block highlight, UI)
+    // 3. Sky Pass: Render sky gradient with sun disc to HDR framebuffer
+    {
+        PROFILE_SCOPE("Sky_Pass");
+        
+        // Bind HDR framebuffer and copy depth from G-buffer
+        g_hdrFramebuffer.bind();
+        
+        // Copy depth from G-buffer to HDR framebuffer for proper depth testing
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gBuffer.getFBO());
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_hdrFramebuffer.getFBO());
+        glBlitFramebuffer(0, 0, m_windowWidth, m_windowHeight, 0, 0, m_windowWidth, m_windowHeight, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        
+        // Render sky (will only render where depth = 1.0, i.e., background pixels)
+        float sunIntensity = m_dayNightController ? m_dayNightController->getSunIntensity() : 0.8f;
+        float aspectRatio = static_cast<float>(m_windowWidth) / static_cast<float>(m_windowHeight);
+        g_skyRenderer.render(sunDirGLM, sunIntensity, cameraPosGLM, viewMatrix, aspectRatio);
+        
+        g_hdrFramebuffer.unbind();
+    }
+    
+    // 4. Post-Processing Pass: Apply godrays, tone mapping, etc.
+    {
+        PROFILE_SCOPE("Post_Processing_Pass");
+        
+        // Process HDR framebuffer through post-processing pipeline
+        glm::mat4 viewProjectionMatrix = projectionMatrix * viewMatrix;
+        g_postProcessing.process(g_hdrFramebuffer.getColorTexture(), g_gBuffer.getDepthTexture(), 
+                               sunDirGLM, cameraPosGLM, viewProjectionMatrix);
+    }
+    
+    // 5. Forward Pass: Render transparent/special objects (block highlight, UI)
     {
         PROFILE_SCOPE("Forward_Pass");
         
@@ -910,13 +999,13 @@ void GameClient::renderShadowPass()
     int numCascades = g_shadowMap.getNumCascades();
     
     // Cascade configuration for proper coverage with 32-block overlap
-    // Cascade 0 (near): covers 0-128 blocks from camera, 256x256 units ortho (high detail)
+    // Cascade 0 (near): covers 0-128 blocks from camera, 128x128 units ortho (high detail)
     // Cascade 1 (far):  covers 0-1000 blocks from camera (render distance), 2048x2048 units ortho
     // 28-block overlap zone from 100-128 blocks for smooth transitions
     const float cascade0Split = 128.0f;   // Near cascade max distance
     const float cascade1Split = 1000.0f;  // Far cascade = camera far plane (render distance)
     
-    const float nearOrthoSize = 128.0f;   // Near: 256x256 units coverage
+    const float nearOrthoSize = 64.0f;    // Near: 128x128 units coverage
     const float farOrthoSize = 1024.0f;   // Far: 2048x2048 units coverage
     
     // Render each cascade
@@ -1083,6 +1172,12 @@ void GameClient::onWindowResize(int width, int height)
     
     // Resize G-buffer to match new window size
     g_gBuffer.resize(width, height);
+    
+    // Resize HDR framebuffer to match new window size
+    g_hdrFramebuffer.resize(width, height);
+    
+    // Resize post-processing pipeline to match new window size
+    g_postProcessing.resize(width, height);
 }
 
 void GameClient::handleWorldStateReceived(const WorldStateMessage& worldState)

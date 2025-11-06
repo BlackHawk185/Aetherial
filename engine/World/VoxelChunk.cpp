@@ -122,7 +122,7 @@ void VoxelChunk::generateMesh(bool generateLighting)
     
     // Build into a new mesh (no locks needed - parallel-safe!)
     auto newMesh = std::make_shared<VoxelMesh>();
-    auto newCollisionMesh = std::make_shared<CollisionMesh>();
+    // NOTE: Collision mesh generation removed - voxel-based collision doesn't use it
     
     // Temporary storage for model instances during mesh generation
     std::unordered_map<uint8_t, std::vector<Vec3>> tempModelInstances;
@@ -155,20 +155,7 @@ void VoxelChunk::generateMesh(bool generateLighting)
     generateSimpleMeshInto(newMesh->quads);
     
     auto t_mesh_end = std::chrono::high_resolution_clock::now();
-    auto t_collision_start = std::chrono::high_resolution_clock::now();
-    
-    // Build collision mesh from generated quads (trivial copy)
-    for (const auto& quad : newMesh->quads)
-    {
-        newCollisionMesh->faces.push_back({
-            quad.position,
-            quad.normal,
-            quad.width,
-            quad.height
-        });
-    }
-    
-    auto t_collision_end = std::chrono::high_resolution_clock::now();
+
     
     // Build quad lookup map for incremental updates
     m_quadLookup.clear();
@@ -191,7 +178,7 @@ void VoxelChunk::generateMesh(bool generateLighting)
     
     // DIRECT ASSIGNMENT - fast, no atomic overhead!
     renderMesh = newMesh;
-    collisionMesh = newCollisionMesh;
+    // NOTE: collisionMesh no longer generated - voxel-based collision uses voxel data directly
     
     // Update model instances (protected by implicit synchronization)
     m_modelInstances = std::move(tempModelInstances);
@@ -206,69 +193,12 @@ void VoxelChunk::generateMesh(bool generateLighting)
     // Performance tracking
     auto prescan_ms = std::chrono::duration<double, std::milli>(t_prescan_end - t_prescan_start).count();
     auto mesh_ms = std::chrono::duration<double, std::milli>(t_mesh_end - t_mesh_start).count();
-    auto collision_ms = std::chrono::duration<double, std::milli>(t_collision_end - t_collision_start).count();
     auto total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
     
     std::cout << "🔧 MESH GEN: Total=" << total_ms << "ms (Prescan=" << prescan_ms 
-              << "ms, Mesh=" << mesh_ms << "ms, Collision=" << collision_ms 
-              << "ms) Quads=" << newMesh->quads.size() << std::endl;
+              << "ms, Mesh=" << mesh_ms << "ms) Quads=" << newMesh->quads.size() << std::endl;
 }
 
-bool VoxelChunk::checkRayCollision(const Vec3& rayOrigin, const Vec3& rayDirection,
-                                   float maxDistance, Vec3& hitPoint, Vec3& hitNormal) const
-{
-    // Get current collision mesh (thread-safe atomic load)
-    auto mesh = getCollisionMesh();
-    if (!mesh)
-        return false;
-    
-    // Simple ray-triangle intersection with collision faces
-    float closestDistance = maxDistance;
-    bool hit = false;
-
-    for (const auto& face : mesh->faces)
-    {
-        // Ray-plane intersection
-        float denom = rayDirection.dot(face.normal);
-        if (abs(denom) < 1e-6f)
-            continue;  // Ray parallel to plane
-
-        Vec3 planeToRay = face.position - rayOrigin;
-        float t = planeToRay.dot(face.normal) / denom;
-
-        if (t < 0 || t > closestDistance)
-            continue;
-
-        // Check if intersection point is within face bounds (simple AABB check)
-        Vec3 intersection = rayOrigin + rayDirection * t;
-        Vec3 localPoint = intersection - face.position;
-
-        // Determine which axes to check based on face normal
-        bool withinBounds = true;
-        if (abs(face.normal.x) > 0.5f)
-        {  // X-facing face
-            withinBounds = abs(localPoint.y) <= 0.5f && abs(localPoint.z) <= 0.5f;
-        }
-        else if (abs(face.normal.y) > 0.5f)
-        {  // Y-facing face
-            withinBounds = abs(localPoint.x) <= 0.5f && abs(localPoint.z) <= 0.5f;
-        }
-        else
-        {  // Z-facing face
-            withinBounds = abs(localPoint.x) <= 0.5f && abs(localPoint.y) <= 0.5f;
-        }
-
-        if (withinBounds)
-        {
-            closestDistance = t;
-            hitPoint = intersection;
-            hitNormal = face.normal;
-            hit = true;
-        }
-    }
-
-    return hit;
-}
 
 int VoxelChunk::calculateLOD(const Vec3& cameraPos) const
 {

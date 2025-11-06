@@ -38,6 +38,7 @@ public:
     GLuint getPositionTexture() const { return m_positionTex; }
     GLuint getMetadataTexture() const { return m_metadataTex; }
     GLuint getDepthTexture() const { return m_depthTex; }
+    GLuint getFBO() const { return m_fbo; }
 
     int getWidth() const { return m_width; }
     int getHeight() const { return m_height; }

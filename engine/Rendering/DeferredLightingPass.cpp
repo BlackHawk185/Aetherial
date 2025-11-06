@@ -1,6 +1,7 @@
 #include "DeferredLightingPass.h"
 #include "GBuffer.h"
 #include "CascadedShadowMap.h"
+#include "HDRFramebuffer.h"
 #include <glad/gl.h>
 #include <iostream>
 
@@ -41,9 +42,13 @@ uniform int uNumCascades;
 
 // Lighting
 uniform vec3 uSunDir;
-uniform float uAmbient;
+uniform vec3 uCameraPos;
 
 out vec4 FragColor;
+
+// Cascade distance constants (in world units/blocks)
+const float NEAR_CASCADE_END = 128.0;
+const float FAR_CASCADE_START = 32.0;
 
 // Poisson disk for PCF soft shadows (32 samples)
 const vec2 POISSON[32] = vec2[32](
@@ -66,90 +71,80 @@ const vec2 POISSON[32] = vec2[32](
 );
 
 float sampleShadowPCF(vec3 worldPos, float bias) {
-    // Select cascade based on distance from camera
-    // NOTE: In deferred, we don't have view-space Z directly
-    // We'll use world position distance as approximation
-    int cascadeIndex = 0;
-    float distFromCamera = length(worldPos);
+    // Hard cascade cutoffs with overlap zone
+    // Near cascade: 0-128 blocks (hard cutoff at 128)
+    // Far cascade: starts at 32 blocks
+    // Overlap zone: 32-128 blocks (both render, near wins)
+    float distFromCamera = length(worldPos - uCameraPos);
     
-    if (distFromCamera > 64.0) {
-        cascadeIndex = 1;
+    bool useNear = (distFromCamera <= NEAR_CASCADE_END);
+    bool useFar = (distFromCamera >= FAR_CASCADE_START);
+    bool inOverlap = (distFromCamera >= FAR_CASCADE_START && distFromCamera <= NEAR_CASCADE_END);
+    
+    float shadow = 1.0;
+    
+    // Sample near cascade if applicable
+    if (useNear) {
+        vec4 lightSpacePos0 = uCascadeVP[0] * vec4(worldPos, 1.0);
+        vec3 proj0 = lightSpacePos0.xyz / lightSpacePos0.w;
+        proj0 = proj0 * 0.5 + 0.5;
+        
+        if (proj0.x >= 0.0 && proj0.x <= 1.0 && proj0.y >= 0.0 && proj0.y <= 1.0 && proj0.z <= 1.0) {
+            float current = proj0.z - bias;
+            float radius = 128.0 * uShadowTexel;
+            
+            float center = texture(uShadowMap, vec4(proj0.xy, 0, current));
+            if (center > 0.99) {
+                shadow = 1.0;
+            } else {
+                shadow = center;
+                for (int i = 0; i < 32; ++i) {
+                    vec2 offset = POISSON[i] * radius;
+                    shadow += texture(uShadowMap, vec4(proj0.xy + offset, 0, current));
+                }
+                shadow /= 33.0;
+            }
+        }
+        
+        // If not in overlap zone, return near cascade result
+        if (!inOverlap) {
+            return shadow;
+        }
     }
     
-    // Transform to light space
-    vec4 lightSpacePos = uCascadeVP[cascadeIndex] * vec4(worldPos, 1.0);
-    vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
-    proj = proj * 0.5 + 0.5;
-    
-    // Outside light frustum = no shadow (fully lit)
-    if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0 || proj.z > 1.0)
-        return 1.0;
-    
-    float current = proj.z - bias;
-    
-    // PCF radius (adjust per cascade)
-    float baseRadius = 128.0;
-    float radiusScale = (cascadeIndex == 0) ? 1.0 : 0.125;
-    float radius = baseRadius * radiusScale * uShadowTexel;
-    
-    // Sample shadow map with PCF
-    float shadow = 0.0;
-    float center = texture(uShadowMap, vec4(proj.xy, cascadeIndex, current));
-    shadow += center;
-    
-    // Early exit if fully lit
-    if (center > 0.99) return 1.0;
-    
-    // Sample Poisson disk
-    for (int i = 0; i < 32; ++i) {
-        vec2 offset = POISSON[i] * radius;
-        float d = texture(uShadowMap, vec4(proj.xy + offset, cascadeIndex, current));
-        shadow += d;
+    // Sample far cascade if applicable
+    if (useFar) {
+        float farShadow = 1.0;
+        vec4 lightSpacePos1 = uCascadeVP[1] * vec4(worldPos, 1.0);
+        vec3 proj1 = lightSpacePos1.xyz / lightSpacePos1.w;
+        proj1 = proj1 * 0.5 + 0.5;
+        
+        if (proj1.x >= 0.0 && proj1.x <= 1.0 && proj1.y >= 0.0 && proj1.y <= 1.0 && proj1.z <= 1.0) {
+            float current = proj1.z - bias;
+            float radius = 128.0 * 0.125 * uShadowTexel;
+            
+            float center = texture(uShadowMap, vec4(proj1.xy, 1, current));
+            if (center > 0.99) {
+                farShadow = 1.0;
+            } else {
+                farShadow = center;
+                for (int i = 0; i < 32; ++i) {
+                    vec2 offset = POISSON[i] * radius;
+                    farShadow += texture(uShadowMap, vec4(proj1.xy + offset, 1, current));
+                }
+                farShadow /= 33.0;
+            }
+        }
+        
+        // In overlap zone, combine both cascades (multiply for darker shadows)
+        if (inOverlap) {
+            return shadow * farShadow;
+        } else {
+            return farShadow;
+        }
     }
     
-    return shadow / 33.0;
-}
-
-vec3 calculateSkyGradient(vec2 uv, vec3 sunDir) {
-    // Convert UV to normalized device coordinates for gradient
-    float height = (uv.y - 0.5) * 2.0;  // -1 to 1, with 1 at top
-    
-    // Sun height determines time of day
-    float sunHeight = -sunDir.y;
-    
-    // Day colors
-    vec3 daySky = vec3(0.4, 0.6, 0.9);
-    vec3 dayHorizon = vec3(0.7, 0.8, 0.9);
-    
-    // Night colors
-    vec3 nightSky = vec3(0.02, 0.02, 0.05);
-    vec3 nightHorizon = vec3(0.05, 0.05, 0.1);
-    
-    // Sunset/sunrise colors
-    vec3 sunsetSky = vec3(0.3, 0.2, 0.4);
-    vec3 sunsetHorizon = vec3(1.0, 0.5, 0.2);
-    
-    vec3 skyColor, horizonColor;
-    
-    if (sunHeight > 0.3) {
-        // Daytime
-        float t = clamp((sunHeight - 0.3) / 0.7, 0.0, 1.0);
-        skyColor = mix(sunsetSky, daySky, t);
-        horizonColor = mix(sunsetHorizon, dayHorizon, t);
-    } else if (sunHeight > -0.3) {
-        // Sunset/sunrise
-        skyColor = sunsetSky;
-        horizonColor = sunsetHorizon;
-    } else {
-        // Night
-        float t = clamp((-sunHeight - 0.3) / 0.7, 0.0, 1.0);
-        skyColor = mix(sunsetSky, nightSky, t);
-        horizonColor = mix(sunsetHorizon, nightHorizon, t);
-    }
-    
-    // Vertical gradient
-    float gradientT = smoothstep(-0.5, 0.8, height);
-    return mix(horizonColor, skyColor, gradientT);
+    return shadow;
 }
 
 void main() {
@@ -160,26 +155,18 @@ void main() {
     vec4 metadata = texture(gMetadata, vUV);
     float depth = texture(gDepth, vUV).r;
     
-    // Render gradient sky for empty pixels (depth = 1.0)
+    // Skip pixels with no geometry (depth = 1.0) - let sky pass handle background
     if (depth >= 0.9999) {
-        vec3 skyColor = calculateSkyGradient(vUV, uSunDir);
-        FragColor = vec4(skyColor, 1.0);
-        return;
+        discard;  // Don't render anything for empty pixels
     }
     
-    // Normalize normal (might have been interpolated)
-    normal = normalize(normal);
-    
-    // Sun lighting (N dot L)
-    vec3 sunDir = normalize(uSunDir);
-    float NdotL = max(dot(normal, -sunDir), 0.0);
-    
-    // Shadow mapping
-    float bias = max(0.005 * (1.0 - NdotL), 0.001);
+    // Shadow mapping only - no Lambert, no ambient
+    float bias = 0.0;
     float shadowFactor = sampleShadowPCF(worldPos, bias);
     
-    // Final lighting (pure directional sun only - no ambient)
-    vec3 finalColor = albedo * NdotL * shadowFactor;
+    // Final color: albedo modulated by shadow map ONLY
+    // Dark by default (shadowFactor = 0), lit only where shadow map says so
+    vec3 finalColor = albedo * shadowFactor;
     
     FragColor = vec4(finalColor, 1.0);
 }
@@ -259,7 +246,7 @@ bool DeferredLightingPass::initialize() {
     m_loc_gDepth = glGetUniformLocation(m_shader, "gDepth");
     m_loc_shadowMap = glGetUniformLocation(m_shader, "uShadowMap");
     m_loc_sunDir = glGetUniformLocation(m_shader, "uSunDir");
-    m_loc_ambient = glGetUniformLocation(m_shader, "uAmbient");
+    m_loc_cameraPos = glGetUniformLocation(m_shader, "uCameraPos");
     m_loc_numCascades = glGetUniformLocation(m_shader, "uNumCascades");
     m_loc_shadowTexel = glGetUniformLocation(m_shader, "uShadowTexel");
     
@@ -306,7 +293,11 @@ void DeferredLightingPass::setCascadeData(int index, const glm::mat4& viewProj, 
     }
 }
 
-void DeferredLightingPass::render(const glm::vec3& sunDirection, float ambientStrength) {
+void DeferredLightingPass::render(const glm::vec3& sunDirection, const glm::vec3& cameraPosition) {
+    // Bind HDR framebuffer for output
+    g_hdrFramebuffer.bind();
+    g_hdrFramebuffer.clear();
+    
     glUseProgram(m_shader);
     
     // Bind G-buffer textures
@@ -326,7 +317,7 @@ void DeferredLightingPass::render(const glm::vec3& sunDirection, float ambientSt
     
     // Set lighting uniforms
     if (m_loc_sunDir >= 0) glUniform3fv(m_loc_sunDir, 1, &sunDirection[0]);
-    if (m_loc_ambient >= 0) glUniform1f(m_loc_ambient, ambientStrength);
+    if (m_loc_cameraPos >= 0) glUniform3fv(m_loc_cameraPos, 1, &cameraPosition[0]);
     if (m_loc_numCascades >= 0) glUniform1i(m_loc_numCascades, g_shadowMap.getNumCascades());
     
     float shadowTexel = 1.0f / static_cast<float>(g_shadowMap.getSize());
@@ -353,4 +344,5 @@ void DeferredLightingPass::render(const glm::vec3& sunDirection, float ambientSt
     glEnable(GL_DEPTH_TEST);
     
     glUseProgram(0);
+    g_hdrFramebuffer.unbind();
 }

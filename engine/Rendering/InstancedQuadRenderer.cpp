@@ -91,7 +91,7 @@ void main() {
 }
 )";
 
-// Fragment shader - OPTIMIZED with texture atlas (no branching!)
+// Fragment shader - Uses texture array for all block types
 static const char* FRAGMENT_SHADER = R"(
 #version 460 core
 
@@ -101,10 +101,7 @@ in vec3 WorldPos;
 flat in uint BlockType;
 flat in uint FaceDir;
 
-uniform sampler2D uTextureStone;
-uniform sampler2D uTextureDirt;
-uniform sampler2D uTextureGrass;
-uniform sampler2D uTextureSand;
+uniform sampler2DArray uBlockTextures;  // Texture array with all block textures
 
 // Real-time shadow system (CSM/PCF)
 uniform sampler2DArrayShadow uShadowMap;  // Cascaded shadow map array
@@ -143,13 +140,14 @@ const vec2 POISSON[32] = vec2[32](
 
 float sampleShadowPCF(float bias, float viewZ)
 {
-    // Select cascade based on view-space depth
-    int cascadeIndex = 0;
+    // Hard cascade switch with overlap zone
+    // Near cascade: 0-128 blocks (high detail)
+    // Far cascade: 32+ blocks (low detail, large coverage)
+    // Overlap zone: 32-128 blocks (both render, near wins)
     float viewDepth = abs(viewZ);
     
-    if (viewDepth > 64.0) {
-        cascadeIndex = 1;  // Far cascade starts at 64 blocks
-    }
+    // Use near cascade if within 128 blocks
+    int cascadeIndex = (viewDepth <= 128.0) ? 0 : 1;
     
     // Transform to light space for selected cascade
     vec4 lightSpacePos = uCascadeVP[cascadeIndex] * vec4(WorldPos, 1.0);
@@ -163,7 +161,7 @@ float sampleShadowPCF(float bias, float viewZ)
     float current = proj.z - bias;
     
     // Adjust PCF radius based on cascade to maintain consistent world-space blur
-    float baseRadius = 128.0;
+    float baseRadius = 512.0;
     float radiusScale = (cascadeIndex == 0) ? 1.0 : 0.125;  // 1/8 for far cascade
     float radius = baseRadius * radiusScale * uShadowTexel;
     
@@ -188,19 +186,8 @@ float sampleShadowPCF(float bias, float viewZ)
 }
 
 void main() {
-    // Sample appropriate texture based on block type
-    vec4 texColor;
-    if (BlockType == 1u) {
-        texColor = texture(uTextureStone, TexCoord);
-    } else if (BlockType == 2u) {
-        texColor = texture(uTextureDirt, TexCoord);
-    } else if (BlockType == 3u) {
-        texColor = texture(uTextureGrass, TexCoord);
-    } else if (BlockType == 25u) {
-        texColor = texture(uTextureSand, TexCoord);
-    } else {
-        texColor = texture(uTextureStone, TexCoord);  // Default
-    }
+    // Sample texture from array using BlockType as layer index
+    vec4 texColor = texture(uBlockTextures, vec3(TexCoord, float(BlockType)));
     
     // Calculate view-space Z for cascade selection
     vec4 viewPos = uView * vec4(WorldPos, 1.0);
@@ -210,7 +197,7 @@ void main() {
     vec3 N = normalize(Normal);
     vec3 L = normalize(-uLightDir);
     float ndotl = max(dot(N, L), 0.0);
-    float bias = max(0.0, 0.0002 * (1.0 - ndotl));
+    float bias = max(0.0, 0.0001 * (1.0 - ndotl));
     
     // Sample real-time CSM/PCF shadow
     float visibility = sampleShadowPCF(bias, viewZ);
@@ -357,10 +344,7 @@ in vec3 WorldPos;
 flat in uint BlockType;
 flat in uint FaceDir;
 
-uniform sampler2D uTextureStone;
-uniform sampler2D uTextureDirt;
-uniform sampler2D uTextureGrass;
-uniform sampler2D uTextureSand;
+uniform sampler2DArray uBlockTextures;  // Texture array with all block textures
 
 // G-buffer outputs (MRT)
 layout(location = 0) out vec3 gAlbedo;    // Base color
@@ -369,19 +353,8 @@ layout(location = 2) out vec3 gPosition;  // World position
 layout(location = 3) out vec4 gMetadata;  // BlockType (R), FaceDir (G)
 
 void main() {
-    // Sample texture based on block type
-    vec4 texColor;
-    if (BlockType == 1u) {
-        texColor = texture(uTextureStone, TexCoord);
-    } else if (BlockType == 2u) {
-        texColor = texture(uTextureDirt, TexCoord);
-    } else if (BlockType == 3u) {
-        texColor = texture(uTextureGrass, TexCoord);
-    } else if (BlockType == 25u) {
-        texColor = texture(uTextureSand, TexCoord);
-    } else {
-        texColor = texture(uTextureStone, TexCoord);
-    }
+    // Sample texture from array using BlockType as layer index
+    vec4 texColor = texture(uBlockTextures, vec3(TexCoord, float(BlockType)));
     
     // Write to G-buffer
     gAlbedo = texColor.rgb;
@@ -412,49 +385,21 @@ bool InstancedQuadRenderer::initialize()
     createGBufferShader();  // For deferred rendering
     createDepthShader();    // For shadow casting
     
-    // Load block textures
+    // Initialize and load block textures directly into texture array
     extern TextureManager* g_textureManager;
-    if (g_textureManager)
-    {
-        // Try multiple possible paths for textures
-        std::vector<std::string> searchPaths = {
-            "assets/textures/",
-            "../assets/textures/",
-            "C:/Users/steve-17/Desktop/game2/assets/textures/"
-        };
-        
-        struct TextureToLoad {
-            std::string name;
-            std::string filename;
-        };
-        
-        std::vector<TextureToLoad> textures = {
-            {"dirt", "dirt.png"},
-            {"stone", "stone.png"},
-            {"grass", "grass.png"},
-            {"sand", "sand.png"}
-        };
-        
-        for (const auto& tex : textures)
-        {
-            bool loaded = false;
-            for (const auto& path : searchPaths)
-            {
-                std::string fullPath = path + tex.filename;
-                GLuint texID = g_textureManager->loadTexture(fullPath, true, true);
-                if (texID != 0)
-                {
-                    std::cout << "   ├─ Loaded texture: " << tex.name << " from " << fullPath << std::endl;
-                    loaded = true;
-                    break;
-                }
-            }
-            
-            if (!loaded)
-            {
-                std::cerr << "   ⚠️  Failed to load texture: " << tex.name << std::endl;
-            }
-        }
+    if (!g_textureManager) {
+        g_textureManager = new TextureManager();
+    }
+    
+    // Always ensure it's initialized (safe to call multiple times)
+    if (!g_textureManager->initialize()) {
+        std::cerr << "❌ Failed to initialize texture manager" << std::endl;
+        return false;
+    }
+    
+    if (!loadBlockTextureArray()) {
+        std::cerr << "❌ Failed to load block texture array" << std::endl;
+        return false;
     }
     
     // Create global VAO for MDI (will be configured when chunks are registered)
@@ -532,10 +477,7 @@ void InstancedQuadRenderer::createShader()
     // Get uniform locations (no more uChunkTransform - using SSBO)
     m_uViewProjection = glGetUniformLocation(m_shaderProgram, "uViewProjection");
     m_uView = glGetUniformLocation(m_shaderProgram, "uView");
-    m_uTextureStone = glGetUniformLocation(m_shaderProgram, "uTextureStone");
-    m_uTextureDirt = glGetUniformLocation(m_shaderProgram, "uTextureDirt");
-    m_uTextureGrass = glGetUniformLocation(m_shaderProgram, "uTextureGrass");
-    m_uTextureSand = glGetUniformLocation(m_shaderProgram, "uTextureSand");
+    m_uBlockTextures = glGetUniformLocation(m_shaderProgram, "uBlockTextures");
     
     // CSM/PCF shadow uniforms
     m_uShadowMap = glGetUniformLocation(m_shaderProgram, "uShadowMap");
@@ -598,12 +540,117 @@ void InstancedQuadRenderer::createGBufferShader()
     
     // Get uniform locations
     m_gbuffer_uViewProjection = glGetUniformLocation(m_gbufferProgram, "uViewProjection");
-    m_gbuffer_uTextureStone = glGetUniformLocation(m_gbufferProgram, "uTextureStone");
-    m_gbuffer_uTextureDirt = glGetUniformLocation(m_gbufferProgram, "uTextureDirt");
-    m_gbuffer_uTextureGrass = glGetUniformLocation(m_gbufferProgram, "uTextureGrass");
-    m_gbuffer_uTextureSand = glGetUniformLocation(m_gbufferProgram, "uTextureSand");
+    m_gbuffer_uBlockTextures = glGetUniformLocation(m_gbufferProgram, "uBlockTextures");
     
     std::cout << "   └─ G-buffer shader compiled and linked (deferred rendering)" << std::endl;
+}
+
+bool InstancedQuadRenderer::loadBlockTextureArray()
+{
+    std::cout << "🎨 Loading block texture array..." << std::endl;
+    
+    extern TextureManager* g_textureManager;
+    
+    // Define all 46 block textures in ID order (matching BlockID enum)
+    const char* blockTextureFiles[46] = {
+        "stone.png",          // 0  - AIR (fallback)
+        "stone.png",          // 1  - STONE
+        "dirt.png",           // 2  - DIRT
+        "gravel.png",         // 3  - GRAVEL
+        "clay.png",           // 4  - CLAY
+        "moss.png",           // 5  - MOSS
+        "sand.png",           // 6  - SAND
+        "wood_oak.png",       // 7  - WOOD_OAK
+        "wood_birch.png",     // 8  - WOOD_BIRCH
+        "wood_pine.png",      // 9  - WOOD_PINE
+        "wood_jungle.png",    // 10 - WOOD_JUNGLE
+        "wood_palm.png",      // 11 - WOOD_PALM
+        "leaves_green.png",   // 12 - LEAVES_GREEN
+        "leaves_dark.png",    // 13 - LEAVES_DARK
+        "leaves_palm.png",    // 14 - LEAVES_PALM
+        "ice.png",            // 15 - ICE
+        "packed_ice.png",     // 16 - PACKED_ICE
+        "snow.png",           // 17 - SNOW
+        "sandstone.png",      // 18 - SANDSTONE
+        "granite.png",        // 19 - GRANITE
+        "basalt.png",         // 20 - BASALT
+        "limestone.png",      // 21 - LIMESTONE
+        "marble.png",         // 22 - MARBLE
+        "obsidian.png",       // 23 - OBSIDIAN
+        "lava_rock.png",      // 24 - LAVA_ROCK
+        "volcanic_ash.png",   // 25 - VOLCANIC_ASH
+        "magma.png",          // 26 - MAGMA
+        "lava.png",           // 27 - LAVA
+        "coal.png",           // 28 - COAL
+        "iron_block.png",     // 29 - IRON_BLOCK
+        "copper_block.png",   // 30 - COPPER_BLOCK
+        "gold_block.png",     // 31 - GOLD_BLOCK
+        "diamond_block.png",  // 32 - DIAMOND_BLOCK
+        "emerald_block.png",  // 33 - EMERALD_BLOCK
+        "ruby_block.png",     // 34 - RUBY_BLOCK
+        "sapphire_block.png", // 35 - SAPPHIRE_BLOCK
+        "amethyst.png",       // 36 - AMETHYST
+        "quartz.png",         // 37 - QUARTZ
+        "crystal_blue.png",   // 38 - CRYSTAL_BLUE
+        "crystal_green.png",  // 39 - CRYSTAL_GREEN
+        "crystal_purple.png", // 40 - CRYSTAL_PURPLE
+        "crystal_pink.png",   // 41 - CRYSTAL_PINK
+        "salt_block.png",     // 42 - SALT_BLOCK
+        "mushroom_block.png", // 43 - MUSHROOM_BLOCK
+        "coral.png",          // 44 - CORAL
+        "water.png"           // 45 - WATER
+    };
+    
+    // Create 2D texture array (46 layers, 32x32 RGBA, no mipmaps)
+    glGenTextures(1, &m_blockTextureArray);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_blockTextureArray);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, 32, 32, 46);
+    
+    // Load and upload each texture directly
+    int successCount = 0;
+    int failCount = 0;
+    
+    for (int i = 0; i < 46; ++i)
+    {
+        TextureData texData = g_textureManager->loadTextureData(blockTextureFiles[i]);
+        
+        if (texData.isValid())
+        {
+            // Resize if needed (textures should be 32x32)
+            if (texData.width == 32 && texData.height == 32)
+            {
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, i, 32, 32, 1, GL_RGBA, GL_UNSIGNED_BYTE, texData.pixels);
+                successCount++;
+            }
+            else
+            {
+                std::cerr << "   ⚠️  Layer " << i << " (" << blockTextureFiles[i] << "): Wrong size " 
+                          << texData.width << "x" << texData.height << " (expected 32x32)" << std::endl;
+                failCount++;
+            }
+        }
+        else
+        {
+            std::cerr << "   ❌ Layer " << i << " (" << blockTextureFiles[i] << "): Failed to load" << std::endl;
+            failCount++;
+        }
+    }
+    
+    // Set texture parameters (pixel art style - nearest neighbor)
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    
+    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+    
+    std::cout << "   ✅ Texture array created: " << successCount << "/46 loaded";
+    if (failCount > 0) {
+        std::cout << " (" << failCount << " failed)";
+    }
+    std::cout << std::endl;
+    
+    return successCount > 0; // At least one texture must load
 }
 
 GLuint InstancedQuadRenderer::compileShader(const char* source, GLenum type)
@@ -942,32 +989,18 @@ void InstancedQuadRenderer::render(const glm::mat4& viewProjection, const glm::m
     glUniformMatrix4fv(m_uViewProjection, 1, GL_FALSE, glm::value_ptr(viewProjection));
     glUniformMatrix4fv(m_uView, 1, GL_FALSE, glm::value_ptr(view));
     
-    // Bind 4 separate textures
-    extern TextureManager* g_textureManager;
-    
+    // Bind texture array
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("stone.png"));
-    glUniform1i(m_uTextureStone, 0);
-    
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("dirt.png"));
-    glUniform1i(m_uTextureDirt, 1);
-    
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("grass.png"));
-    glUniform1i(m_uTextureGrass, 2);
-    
-    glActiveTexture(GL_TEXTURE3);
-    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("sand.png"));
-    glUniform1i(m_uTextureSand, 3);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_blockTextureArray);
+    glUniform1i(m_uBlockTextures, 0);
     
     // Bind CSM/PCF shadow map (matches ModelInstanceRenderer)
     extern class ShadowMap g_shadowMap;
     extern class DayNightController* g_dayNightController;
     
-    glActiveTexture(GL_TEXTURE4);
+    glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D_ARRAY, g_shadowMap.getDepthTexture());
-    glUniform1i(m_uShadowMap, 4);
+    glUniform1i(m_uShadowMap, 1);
     
     // Shadow texel size for PCF radius calculation
     float shadowTexel = 1.0f / static_cast<float>(g_shadowMap.getSize());
@@ -1043,24 +1076,10 @@ void InstancedQuadRenderer::renderToGBuffer(const glm::mat4& viewProjection, con
     glUseProgram(m_gbufferProgram);
     glUniformMatrix4fv(m_gbuffer_uViewProjection, 1, GL_FALSE, glm::value_ptr(viewProjection));
     
-    // Bind textures
-    extern TextureManager* g_textureManager;
-    
+    // Bind texture array
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("stone.png"));
-    glUniform1i(m_gbuffer_uTextureStone, 0);
-    
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("dirt.png"));
-    glUniform1i(m_gbuffer_uTextureDirt, 1);
-    
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("grass.png"));
-    glUniform1i(m_gbuffer_uTextureGrass, 2);
-    
-    glActiveTexture(GL_TEXTURE3);
-    glBindTexture(GL_TEXTURE_2D, g_textureManager->getTexture("sand.png"));
-    glUniform1i(m_gbuffer_uTextureSand, 3);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_blockTextureArray);
+    glUniform1i(m_gbuffer_uBlockTextures, 0);
     
     // Rebuild MDI buffers if dirty
     if (m_mdiDirty) {

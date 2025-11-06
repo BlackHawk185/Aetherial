@@ -11,7 +11,6 @@ using GLint = int;
  * Reads G-buffer textures and applies:
  * - Cascaded shadow mapping (CSM)
  * - Directional sun lighting
- * - Ambient lighting
  * - Day/night cycle
  * 
  * Outputs final lit color to screen
@@ -24,8 +23,8 @@ public:
     bool initialize();
     void shutdown();
 
-    // Render full-screen quad with deferred lighting
-    void render(const glm::vec3& sunDirection, float ambientStrength);
+    // Render full-screen quad with deferred lighting to HDR framebuffer
+    void render(const glm::vec3& sunDirection, const glm::vec3& cameraPosition);
 
     // Update cascade shadow map data
     void setCascadeData(int index, const glm::mat4& viewProj, float splitDistance);
@@ -43,7 +42,7 @@ private:
     GLint m_loc_gDepth = -1;
     GLint m_loc_shadowMap = -1;
     GLint m_loc_sunDir = -1;
-    GLint m_loc_ambient = -1;
+    GLint m_loc_cameraPos = -1;
     GLint m_loc_cascadeVP = -1;
     GLint m_loc_numCascades = -1;
     GLint m_loc_shadowTexel = -1;

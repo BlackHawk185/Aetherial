@@ -13,7 +13,7 @@ void BiomeSystem::initializePalettes()
 {
     // GRASSLAND - Default lush biome
     m_palettes[static_cast<int>(BiomeType::GRASSLAND)] = {
-        BlockID::GRASS,          // surfaceBlock
+        BlockID::DIRT,           // surfaceBlock
         BlockID::DIRT,           // subsurfaceBlock
         BlockID::STONE,          // deepBlock
         BlockID::COAL,           // oreBlock
@@ -21,71 +21,71 @@ void BiomeSystem::initializePalettes()
         0.3f                     // oreSpawnChance
     };
     
-    // FOREST - Dense forested biome
+    // FOREST - Dense forested biome with moss and rich soil
     m_palettes[static_cast<int>(BiomeType::FOREST)] = {
-        BlockID::GRASS,          // surfaceBlock
+        BlockID::MOSS,           // surfaceBlock (mossy forest floor)
         BlockID::DIRT,           // subsurfaceBlock
-        BlockID::STONE,          // deepBlock
-        BlockID::COAL,           // oreBlock
+        BlockID::GRANITE,        // deepBlock (hard bedrock)
+        BlockID::EMERALD_BLOCK,  // oreBlock (rare emeralds in ancient forests)
         0.95f,                   // vegetationDensity (very high - dense forest)
-        0.25f                    // oreSpawnChance
+        0.2f                     // oreSpawnChance (less ore, more nature)
     };
     
-    // DESERT - Sandy and dry
+    // DESERT - Sandy and dry with sandstone layers
     m_palettes[static_cast<int>(BiomeType::DESERT)] = {
         BlockID::SAND,           // surfaceBlock
-        BlockID::SAND,           // subsurfaceBlock (more sand)
+        BlockID::SANDSTONE,      // subsurfaceBlock (compressed sand)
         BlockID::LIMESTONE,      // deepBlock
-        BlockID::GOLD_BLOCK,     // oreBlock
+        BlockID::GOLD_BLOCK,     // oreBlock (desert gold deposits)
         0.1f,                    // vegetationDensity (sparse)
         0.4f                     // oreSpawnChance (gold in deserts)
     };
     
-    // SNOW - Frozen tundra
+    // SNOW - Frozen tundra with packed ice
     m_palettes[static_cast<int>(BiomeType::SNOW)] = {
-        BlockID::ICE,            // surfaceBlock
-        BlockID::DIRT,           // subsurfaceBlock
-        BlockID::STONE,          // deepBlock
-        BlockID::IRON_BLOCK,     // oreBlock
+        BlockID::SNOW,           // surfaceBlock
+        BlockID::PACKED_ICE,     // subsurfaceBlock (permafrost)
+        BlockID::MARBLE,         // deepBlock (metamorphic rock)
+        BlockID::SAPPHIRE_BLOCK, // oreBlock (icy blue gems)
         0.2f,                    // vegetationDensity
         0.35f                    // oreSpawnChance
     };
     
-    // VOLCANIC - Dark and mineral-rich
+    // VOLCANIC - Dark basalt with glowing magma
     m_palettes[static_cast<int>(BiomeType::VOLCANIC)] = {
-        BlockID::STONE,          // surfaceBlock (dark rock)
-        BlockID::STONE,          // subsurfaceBlock
-        BlockID::STONE,          // deepBlock
-        BlockID::COAL,           // oreBlock (abundant coal)
+        BlockID::LAVA_ROCK,      // surfaceBlock (cooled lava)
+        BlockID::BASALT,         // subsurfaceBlock (volcanic rock)
+        BlockID::OBSIDIAN,       // deepBlock (volcanic glass)
+        BlockID::RUBY_BLOCK,     // oreBlock (fire gems)
         0.05f,                   // vegetationDensity (almost none)
-        0.7f                     // oreSpawnChance (very rich)
+        0.7f                     // oreSpawnChance (very rich in minerals)
     };
     
-    // CRYSTAL - Rare and valuable
+    // CRYSTAL - Magical rare biome with crystal formations
     m_palettes[static_cast<int>(BiomeType::CRYSTAL)] = {
-        BlockID::DIAMOND_BLOCK,  // surfaceBlock (shimmering)
-        BlockID::STONE,          // subsurfaceBlock
-        BlockID::STONE,          // deepBlock
+        BlockID::CRYSTAL_PURPLE, // surfaceBlock (shimmering crystals)
+        BlockID::QUARTZ,         // subsurfaceBlock
+        BlockID::AMETHYST,       // deepBlock
         BlockID::DIAMOND_BLOCK,  // oreBlock
         0.3f,                    // vegetationDensity
-        0.9f                     // oreSpawnChance (very valuable)
+        0.9f                     // oreSpawnChance (extremely valuable)
     };
     
-    // TROPICAL - Beach paradise
+    // TROPICAL - Beach paradise with coral and sand
     m_palettes[static_cast<int>(BiomeType::TROPICAL)] = {
-        BlockID::GRASS,          // surfaceBlock
-        BlockID::SAND,           // subsurfaceBlock (sandy underneath)
-        BlockID::LIMESTONE,      // deepBlock
+        BlockID::DIRT,           // surfaceBlock
+        BlockID::SAND,           // subsurfaceBlock (sandy beach)
+        BlockID::CORAL,          // deepBlock (coral reef base)
         BlockID::COPPER_BLOCK,   // oreBlock
-        0.8f,                    // vegetationDensity (lush)
+        0.8f,                    // vegetationDensity (lush palm trees)
         0.25f                    // oreSpawnChance
     };
     
-    // BARREN - Rocky wasteland
+    // BARREN - Rocky wasteland with gravel
     m_palettes[static_cast<int>(BiomeType::BARREN)] = {
-        BlockID::STONE,          // surfaceBlock
+        BlockID::GRAVEL,         // surfaceBlock (loose rocks)
         BlockID::STONE,          // subsurfaceBlock
-        BlockID::STONE,          // deepBlock
+        BlockID::GRANITE,        // deepBlock (hard granite bedrock)
         BlockID::IRON_BLOCK,     // oreBlock
         0.0f,                    // vegetationDensity (none)
         0.5f                     // oreSpawnChance (decent ore)

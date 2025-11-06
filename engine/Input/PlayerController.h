@@ -112,7 +112,7 @@ private:
     float m_stepStartHeight = 0.0f;     // Y position when step started
     
     // Movement settings
-    float m_moveSpeed = 20.0f;          // Walk speed (adjusted 1.5x for larger world scale)
+    float m_moveSpeed = 30.0f;          // Walk speed (adjusted 1.5x for larger world scale)
     float m_jumpStrength = 8.0f;       // Jump velocity (adjusted 1.5x for larger world scale)
     float m_gravity = 20.0f;            // Gravity acceleration
     float m_airControl = 0.2f;          // How much control in air (reduced from 0.4)

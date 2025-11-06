@@ -31,7 +31,6 @@ public:
     Vec3 getSunDirection() const;          // Current sun direction vector (for shadow casting)
     Vec3 getMoonDirection() const;         // Moon is opposite the sun
     float getSunIntensity() const;         // 0.0 (night) to 1.0 (midday)
-    float getAmbientIntensity() const;     // Base ambient light level
     
     // Sky colors for rendering
     struct SkyColors {

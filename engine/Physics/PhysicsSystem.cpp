@@ -35,79 +35,6 @@ void PhysicsSystem::shutdown()
 {
 }
 
-bool PhysicsSystem::checkRayCollision(const Vec3& rayOrigin, const Vec3& rayDirection,
-                                      float maxDistance, Vec3& hitPoint, Vec3& hitNormal)
-{
-    PROFILE_FUNCTION();
-    if (!m_islandSystem)
-        return false;
-
-    // Check ray collision with all active islands
-    const auto& islands = m_islandSystem->getIslands();
-    for (const auto& islandPair : islands)
-    {
-        const FloatingIsland* island = &islandPair.second;
-        if (!island)
-            continue;
-
-        // Convert ray origin to island-local coordinates
-        Vec3 localRayOrigin = rayOrigin - island->physicsCenter;
-        Vec3 rayEnd = localRayOrigin + (rayDirection * maxDistance);
-        
-        // Calculate bounding box of ray path
-        float minX = std::min(localRayOrigin.x, rayEnd.x);
-        float maxX = std::max(localRayOrigin.x, rayEnd.x);
-        float minY = std::min(localRayOrigin.y, rayEnd.y);
-        float maxY = std::max(localRayOrigin.y, rayEnd.y);
-        float minZ = std::min(localRayOrigin.z, rayEnd.z);
-        float maxZ = std::max(localRayOrigin.z, rayEnd.z);
-        
-        // Calculate chunk coordinate bounds that the ray could intersect
-        int minChunkX = static_cast<int>(std::floor(minX / VoxelChunk::SIZE));
-        int maxChunkX = static_cast<int>(std::ceil(maxX / VoxelChunk::SIZE));
-        int minChunkY = static_cast<int>(std::floor(minY / VoxelChunk::SIZE));
-        int maxChunkY = static_cast<int>(std::ceil(maxY / VoxelChunk::SIZE));
-        int minChunkZ = static_cast<int>(std::floor(minZ / VoxelChunk::SIZE));
-        int maxChunkZ = static_cast<int>(std::ceil(maxZ / VoxelChunk::SIZE));
-
-        // Only check chunks that the ray could potentially intersect
-        for (int chunkX = minChunkX; chunkX <= maxChunkX; ++chunkX)
-        {
-            for (int chunkY = minChunkY; chunkY <= maxChunkY; ++chunkY)
-            {
-                for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ)
-                {
-                    Vec3 chunkCoord(chunkX, chunkY, chunkZ);
-                    
-                    // Check if this chunk exists in the island
-                    auto chunkIt = island->chunks.find(chunkCoord);
-                    if (chunkIt == island->chunks.end() || !chunkIt->second)
-                        continue;
-
-                    // Calculate chunk world position
-                    Vec3 chunkWorldPos = island->physicsCenter + FloatingIsland::chunkCoordToWorldPos(chunkCoord);
-                    
-                    // Convert ray to chunk-local coordinates
-                    Vec3 chunkLocalRayOrigin = rayOrigin - chunkWorldPos;
-
-                    // Check ray collision with this chunk
-                    Vec3 localHitPoint, localHitNormal;
-                    if (chunkIt->second->checkRayCollision(chunkLocalRayOrigin, rayDirection, maxDistance,
-                                                          localHitPoint, localHitNormal))
-                    {
-                        // Convert back to world coordinates
-                        hitPoint = localHitPoint + chunkWorldPos;
-                        hitNormal = localHitNormal;
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    return false;
-}
-
 void PhysicsSystem::updateEntities(float deltaTime)
 {
     // Physics updates now handled by PlayerController using capsule collision
@@ -181,20 +108,19 @@ int PhysicsSystem::getTotalCollisionFaces() const
 }
 
 // ============================================================================
-// CAPSULE COLLISION SYSTEM
+// CAPSULE COLLISION SYSTEM - VOXEL-BASED OPTIMIZATION
 // ============================================================================
 // Capsule is a cylinder with hemispherical caps on top and bottom
 // Perfect for humanoid character collision (narrow width, proper height)
+//
+// OPTIMIZATION: Instead of iterating 10K-100K collision faces (slow at 256^3 chunks),
+// we query voxels within the capsule AABB, then only test faces for solid voxels.
+// This reduces checks from O(all_faces) to O(voxels_in_capsule_bounds).
 
 bool PhysicsSystem::checkChunkCapsuleCollision(const VoxelChunk* chunk, const Vec3& capsuleCenter,
                                                const Vec3& /*chunkWorldPos*/, Vec3& outNormal,
                                                float radius, float height)
 {
-    // Get collision mesh (thread-safe atomic load)
-    auto collisionMesh = chunk->getCollisionMesh();
-    if (!collisionMesh)
-        return false;
-    
     // Capsule breakdown:
     // - Total height: height
     // - Cylinder height: height - 2*radius (middle section)
@@ -205,87 +131,155 @@ bool PhysicsSystem::checkChunkCapsuleCollision(const VoxelChunk* chunk, const Ve
     Vec3 topSphereCenter = capsuleCenter + Vec3(0, cylinderHalfHeight, 0);
     Vec3 bottomSphereCenter = capsuleCenter - Vec3(0, cylinderHalfHeight, 0);
     
-    for (const auto& face : collisionMesh->faces)
+    // Calculate AABB of capsule in chunk-local voxel coordinates
+    float capsuleHalfHeight = height * 0.5f;
+    int minX = static_cast<int>(std::floor(capsuleCenter.x - radius));
+    int maxX = static_cast<int>(std::ceil(capsuleCenter.x + radius));
+    int minY = static_cast<int>(std::floor(capsuleCenter.y - capsuleHalfHeight));
+    int maxY = static_cast<int>(std::ceil(capsuleCenter.y + capsuleHalfHeight));
+    int minZ = static_cast<int>(std::floor(capsuleCenter.z - radius));
+    int maxZ = static_cast<int>(std::ceil(capsuleCenter.z + radius));
+    
+    // Clamp to chunk bounds
+    minX = std::max(0, minX);
+    maxX = std::min(VoxelChunk::SIZE - 1, maxX);
+    minY = std::max(0, minY);
+    maxY = std::min(VoxelChunk::SIZE - 1, maxY);
+    minZ = std::max(0, minZ);
+    maxZ = std::min(VoxelChunk::SIZE - 1, maxZ);
+    
+    // VOXEL-BASED CULLING: Only check voxels within capsule AABB
+    // This replaces iterating 100K faces with checking ~10-50 voxels
+    for (int x = minX; x <= maxX; ++x)
     {
-        Vec3 faceToCenter = capsuleCenter - face.position;
-        float distanceToPlane = faceToCenter.dot(face.normal);
-        
-        // Check if capsule intersects this face's plane
-        // For a capsule, we need to check:
-        // 1. The cylindrical middle section (XZ circle at multiple Y heights)
-        // 2. The top hemisphere
-        // 3. The bottom hemisphere
-        
-        // Quick reject: if center is too far from plane
-        if (abs(distanceToPlane) > (height * 0.5f + 0.1f))
-            continue;
-        
-        // Determine which part of the capsule to test based on face position
-        Vec3 closestPointOnAxis;
-        
-        // Project face position onto capsule's vertical axis
-        float yOffset = (face.position.y - capsuleCenter.y);
-        
-        if (yOffset > cylinderHalfHeight)
+        for (int y = minY; y <= maxY; ++y)
         {
-            // Check top hemisphere
-            closestPointOnAxis = topSphereCenter;
-        }
-        else if (yOffset < -cylinderHalfHeight)
-        {
-            // Check bottom hemisphere
-            closestPointOnAxis = bottomSphereCenter;
-        }
-        else
-        {
-            // Check cylinder - clamp to cylinder height
-            closestPointOnAxis = capsuleCenter + Vec3(0, yOffset, 0);
-        }
-        
-        // Now do sphere-to-face test from closestPointOnAxis
-        Vec3 faceToPoint = closestPointOnAxis - face.position;
-        float distToPlane = faceToPoint.dot(face.normal);
-        
-        if (abs(distToPlane) <= radius)
-        {
-            // Project point onto face plane
-            Vec3 projectedPoint = closestPointOnAxis - face.normal * distToPlane;
-            Vec3 localPoint = projectedPoint - face.position;
-            
-            // Check if projected point overlaps with face bounds (using greedy merged dimensions)
-            float halfWidth = face.width * 0.5f;
-            float halfHeight = face.height * 0.5f;
-            
-            bool withinBounds = true;
-            if (abs(face.normal.x) > 0.5f)
+            for (int z = minZ; z <= maxZ; ++z)
             {
-                // X-facing face - check YZ bounds (width=Z, height=Y)
-                withinBounds = (abs(localPoint.y) <= (halfHeight + radius)) && 
-                              (abs(localPoint.z) <= (halfWidth + radius));
-            }
-            else if (abs(face.normal.z) > 0.5f)
-            {
-                // Z-facing face - check XY bounds (width=X, height=Y)
-                withinBounds = (abs(localPoint.x) <= (halfWidth + radius)) && 
-                              (abs(localPoint.y) <= (halfHeight + radius));
-            }
-            else
-            {
-                // Y-facing face - check XZ bounds (width=X, height=Z)
-                withinBounds = (abs(localPoint.x) <= (halfWidth + radius)) && 
-                              (abs(localPoint.z) <= (halfHeight + radius));
-            }
-            
-            if (withinBounds)
-            {
-                outNormal = face.normal;
-                return true;
+                // Skip air blocks
+                uint8_t blockType = chunk->getVoxel(x, y, z);
+                if (blockType == 0)
+                    continue;
+                
+                // Skip OBJ/model blocks (they don't have collision - decorative only)
+                auto& registry = BlockTypeRegistry::getInstance();
+                const BlockTypeInfo* blockInfo = registry.getBlockType(blockType);
+                if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
+                    continue;  // OBJ blocks are decorative - no collision
+                }
+                
+                // Found solid voxel - do precise capsule-to-AABB collision
+                Vec3 voxelMin(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+                Vec3 voxelMax = voxelMin + Vec3(1.0f, 1.0f, 1.0f);
+                
+                // Find closest point on voxel AABB to capsule axis
+                Vec3 closestPointOnAxis;
+                
+                // Determine which part of capsule to test
+                float voxelCenterY = voxelMin.y + 0.5f;
+                float yOffset = voxelCenterY - capsuleCenter.y;
+                
+                if (yOffset > cylinderHalfHeight)
+                {
+                    closestPointOnAxis = topSphereCenter;
+                }
+                else if (yOffset < -cylinderHalfHeight)
+                {
+                    closestPointOnAxis = bottomSphereCenter;
+                }
+                else
+                {
+                    closestPointOnAxis = capsuleCenter + Vec3(0, yOffset, 0);
+                }
+                
+                // Find closest point on AABB to capsule axis point
+                Vec3 closestPointOnAABB(
+                    std::max(voxelMin.x, std::min(closestPointOnAxis.x, voxelMax.x)),
+                    std::max(voxelMin.y, std::min(closestPointOnAxis.y, voxelMax.y)),
+                    std::max(voxelMin.z, std::min(closestPointOnAxis.z, voxelMax.z))
+                );
+                
+                // Check if closest point is within capsule radius
+                Vec3 delta = closestPointOnAABB - closestPointOnAxis;
+                float distSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+                
+                if (distSq <= radius * radius)
+                {
+                    // Collision detected - calculate penetration normal
+                    // Use closest point method for accurate push-out direction
+                    Vec3 penetrationVec = closestPointOnAxis - closestPointOnAABB;
+                    float penetrationDist = std::sqrt(penetrationVec.x * penetrationVec.x + 
+                                                     penetrationVec.y * penetrationVec.y + 
+                                                     penetrationVec.z * penetrationVec.z);
+                    
+                    if (penetrationDist > 0.0001f)
+                    {
+                        // Normal points from collision point toward capsule (push-out direction)
+                        outNormal = Vec3(penetrationVec.x / penetrationDist, 
+                                        penetrationVec.y / penetrationDist, 
+                                        penetrationVec.z / penetrationDist);
+                    }
+                    else
+                    {
+                        // Capsule center exactly on AABB surface - find nearest face
+                        // This handles the "stuck inside block" case
+                        Vec3 voxelCenter = voxelMin + Vec3(0.5f, 0.5f, 0.5f);
+                        Vec3 delta = closestPointOnAxis - voxelCenter;
+                        
+                        // Find the axis with largest absolute displacement
+                        float absX = std::abs(delta.x);
+                        float absY = std::abs(delta.y);
+                        float absZ = std::abs(delta.z);
+                        
+                        if (absX > absY && absX > absZ)
+                        {
+                            // Push out along X
+                            outNormal = Vec3(delta.x > 0 ? 1.0f : -1.0f, 0, 0);
+                        }
+                        else if (absY > absZ)
+                        {
+                            // Push out along Y
+                            outNormal = Vec3(0, delta.y > 0 ? 1.0f : -1.0f, 0);
+                        }
+                        else
+                        {
+                            // Push out along Z
+                            outNormal = Vec3(0, 0, delta.z > 0 ? 1.0f : -1.0f);
+                        }
+                    }
+                    
+                    return true;
+                }
             }
         }
     }
     
     return false;
 }
+
+// OLD APPROACH (KEPT FOR REFERENCE - DELETE AFTER TESTING):
+// This iterated ALL collision faces (10K-100K at 256^3 chunks)
+// New approach checks only voxels within capsule AABB (~10-50 voxels)
+/*
+bool PhysicsSystem::checkChunkCapsuleCollision_OLD_FACE_ITERATION(const VoxelChunk* chunk, const Vec3& capsuleCenter,
+                                               float radius, float height)
+{
+    auto collisionMesh = chunk->getCollisionMesh();
+    if (!collisionMesh)
+        return false;
+    
+    float cylinderHalfHeight = (height - 2.0f * radius) * 0.5f;
+    Vec3 topSphereCenter = capsuleCenter + Vec3(0, cylinderHalfHeight, 0);
+    Vec3 bottomSphereCenter = capsuleCenter - Vec3(0, cylinderHalfHeight, 0);
+    
+    for (const auto& face : collisionMesh->faces)
+    {
+        // ... old face iteration logic ...
+    }
+    
+    return false;
+}
+*/
 
 bool PhysicsSystem::checkCapsuleCollision(const Vec3& capsuleCenter, float radius, float height,
                                          Vec3& outNormal, const FloatingIsland** outIsland)

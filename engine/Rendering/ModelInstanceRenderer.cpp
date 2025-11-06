@@ -82,7 +82,7 @@ void main(){
     vec4 world = uModel * vec4(aPos + windOffset + aInstance.xyz, 1.0);
     gl_Position = uProjection * uView * world;
     vUV = aUV;
-    vNormalWS = mat3(uModel) * aNormal;
+    vNormalWS = normalize(mat3(transpose(inverse(uModel))) * aNormal);
     vWorldPos = world.xyz;
     vLightSpacePos = uLightVP * world;
     vViewZ = -(uView * world).z;
@@ -114,7 +114,7 @@ void main(){
     vec4 world = uModel * vec4(aPos + aInstance.xyz, 1.0);
     gl_Position = uProjection * uView * world;
     vUV = aUV;
-    vNormalWS = mat3(uModel) * aNormal;
+    vNormalWS = normalize(mat3(transpose(inverse(uModel))) * aNormal);
     vWorldPos = world.xyz;
     vLightSpacePos = uLightVP * world;
     vViewZ = -(uView * world).z;
@@ -163,14 +163,14 @@ const vec2 POISSON[32] = vec2[32](
 
 float sampleShadowPCF(float bias)
 {
-    // Select cascade based on view-space depth
-    // Use far cascade (index 1) starting at 64 blocks for smooth transitions
-    int cascadeIndex = 0;
+    // Hard cascade switch with overlap zone
+    // Near cascade: 0-128 blocks (high detail)
+    // Far cascade: 32+ blocks (low detail, large coverage)
+    // Overlap zone: 32-128 blocks (both render, near wins)
     float viewDepth = abs(vViewZ);
     
-    if (viewDepth > 64.0) {
-        cascadeIndex = 1;  // Far cascade starts at 64 blocks
-    }
+    // Use near cascade if within 128 blocks
+    int cascadeIndex = (viewDepth <= 128.0) ? 0 : 1;
     
     // Transform to light space for selected cascade
     vec4 lightSpacePos = uCascadeVP[cascadeIndex] * vec4(vWorldPos, 1.0);
@@ -184,10 +184,8 @@ float sampleShadowPCF(float bias)
     float current = proj.z - bias;
     
     // Adjust PCF radius based on cascade to maintain consistent world-space blur
-    // Near cascade (256 units): use 128 pixel radius
-    // Far cascade (2048 units): scale down radius to maintain same world-space coverage
-    float baseRadius = 128.0;
-    float radiusScale = (cascadeIndex == 0) ? 1.0 : 0.125;  // 1/8 for far cascade (256/2048)
+    float baseRadius = 512.0;
+    float radiusScale = (cascadeIndex == 0) ? 1.0 : 0.125;  // 1/8 for far cascade
     float radius = baseRadius * radiusScale * uShadowTexel;
     
     // Sample center first using array shadow sampler
@@ -215,7 +213,7 @@ void main(){
     vec3 N = normalize(vNormalWS);
     vec3 L = normalize(-uLightDir);
     float ndotl = max(dot(N, L), 0.0);
-    float bias = max(0.0, 0.0002 * (1.0 - ndotl));
+    float bias = max(0.0, 0.0001 * (1.0 - ndotl));
     
     float visibility = sampleShadowPCF(bias);
 

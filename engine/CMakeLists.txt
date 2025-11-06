@@ -18,6 +18,7 @@ add_library(engine STATIC
     World/VoronoiIslandPlacer.cpp
     World/AsyncMeshGenerator.cpp
     World/BiomeSystem.cpp
+    World/TreeGenerator.cpp
     
     # Rendering systems
     Rendering/InstancedQuadRenderer.cpp  # GPU instanced quad renderer with shared unit quad
@@ -27,7 +28,10 @@ add_library(engine STATIC
     Rendering/ModelInstanceRenderer.cpp
     Rendering/BlockHighlightRenderer.cpp
     Rendering/GBuffer.cpp               # Deferred rendering G-buffer
+    Rendering/HDRFramebuffer.cpp        # HDR framebuffer for proper lighting pipeline
+    Rendering/SkyRenderer.cpp           # Sky gradient and sun disc rendering
     Rendering/DeferredLightingPass.cpp  # Deferred lighting shader
+    Rendering/PostProcessingPipeline.cpp  # Post-processing effects (godrays, tone mapping)
     Assets/GLBLoader.cpp
     
     # Input systems

@@ -94,14 +94,6 @@ float DayNightController::getSunIntensity() const {
     }
 }
 
-float DayNightController::getAmbientIntensity() const {
-    float sunIntensity = getSunIntensity();
-    
-    // Ambient is lower than sun intensity
-    // Night: 0.1, Day: 0.3
-    return 0.1f + (sunIntensity * 0.2f);
-}
-
 float DayNightController::smoothTransition(float t) const {
     // Smoothstep function for smooth transitions
     t = std::clamp(t, 0.0f, 1.0f);

@@ -50,10 +50,7 @@ private:
     // G-buffer shader (deferred rendering)
     GLuint m_gbufferProgram;
     GLint m_gbuffer_uViewProjection;
-    GLint m_gbuffer_uTextureStone;
-    GLint m_gbuffer_uTextureDirt;
-    GLint m_gbuffer_uTextureGrass;
-    GLint m_gbuffer_uTextureSand;
+    GLint m_gbuffer_uBlockTextures;
     
     // Depth-only shader for shadow map rendering
     GLuint m_depthProgram;
@@ -62,10 +59,7 @@ private:
     // Uniform locations
     GLint m_uViewProjection;
     GLint m_uView;
-    GLint m_uTextureStone;
-    GLint m_uTextureDirt;
-    GLint m_uTextureGrass;
-    GLint m_uTextureSand;
+    GLint m_uBlockTextures;
     
     // CSM/PCF shadow uniforms
     GLint m_uShadowMap;
@@ -98,6 +92,7 @@ private:
     GLuint m_globalInstanceVBO;      // Merged instance data for all chunks
     GLuint m_indirectCommandBuffer;  // GPU buffer for draw commands
     GLuint m_transformSSBO;          // Chunk transforms for shader lookup
+    GLuint m_blockTextureArray;      // Texture array for all blocks
     
     bool m_mdiDirty;                 // True when buffers need rebuild
     size_t m_totalAllocatedInstances; // Total buffer capacity (with padding)
@@ -107,6 +102,7 @@ private:
     void createShader();
     void createGBufferShader();
     void createDepthShader();
+    bool loadBlockTextureArray();  // Load all block textures into texture array
     GLuint compileShader(const char* source, GLenum type);
     void uploadChunkInstances(ChunkEntry& entry);
     void rebuildMDIBuffers();  // Rebuild merged buffers for MDI (full)

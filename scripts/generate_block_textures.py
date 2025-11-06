@@ -70,6 +70,64 @@ BLOCK_TEXTURES = {
         "recipe": "Mossy ground cover - forest biomes"
     },
     
+    # Wood/Tree blocks
+    "wood_oak": {
+        "base_color": (139, 90, 43),
+        "variation": 20,
+        "noise_scale": 0.25,
+        "pattern": "wood_bark",
+        "recipe": "Oak tree trunk - brown bark"
+    },
+    "wood_birch": {
+        "base_color": (220, 220, 200),
+        "variation": 15,
+        "noise_scale": 0.2,
+        "pattern": "wood_bark",
+        "recipe": "Birch tree trunk - white bark"
+    },
+    "wood_pine": {
+        "base_color": (90, 70, 50),
+        "variation": 18,
+        "noise_scale": 0.22,
+        "pattern": "wood_bark",
+        "recipe": "Pine tree trunk - dark bark"
+    },
+    "wood_jungle": {
+        "base_color": (100, 70, 40),
+        "variation": 22,
+        "noise_scale": 0.28,
+        "pattern": "wood_bark",
+        "recipe": "Jungle tree trunk - rough bark"
+    },
+    "wood_palm": {
+        "base_color": (160, 130, 90),
+        "variation": 18,
+        "noise_scale": 0.3,
+        "pattern": "wood_bark",
+        "recipe": "Palm tree trunk - segmented"
+    },
+    "leaves_green": {
+        "base_color": (40, 120, 30),
+        "variation": 30,
+        "noise_scale": 0.4,
+        "pattern": "leaves",
+        "recipe": "Green tree leaves - oak/birch"
+    },
+    "leaves_dark": {
+        "base_color": (25, 80, 25),
+        "variation": 28,
+        "noise_scale": 0.38,
+        "pattern": "leaves",
+        "recipe": "Dark green leaves - pine/jungle"
+    },
+    "leaves_palm": {
+        "base_color": (60, 140, 40),
+        "variation": 25,
+        "noise_scale": 0.35,
+        "pattern": "leaves",
+        "recipe": "Palm fronds - tropical"
+    },
+    
     # Ice/Snow biome blocks
     "ice": {
         "base_color": (200, 220, 255),
@@ -534,6 +592,63 @@ def generate_fluid_pattern(width, height, base_color, variation, noise_scale, gl
     return img
 
 
+def generate_wood_bark_pattern(width, height, base_color, variation, noise_scale):
+    """Generate wood bark texture with vertical grain"""
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    noise = perlin_noise_2d(width, height, noise_scale, octaves=5)
+    
+    # Vertical grain pattern
+    vertical_grain = np.zeros((height, width))
+    for y in range(height):
+        for x in range(width):
+            # Add vertical streaks
+            vertical_grain[y, x] = np.sin(x * 0.8 + noise[y, x] * 3) * 0.3
+    
+    for y in range(height):
+        for x in range(width):
+            n = noise[y, x]
+            grain = vertical_grain[y, x]
+            
+            # Combine noise and grain
+            total = n + grain
+            
+            r = int(np.clip(base_color[0] + (total - 0.5) * variation * 2, 0, 255))
+            g = int(np.clip(base_color[1] + (total - 0.5) * variation * 2, 0, 255))
+            b = int(np.clip(base_color[2] + (total - 0.5) * variation * 2, 0, 255))
+            img[y, x] = [r, g, b]
+    
+    return img
+
+
+def generate_leaves_pattern(width, height, base_color, variation, noise_scale):
+    """Generate leaf texture with transparency effect (darker = more transparent)"""
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    noise = perlin_noise_2d(width, height, noise_scale, octaves=6)
+    
+    # Add clumpy leaf pattern
+    clump_noise = perlin_noise_2d(width, height, 0.2, octaves=3)
+    
+    for y in range(height):
+        for x in range(width):
+            n = noise[y, x]
+            clump = clump_noise[y, x]
+            
+            # Create leaf gaps (will appear darker)
+            if clump < 0.3:
+                # Gap between leaves - much darker
+                brightness = 0.4
+            else:
+                # Leaf surface with variation
+                brightness = 0.8 + n * 0.4
+            
+            r = int(np.clip(base_color[0] * brightness, 0, 255))
+            g = int(np.clip(base_color[1] * brightness, 0, 255))
+            b = int(np.clip(base_color[2] * brightness, 0, 255))
+            img[y, x] = [r, g, b]
+    
+    return img
+
+
 def generate_texture(block_name, config, width=32, height=32):
     """Generate a single texture based on configuration"""
     pattern = config["pattern"]
@@ -559,6 +674,10 @@ def generate_texture(block_name, config, width=32, height=32):
     elif pattern == "fluid":
         glow = config.get("glow", False)
         img_array = generate_fluid_pattern(width, height, base_color, variation, noise_scale, glow)
+    elif pattern == "wood_bark":
+        img_array = generate_wood_bark_pattern(width, height, base_color, variation, noise_scale)
+    elif pattern == "leaves":
+        img_array = generate_leaves_pattern(width, height, base_color, variation, noise_scale)
     else:
         # Default to organic
         img_array = generate_organic_pattern(width, height, base_color, variation, noise_scale)

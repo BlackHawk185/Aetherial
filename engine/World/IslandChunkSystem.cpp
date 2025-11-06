@@ -14,6 +14,7 @@
 
 #include "VoxelChunk.h"
 #include "BlockType.h"
+#include "TreeGenerator.h"
 #include "AsyncMeshGenerator.h"
 #include "../Profiling/Profiler.h"
 #include "../Rendering/InstancedQuadRenderer.h"
@@ -333,25 +334,9 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
             
             if (finalDensity > densityThreshold)
             {
-                // Determine block type based on biome and depth from surface
-                uint8_t blockType = palette.deepBlock;  // Default to deep block
-                
-                // Calculate approximate depth from surface
-                float surfaceDist = radius - distanceFromCenter;
-                
-                if (surfaceDist < 3.0f)
-                {
-                    // Top 3 voxels: surface block
-                    blockType = palette.surfaceBlock;
-                }
-                else if (surfaceDist < 8.0f)
-                {
-                    // Next 5 voxels: subsurface block
-                    blockType = palette.subsurfaceBlock;
-                }
-                // else: use deep block (already set)
-                
-                setBlockIDWithAutoChunk(islandID, neighbor, blockType);
+                // Initially place all blocks as deep blocks
+                // We'll determine the correct surface/subsurface blocks in a second pass
+                setBlockIDWithAutoChunk(islandID, neighbor, palette.deepBlock);
                 frontier.push(neighbor);
                 voxelsGenerated++;
             }
@@ -365,51 +350,179 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
               << island->chunks.size() << " chunks)" << std::endl;
     std::cout << "   └─ Positions Sampled: " << voxelsSampled << " (connectivity-aware)" << std::endl;
     
-    // TEMPORARILY DISABLED: Grass decoration pass
-    // auto decorationStart = std::chrono::high_resolution_clock::now();
-    // 
-    // int grassPlaced = 0;
-    // 
-    // // Direct chunk iteration - we already have the island pointer, no locks needed
-    // for (auto& [chunkCoord, chunk] : island->chunks) {
-    //     if (!chunk) continue;
-    //     
-    //     // Scan each voxel in this chunk
-    //     for (int z = 0; z < VoxelChunk::SIZE; ++z) {
-    //         for (int x = 0; x < VoxelChunk::SIZE; ++x) {
-    //             for (int y = VoxelChunk::SIZE - 1; y >= 0; --y) {  // Scan top-down
-    //                 uint8_t blockID = chunk->getVoxel(x, y, z);
-    //                 if (blockID == BlockID::AIR) continue;
-    //                 
-    //                 // Found solid block - check if surface is exposed
-    //                 if (y + 1 < VoxelChunk::SIZE) {
-    //                     uint8_t blockAbove = chunk->getVoxel(x, y + 1, z);
-    //                     if (blockAbove == BlockID::AIR && (std::rand() % 100) < 25) {
-    //                         chunk->setVoxel(x, y + 1, z, BlockID::DECOR_GRASS);
-    //                         grassPlaced++;
-    //                     }
-    //                 } else {
-    //                     // Edge of chunk - check neighboring chunk above (rare case)
-    //                     Vec3 aboveChunkCoord = chunkCoord + Vec3(0, 1, 0);
-    //                     auto itAbove = island->chunks.find(aboveChunkCoord);
-    //                     if (itAbove != island->chunks.end() && itAbove->second) {
-    //                         uint8_t blockAbove = itAbove->second->getVoxel(x, 0, z);
-    //                         if (blockAbove == BlockID::AIR && (std::rand() % 100) < 25) {
-    //                             itAbove->second->setVoxel(x, 0, z, BlockID::DECOR_GRASS);
-    //                             grassPlaced++;
-    //                         }
-    //                     }
-    //                 }
-    //                 
-    //                 break;  // Found topmost solid block in this column, move to next
-    //             }
-    //         }
-    //     }
-    // }
-    // 
-    // auto decorationEnd = std::chrono::high_resolution_clock::now();
-    // auto decorationDuration = std::chrono::duration_cast<std::chrono::milliseconds>(decorationEnd - decorationStart).count();
-    // std::cout << "🌿 Decoration: " << decorationDuration << "ms (" << grassPlaced << " grass)" << std::endl;
+    // **SURFACE DETECTION PASS**
+    // Now that all voxels are placed, determine which should be surface/subsurface blocks
+    auto surfacePassStart = std::chrono::high_resolution_clock::now();
+    int surfaceBlocksPlaced = 0;
+    int subsurfaceBlocksPlaced = 0;
+    
+    static const Vec3 checkNeighbors[6] = {
+        Vec3(1, 0, 0), Vec3(-1, 0, 0),
+        Vec3(0, 1, 0), Vec3(0, -1, 0),
+        Vec3(0, 0, 1), Vec3(0, 0, -1)
+    };
+    
+    // Iterate through all chunks and check each solid block
+    for (auto& [chunkCoord, chunk] : island->chunks)
+    {
+        if (!chunk) continue;
+        
+        for (int lz = 0; lz < VoxelChunk::SIZE; ++lz)
+        {
+            for (int ly = 0; ly < VoxelChunk::SIZE; ++ly)
+            {
+                for (int lx = 0; lx < VoxelChunk::SIZE; ++lx)
+                {
+                    uint8_t currentBlock = chunk->getVoxel(lx, ly, lz);
+                    if (currentBlock == BlockID::AIR) continue;
+                    if (currentBlock != palette.deepBlock) continue;  // Only process deep blocks
+                    
+                    // Calculate world position
+                    Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(lx, ly, lz);
+                    
+                    // Check if any neighbor is air (exposed surface)
+                    bool isExposed = false;
+                    for (const Vec3& delta : checkNeighbors)
+                    {
+                        Vec3 neighborPos = worldPos + delta;
+                        uint8_t neighborBlock = getBlockIDInIsland(islandID, neighborPos);
+                        if (neighborBlock == BlockID::AIR)
+                        {
+                            isExposed = true;
+                            break;
+                        }
+                    }
+                    
+                    if (isExposed)
+                    {
+                        // This is a surface block - replace with surface block type
+                        chunk->setVoxel(lx, ly, lz, palette.surfaceBlock);
+                        surfaceBlocksPlaced++;
+                    }
+                    else
+                    {
+                        // Check if any neighbor is a surface block (1 layer deep)
+                        bool nearSurface = false;
+                        for (const Vec3& delta : checkNeighbors)
+                        {
+                            Vec3 neighborPos = worldPos + delta;
+                            uint8_t neighborBlock = getBlockIDInIsland(islandID, neighborPos);
+                            if (neighborBlock == palette.surfaceBlock)
+                            {
+                                nearSurface = true;
+                                break;
+                            }
+                        }
+                        
+                        if (nearSurface)
+                        {
+                            // This is a subsurface block (1 layer below surface)
+                            chunk->setVoxel(lx, ly, lz, palette.subsurfaceBlock);
+                            subsurfaceBlocksPlaced++;
+                        }
+                        // else: remains deep block
+                    }
+                }
+            }
+        }
+    }
+    
+    auto surfacePassEnd = std::chrono::high_resolution_clock::now();
+    auto surfacePassDuration = std::chrono::duration_cast<std::chrono::milliseconds>(surfacePassEnd - surfacePassStart).count();
+    
+    std::cout << "🎨 Surface Detection: " << surfacePassDuration << "ms (" 
+              << surfaceBlocksPlaced << " surface, " 
+              << subsurfaceBlocksPlaced << " subsurface)" << std::endl;
+    
+    // **VEGETATION DECORATION PASS**
+    // Place grass GLB models and voxel trees based on biome vegetation density
+    auto decorationStart = std::chrono::high_resolution_clock::now();
+    
+    int grassPlaced = 0;
+    int treesPlaced = 0;
+    
+    // Use biome-specific vegetation density - SPARSE trees for Terralith-like feel
+    float grassChance = palette.vegetationDensity * 30.0f;  // Convert to percentage (0-30%)
+    float treeChance = palette.vegetationDensity * 1.5f;    // Much sparser trees (0-1.5%)
+    
+    // Direct chunk iteration - we already have the island pointer, no locks needed
+    for (auto& [chunkCoord, chunk] : island->chunks) {
+        if (!chunk) continue;
+        
+        // Scan each voxel in this chunk
+        for (int z = 0; z < VoxelChunk::SIZE; ++z) {
+            for (int x = 0; x < VoxelChunk::SIZE; ++x) {
+                for (int y = VoxelChunk::SIZE - 1; y >= 0; --y) {  // Scan top-down
+                    uint8_t blockID = chunk->getVoxel(x, y, z);
+                    if (blockID == BlockID::AIR) continue;
+                    
+                    // Found solid block - check if surface is exposed (only place on surface blocks)
+                    if (blockID != palette.surfaceBlock) {
+                        break;  // Not a surface block, skip this column
+                    }
+                    
+                    if (y + 1 < VoxelChunk::SIZE) {
+                        uint8_t blockAbove = chunk->getVoxel(x, y + 1, z);
+                        if (blockAbove == BlockID::AIR) {
+                            float roll = (std::rand() % 100);
+                            
+                            // Calculate world position for tree placement
+                            Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(x, y + 1, z);
+                            
+                            // Place voxel tree (rarer)
+                            if (roll < treeChance) {
+                                // Use world position as seed for variety
+                                uint32_t treeSeed = static_cast<uint32_t>(
+                                    static_cast<int>(worldPos.x) * 73856093 ^ 
+                                    static_cast<int>(worldPos.y) * 19349663 ^ 
+                                    static_cast<int>(worldPos.z) * 83492791
+                                );
+                                TreeGenerator::generateTree(this, islandID, worldPos, treeSeed, palette.vegetationDensity);
+                                treesPlaced++;
+                            }
+                            // Place grass GLB (more common)
+                            else if (roll < grassChance) {
+                                chunk->setVoxel(x, y + 1, z, BlockID::DECOR_GRASS);
+                                grassPlaced++;
+                            }
+                        }
+                    } else {
+                        // Edge of chunk - check neighboring chunk above (rare case)
+                        Vec3 aboveChunkCoord = chunkCoord + Vec3(0, 1, 0);
+                        auto itAbove = island->chunks.find(aboveChunkCoord);
+                        if (itAbove != island->chunks.end() && itAbove->second) {
+                            uint8_t blockAbove = itAbove->second->getVoxel(x, 0, z);
+                            if (blockAbove == BlockID::AIR) {
+                                float roll = (std::rand() % 100);
+                                Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(x, y + 1, z);
+                                
+                                if (roll < treeChance) {
+                                    uint32_t treeSeed = static_cast<uint32_t>(
+                                        static_cast<int>(worldPos.x) * 73856093 ^ 
+                                        static_cast<int>(worldPos.y) * 19349663 ^ 
+                                        static_cast<int>(worldPos.z) * 83492791
+                                    );
+                                    TreeGenerator::generateTree(this, islandID, worldPos, treeSeed, palette.vegetationDensity);
+                                    treesPlaced++;
+                                }
+                                else if (roll < grassChance) {
+                                    itAbove->second->setVoxel(x, 0, z, BlockID::DECOR_GRASS);
+                                    grassPlaced++;
+                                }
+                            }
+                        }
+                    }
+                    
+                    break;  // Found topmost solid block in this column, move to next
+                }
+            }
+        }
+    }
+    
+    auto decorationEnd = std::chrono::high_resolution_clock::now();
+    auto decorationDuration = std::chrono::duration_cast<std::chrono::milliseconds>(decorationEnd - decorationStart).count();
+    std::cout << "🌿 Vegetation: " << decorationDuration << "ms (" 
+              << grassPlaced << " grass, " << treesPlaced << " trees)" << std::endl;
     
     // Chunks will be registered with renderer when client receives them via network
     // (Don't register here - renderer may not exist yet, and this violates separation of concerns)
