@@ -11,10 +11,12 @@
 #include "../Time/DayNightController.h"  // NEW: Simplified day/night cycle
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 // Forward declarations
-class GameState;
+class ClientWorld;
 class BlockHighlightRenderer;
+class FluidParticleRenderer;
 class HUD;
 class PeriodicTableUI;
 struct GLFWwindow;
@@ -31,7 +33,7 @@ namespace Engine { namespace Rendering { class VoxelRenderer; } }
  * The client can either:
  * 1. Connect to a local GameServer (integrated mode)
  * 2. Connect to a remote server (client-only mode)
- * 3. Work with a shared GameState directly (current transition mode)
+ * 3. Work with a shared ClientWorld directly (current transition mode)
  */
 
 /**
@@ -41,7 +43,7 @@ namespace Engine { namespace Rendering { class VoxelRenderer; } }
  * The client can either:
  * 1. Connect to a local GameServer (integrated mode)
  * 2. Connect to a remote server (client-only mode)
- * 3. Work with a shared GameState directly (current transition mode)
+ * 3. Work with a shared ClientWorld directly (current transition mode)
  */
 class GameClient {
 public:
@@ -58,10 +60,10 @@ public:
     bool initialize(bool enableDebug = false);
     
     /**
-     * Connect to a game state (local or remote)
-     * @param gameState - The game state to render (can be local server)
+     * Connect to a client world (local or remote)
+     * @param clientWorld - The client world to render (can be local)
      */
-    bool connectToGameState(GameState* gameState);
+    bool connectToClientWorld(ClientWorld* clientWorld);
     
     /**
      * Connect to a remote server
@@ -123,8 +125,8 @@ private:
     int m_windowWidth = 1280;
     int m_windowHeight = 720;
     
-    // Game state connection
-    GameState* m_gameState = nullptr;  // Not owned by client
+    // Client world connection
+    ClientWorld* m_clientWorld = nullptr;  // Not owned by client
     
     // Client-side physics (separate from server)
     PhysicsSystem m_clientPhysics;
@@ -137,6 +139,7 @@ private:
     PlayerController m_playerController;
     FrustumCuller m_frustumCuller;
     std::unique_ptr<BlockHighlightRenderer> m_blockHighlighter;
+    std::unique_ptr<FluidParticleRenderer> m_fluidParticleRenderer;
     std::unique_ptr<HUD> m_hud;
     std::unique_ptr<PeriodicTableUI> m_periodicTableUI;
     
@@ -148,7 +151,7 @@ private:
     
     // Shadow update throttling - render shadows every Nth frame
     uint32_t m_frameCounter = 0;
-    uint32_t m_shadowUpdateInterval = 2;  // Update shadows every 2 frames (half rate)
+    uint32_t m_shadowUpdateInterval = 1;  // Update shadows every frame (was 2 - caused grain)
     
     // Input state
     struct InputState {
@@ -157,6 +160,15 @@ private:
         float raycastTimer = 0.0f;
         RayHit cachedTargetBlock;  // Cache raycast results for performance
     } m_inputState;
+    
+    // Client-side prediction tracking
+    struct PendingVoxelChange {
+        uint32_t islandID;
+        Vec3 localPos;
+        uint8_t predictedType;
+        uint8_t previousType;  // For rollback if server rejects
+    };
+    std::unordered_map<uint32_t, PendingVoxelChange> m_pendingVoxelChanges;  // sequenceNumber -> change
     
     // NEW: Element-based crafting system
     ElementQueue m_elementQueue;

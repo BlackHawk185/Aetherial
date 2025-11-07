@@ -105,12 +105,6 @@ private:
     bool m_isGrounded = false;
     bool m_jumpPressed = false;
     
-    // Step-up state
-    bool m_isStepping = false;          // Currently performing a step-up animation
-    float m_stepProgress = 0.0f;        // Progress through step animation (0-1)
-    float m_stepTargetHeight = 0.0f;    // Height we're stepping up to
-    float m_stepStartHeight = 0.0f;     // Y position when step started
-    
     // Movement settings
     float m_moveSpeed = 30.0f;          // Walk speed (adjusted 1.5x for larger world scale)
     float m_jumpStrength = 8.0f;       // Jump velocity (adjusted 1.5x for larger world scale)
@@ -124,10 +118,7 @@ private:
     float m_capsuleRadius = 0.55f;      // Horizontal radius (requires 2-block gap, won't fit through 1)
     float m_capsuleHeight = 3.0f;       // Total height including caps
     float m_eyeHeightOffset = 1.2f;     // Eye level above physics center (90% of height)
-    float m_climbSpeed = 3.0f;          // Vertical climbing speed (hold space against wall)
     float m_maxStepHeight = 1.1f;       // Maximum height the player can step up (1 block + margin)
-    float m_stepDuration = 0.5f;        // Time to complete a step-up animation (seconds)
-    float m_stepSlowdown = 0.5f;        // Speed multiplier during step-up (50% speed)
     
     // Debug modes
     bool m_noclipMode = false;          // Debug: disable physics

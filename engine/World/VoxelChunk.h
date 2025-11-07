@@ -87,6 +87,9 @@ class VoxelChunk
     uint8_t getVoxel(int x, int y, int z) const;
     void setVoxel(int x, int y, int z, uint8_t type);
     
+    // SERVER-ONLY: Direct voxel data modification without triggering mesh updates
+    void setVoxelDataDirect(int x, int y, int z, uint8_t type);
+    
     // Block type access using IDs (for debugging only)
     uint8_t getBlockID(int x, int y, int z) const { return getVoxel(x, y, z); }
     void setBlockID(int x, int y, int z, uint8_t blockID) { setVoxel(x, y, z, blockID); }

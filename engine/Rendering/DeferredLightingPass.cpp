@@ -34,117 +34,109 @@ uniform sampler2D gPosition;
 uniform sampler2D gMetadata;
 uniform sampler2D gDepth;
 
-// Shadow mapping
-uniform sampler2DArrayShadow uShadowMap;
-uniform float uShadowTexel;
-uniform mat4 uCascadeVP[2];
+// Light mapping (dark by default, lit where depth test passes)
+uniform sampler2DArrayShadow uLightMap;  // 4 cascades: [0,1]=sun, [2,3]=moon
+uniform float uLightTexel;
+uniform mat4 uCascadeVP[4];
 uniform int uNumCascades;
+uniform float uCascadeOrthoSizes[4];
+uniform float uDitherStrength;
 
 // Lighting
 uniform vec3 uSunDir;
+uniform vec3 uMoonDir;
+uniform float uSunIntensity;
+uniform float uMoonIntensity;
 uniform vec3 uCameraPos;
 
 out vec4 FragColor;
 
-// Cascade distance constants (in world units/blocks)
-const float NEAR_CASCADE_END = 128.0;
-const float FAR_CASCADE_START = 32.0;
+// Cascade split: hard cutoff at 128 blocks (no blending)
+const float CASCADE_SPLIT = 128.0;
 
-// Poisson disk for PCF soft shadows (32 samples)
-const vec2 POISSON[32] = vec2[32](
-    vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725),
-    vec2(-0.09418410, -0.92938870), vec2(0.34495938, 0.29387760),
-    vec2(-0.91588581, 0.45771432), vec2(-0.81544232, -0.87912464),
-    vec2(-0.38277543, 0.27676845), vec2(0.97484398, 0.75648379),
-    vec2(0.44323325, -0.97511554), vec2(0.53742981, -0.47373420),
-    vec2(-0.26496911, -0.41893023), vec2(0.79197514, 0.19090188),
-    vec2(-0.24188840, 0.99706507), vec2(-0.81409955, 0.91437590),
-    vec2(0.19984126, 0.78641367), vec2(0.14383161, -0.14100790),
-    vec2(-0.41086680, -0.70708370), vec2(0.70117795, -0.14753070),
-    vec2(0.03019430, 0.43220600), vec2(-0.58688340, 0.09974030),
-    vec2(0.85595560, -0.33380990), vec2(-0.67121580, 0.59433670),
-    vec2(0.29770330, -0.60421660), vec2(-0.10860150, 0.61185800),
-    vec2(0.69197035, -0.06798679), vec2(-0.97010720, 0.16373110),
-    vec2(0.06372385, 0.37408390), vec2(-0.63902735, -0.56419730),
-    vec2(0.56546623, 0.25234550), vec2(-0.23892370, 0.51662970),
-    vec2(0.13814290, 0.98162460), vec2(-0.46671060, 0.16780830)
+// Poisson disk for PCF soft lighting (64 samples)
+const vec2 POISSON[64] = vec2[64](
+    vec2(-0.613392, 0.617481), vec2(0.170019, -0.040254), vec2(-0.299417, 0.791925),
+    vec2(0.645680, 0.493210), vec2(-0.651784, 0.717887), vec2(0.421003, 0.027070),
+    vec2(-0.817194, -0.271096), vec2(-0.705374, -0.668203), vec2(0.977050, -0.108615),
+    vec2(0.063326, 0.142369), vec2(0.203528, 0.214331), vec2(-0.667531, 0.326090),
+    vec2(-0.098422, -0.295755), vec2(-0.885922, 0.215369), vec2(0.566637, 0.605213),
+    vec2(0.039766, -0.396100), vec2(0.751946, 0.453352), vec2(0.078707, -0.715323),
+    vec2(-0.075838, -0.529344), vec2(0.724479, -0.580798), vec2(0.222999, -0.215125),
+    vec2(-0.467574, -0.405438), vec2(-0.248268, -0.814753), vec2(0.354411, -0.887570),
+    vec2(0.175817, 0.382366), vec2(0.487472, -0.063082), vec2(-0.084078, 0.898312),
+    vec2(0.488876, -0.783441), vec2(0.470016, 0.217933), vec2(-0.696890, -0.549791),
+    vec2(-0.149693, 0.605762), vec2(0.034211, 0.979980), vec2(0.503098, -0.308878),
+    vec2(-0.016205, -0.872921), vec2(0.385784, -0.393902), vec2(-0.146886, -0.859249),
+    vec2(0.643361, 0.164098), vec2(0.634388, -0.049471), vec2(-0.688894, 0.007843),
+    vec2(0.464034, -0.188818), vec2(-0.440840, 0.137486), vec2(0.364483, 0.511704),
+    vec2(0.034028, 0.325968), vec2(0.099094, -0.308023), vec2(0.693960, -0.366253),
+    vec2(0.678884, -0.204688), vec2(0.001801, 0.780328), vec2(0.145177, -0.898984),
+    vec2(0.062655, -0.611866), vec2(0.315226, -0.604297), vec2(-0.780145, 0.486251),
+    vec2(-0.371868, 0.882138), vec2(0.200476, 0.494430), vec2(-0.494552, -0.711051),
+    vec2(0.612476, 0.705252), vec2(-0.578845, -0.768792), vec2(-0.772454, -0.090976),
+    vec2(0.504440, 0.372295), vec2(0.155736, 0.065157), vec2(0.391522, 0.849605),
+    vec2(-0.620106, -0.328104), vec2(0.789239, -0.419965), vec2(-0.545396, 0.538133),
+    vec2(-0.178564, -0.596057)
 );
 
-float sampleShadowPCF(vec3 worldPos, float bias) {
-    // Hard cascade cutoffs with overlap zone
-    // Near cascade: 0-128 blocks (hard cutoff at 128)
-    // Far cascade: starts at 32 blocks
-    // Overlap zone: 32-128 blocks (both render, near wins)
-    float distFromCamera = length(worldPos - uCameraPos);
+float sampleCascade(int cascadeIndex, vec3 worldPos, float bias) {
+    vec4 lightSpacePos = uCascadeVP[cascadeIndex] * vec4(worldPos, 1.0);
+    vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
+    proj = proj * 0.5 + 0.5;
     
-    bool useNear = (distFromCamera <= NEAR_CASCADE_END);
-    bool useFar = (distFromCamera >= FAR_CASCADE_START);
-    bool inOverlap = (distFromCamera >= FAR_CASCADE_START && distFromCamera <= NEAR_CASCADE_END);
+    // Out of bounds - return -1.0 to signal invalid
+    if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0 || proj.z > 1.0)
+        return -1.0;
     
-    float shadow = 1.0;
+    float current = proj.z - bias;
     
-    // Sample near cascade if applicable
-    if (useNear) {
-        vec4 lightSpacePos0 = uCascadeVP[0] * vec4(worldPos, 1.0);
-        vec3 proj0 = lightSpacePos0.xyz / lightSpacePos0.w;
-        proj0 = proj0 * 0.5 + 0.5;
-        
-        if (proj0.x >= 0.0 && proj0.x <= 1.0 && proj0.y >= 0.0 && proj0.y <= 1.0 && proj0.z <= 1.0) {
-            float current = proj0.z - bias;
-            float radius = 128.0 * uShadowTexel;
-            
-            float center = texture(uShadowMap, vec4(proj0.xy, 0, current));
-            if (center > 0.99) {
-                shadow = 1.0;
-            } else {
-                shadow = center;
-                for (int i = 0; i < 32; ++i) {
-                    vec2 offset = POISSON[i] * radius;
-                    shadow += texture(uShadowMap, vec4(proj0.xy + offset, 0, current));
-                }
-                shadow /= 33.0;
-            }
-        }
-        
-        // If not in overlap zone, return near cascade result
-        if (!inOverlap) {
-            return shadow;
-        }
+    // Calculate cascade pair base index (sun cascades = 0,1; moon cascades = 2,3)
+    int baseCascade = (cascadeIndex / 2) * 2;
+    float baseRadius = 512.0;
+    float radiusScale = (cascadeIndex % 2 == 0) ? 1.0 : (uCascadeOrthoSizes[baseCascade] / uCascadeOrthoSizes[baseCascade + 1]);
+    float radius = baseRadius * radiusScale * uLightTexel;
+    
+    float lightValue = 0.0;
+    for (int i = 0; i < 64; ++i) {
+        vec2 offset = POISSON[i] * radius;
+        lightValue += texture(uLightMap, vec4(proj.xy + offset, cascadeIndex, current));
     }
+    return lightValue / 64.0;
+}
+
+// Sample light for sun (cascades 0 and 1)
+float sampleSunLight(vec3 worldPos, float bias) {
+    float lightNear = sampleCascade(0, worldPos, bias);
+    float lightFar = sampleCascade(1, worldPos, bias);
     
-    // Sample far cascade if applicable
-    if (useFar) {
-        float farShadow = 1.0;
-        vec4 lightSpacePos1 = uCascadeVP[1] * vec4(worldPos, 1.0);
-        vec3 proj1 = lightSpacePos1.xyz / lightSpacePos1.w;
-        proj1 = proj1 * 0.5 + 0.5;
-        
-        if (proj1.x >= 0.0 && proj1.x <= 1.0 && proj1.y >= 0.0 && proj1.y <= 1.0 && proj1.z <= 1.0) {
-            float current = proj1.z - bias;
-            float radius = 128.0 * 0.125 * uShadowTexel;
-            
-            float center = texture(uShadowMap, vec4(proj1.xy, 1, current));
-            if (center > 0.99) {
-                farShadow = 1.0;
-            } else {
-                farShadow = center;
-                for (int i = 0; i < 32; ++i) {
-                    vec2 offset = POISSON[i] * radius;
-                    farShadow += texture(uShadowMap, vec4(proj1.xy + offset, 1, current));
-                }
-                farShadow /= 33.0;
-            }
-        }
-        
-        // In overlap zone, combine both cascades (multiply for darker shadows)
-        if (inOverlap) {
-            return shadow * farShadow;
-        } else {
-            return farShadow;
-        }
+    bool nearValid = (lightNear >= 0.0);
+    bool farValid = (lightFar >= 0.0);
+    
+    if (nearValid) {
+        return lightNear;
+    } else if (farValid) {
+        return lightFar;
+    } else {
+        return 0.0;  // Dark by default
     }
+}
+
+// Sample light for moon (cascades 2 and 3)
+float sampleMoonLight(vec3 worldPos, float bias) {
+    float lightNear = sampleCascade(2, worldPos, bias);
+    float lightFar = sampleCascade(3, worldPos, bias);
     
-    return shadow;
+    bool nearValid = (lightNear >= 0.0);
+    bool farValid = (lightFar >= 0.0);
+    
+    if (nearValid) {
+        return lightNear;
+    } else if (farValid) {
+        return lightFar;
+    } else {
+        return 0.0;  // Dark by default
+    }
 }
 
 void main() {
@@ -157,16 +149,29 @@ void main() {
     
     // Skip pixels with no geometry (depth = 1.0) - let sky pass handle background
     if (depth >= 0.9999) {
-        discard;  // Don't render anything for empty pixels
+        discard;
     }
     
-    // Shadow mapping only - no Lambert, no ambient
-    float bias = 0.0;
-    float shadowFactor = sampleShadowPCF(worldPos, bias);
+    vec3 N = normalize(normal);
     
-    // Final color: albedo modulated by shadow map ONLY
-    // Dark by default (shadowFactor = 0), lit only where shadow map says so
-    vec3 finalColor = albedo * shadowFactor;
+    // Sample sun light
+    vec3 L_sun = normalize(-uSunDir);
+    float ndotl_sun = max(dot(N, L_sun), 0.0);
+    float bias_sun = max(0.0005, 0.001 * (1.0 - ndotl_sun));
+    float sunLightFactor = sampleSunLight(worldPos, bias_sun);
+    
+    // Sample moon light
+    vec3 L_moon = normalize(-uMoonDir);
+    float ndotl_moon = max(dot(N, L_moon), 0.0);
+    float bias_moon = max(0.0005, 0.001 * (1.0 - ndotl_moon));
+    float moonLightFactor = sampleMoonLight(worldPos, bias_moon);
+    
+    // Combine sun and moon lighting (additive, moon is much dimmer)
+    vec3 sunContribution = albedo * sunLightFactor * uSunIntensity;
+    vec3 moonContribution = albedo * moonLightFactor * uMoonIntensity * 0.15;  // Moon is 15% as bright
+    
+    // Final color: dark by default, lit only where light maps indicate
+    vec3 finalColor = sunContribution + moonContribution;
     
     FragColor = vec4(finalColor, 1.0);
 }
@@ -209,8 +214,12 @@ void main() {
 }
 
 DeferredLightingPass::DeferredLightingPass() {
-    m_cascadeSplits[0] = 128.0f;
-    m_cascadeSplits[1] = 1000.0f;
+    // Sun cascades
+    m_cascadeSplits[0] = 128.0f;    // Sun near
+    m_cascadeSplits[1] = 1000.0f;   // Sun far
+    // Moon cascades
+    m_cascadeSplits[2] = 128.0f;    // Moon near
+    m_cascadeSplits[3] = 1000.0f;   // Moon far
 }
 
 DeferredLightingPass::~DeferredLightingPass() {
@@ -244,11 +253,16 @@ bool DeferredLightingPass::initialize() {
     m_loc_gPosition = glGetUniformLocation(m_shader, "gPosition");
     m_loc_gMetadata = glGetUniformLocation(m_shader, "gMetadata");
     m_loc_gDepth = glGetUniformLocation(m_shader, "gDepth");
-    m_loc_shadowMap = glGetUniformLocation(m_shader, "uShadowMap");
+    m_loc_lightMap = glGetUniformLocation(m_shader, "uLightMap");
     m_loc_sunDir = glGetUniformLocation(m_shader, "uSunDir");
+    m_loc_moonDir = glGetUniformLocation(m_shader, "uMoonDir");
+    m_loc_sunIntensity = glGetUniformLocation(m_shader, "uSunIntensity");
+    m_loc_moonIntensity = glGetUniformLocation(m_shader, "uMoonIntensity");
     m_loc_cameraPos = glGetUniformLocation(m_shader, "uCameraPos");
     m_loc_numCascades = glGetUniformLocation(m_shader, "uNumCascades");
-    m_loc_shadowTexel = glGetUniformLocation(m_shader, "uShadowTexel");
+    m_loc_lightTexel = glGetUniformLocation(m_shader, "uLightTexel");
+    m_loc_cascadeOrthoSizes = glGetUniformLocation(m_shader, "uCascadeOrthoSizes");
+    m_loc_ditherStrength = glGetUniformLocation(m_shader, "uDitherStrength");
     
     // Create full-screen quad
     float quadVertices[] = {
@@ -286,14 +300,16 @@ void DeferredLightingPass::shutdown() {
     if (m_shader) { glDeleteProgram(m_shader); m_shader = 0; }
 }
 
-void DeferredLightingPass::setCascadeData(int index, const glm::mat4& viewProj, float splitDistance) {
-    if (index >= 0 && index < 2) {
+void DeferredLightingPass::setCascadeData(int index, const glm::mat4& viewProj, float splitDistance, float orthoSize) {
+    if (index >= 0 && index < 4) {
         m_cascadeVP[index] = viewProj;
         m_cascadeSplits[index] = splitDistance;
+        m_cascadeOrthoSizes[index] = orthoSize;
     }
 }
 
-void DeferredLightingPass::render(const glm::vec3& sunDirection, const glm::vec3& cameraPosition) {
+void DeferredLightingPass::render(const glm::vec3& sunDirection, const glm::vec3& moonDirection,
+                                  float sunIntensity, float moonIntensity, const glm::vec3& cameraPosition) {
     // Bind HDR framebuffer for output
     g_hdrFramebuffer.bind();
     g_hdrFramebuffer.clear();
@@ -310,26 +326,39 @@ void DeferredLightingPass::render(const glm::vec3& sunDirection, const glm::vec3
     if (m_loc_gMetadata >= 0) glUniform1i(m_loc_gMetadata, 3);
     if (m_loc_gDepth >= 0) glUniform1i(m_loc_gDepth, 4);
     
-    // Bind shadow map
+    // Bind light map (4 cascades: sun near, sun far, moon near, moon far)
     glActiveTexture(GL_TEXTURE5);
     glBindTexture(GL_TEXTURE_2D_ARRAY, g_shadowMap.getDepthTexture());
-    if (m_loc_shadowMap >= 0) glUniform1i(m_loc_shadowMap, 5);
+    if (m_loc_lightMap >= 0) glUniform1i(m_loc_lightMap, 5);
     
     // Set lighting uniforms
     if (m_loc_sunDir >= 0) glUniform3fv(m_loc_sunDir, 1, &sunDirection[0]);
+    if (m_loc_moonDir >= 0) glUniform3fv(m_loc_moonDir, 1, &moonDirection[0]);
+    if (m_loc_sunIntensity >= 0) glUniform1f(m_loc_sunIntensity, sunIntensity);
+    if (m_loc_moonIntensity >= 0) glUniform1f(m_loc_moonIntensity, moonIntensity);
     if (m_loc_cameraPos >= 0) glUniform3fv(m_loc_cameraPos, 1, &cameraPosition[0]);
     if (m_loc_numCascades >= 0) glUniform1i(m_loc_numCascades, g_shadowMap.getNumCascades());
     
-    float shadowTexel = 1.0f / static_cast<float>(g_shadowMap.getSize());
-    if (m_loc_shadowTexel >= 0) glUniform1f(m_loc_shadowTexel, shadowTexel);
+    float lightTexel = 1.0f / static_cast<float>(g_shadowMap.getSize());
+    if (m_loc_lightTexel >= 0) glUniform1f(m_loc_lightTexel, lightTexel);
     
-    // Set cascade matrices
-    for (int i = 0; i < 2; ++i) {
+    // Set cascade matrices (4 cascades)
+    for (int i = 0; i < 4; ++i) {
         std::string uniformName = "uCascadeVP[" + std::to_string(i) + "]";
         GLint loc = glGetUniformLocation(m_shader, uniformName.c_str());
         if (loc >= 0) {
             glUniformMatrix4fv(loc, 1, GL_FALSE, &m_cascadeVP[i][0][0]);
         }
+    }
+    
+    // Set cascade ortho sizes for proper PCF radius scaling (4 cascades)
+    if (m_loc_cascadeOrthoSizes >= 0) {
+        glUniform1fv(m_loc_cascadeOrthoSizes, 4, m_cascadeOrthoSizes);
+    }
+    
+    // Set dither strength for shadow sampling
+    if (m_loc_ditherStrength >= 0) {
+        glUniform1f(m_loc_ditherStrength, m_ditherStrength);
     }
     
     // Disable depth testing for full-screen quad

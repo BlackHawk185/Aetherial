@@ -51,7 +51,7 @@ void main() {
     // - Chromatic aberration
     // - Film grain
     // - Color grading
-    // - FXAA/TAA
+    // - FXAA
     
     FragColor = vec4(ldrColor, 1.0);
 }

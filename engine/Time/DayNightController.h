@@ -29,8 +29,9 @@ public:
     
     // Lighting information
     Vec3 getSunDirection() const;          // Current sun direction vector (for shadow casting)
-    Vec3 getMoonDirection() const;         // Moon is opposite the sun
+    Vec3 getMoonDirection() const;         // Independent moon direction vector
     float getSunIntensity() const;         // 0.0 (night) to 1.0 (midday)
+    float getMoonIntensity() const;        // 0.0 (day) to 1.0 (midnight)
     
     // Sky colors for rendering
     struct SkyColors {
@@ -63,8 +64,13 @@ private:
     float m_timeSpeed;        // Time multiplier (default 60x = 24min day)
     bool m_paused;
     
+    // Moon state - independent from sun
+    float m_moonPhase;        // 0.0-29.53 days (lunar month cycle)
+    float m_moonOrbitSpeed;   // Moon orbital speed multiplier
+    
     // Internal calculations
     float calculateSunAngle() const;      // Angle in radians for sun position
+    float calculateMoonAngle() const;     // Angle in radians for moon position
     float smoothTransition(float t) const; // Smoothstep for transitions
 };
 

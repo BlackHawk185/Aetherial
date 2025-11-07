@@ -14,6 +14,8 @@ DayNightController::DayNightController()
     : m_currentTime(12.0f)     // Start at noon for nice lighting
     , m_timeSpeed(600.0f)       // 600x speed = 1 minute day cycle
     , m_paused(false)
+    , m_moonPhase(14.765f)      // Start moon ~180 degrees from sun (half lunar cycle)
+    , m_moonOrbitSpeed(1.0f / 29.53f)  // Moon takes 29.53 days to orbit (relative to sun's 1-day cycle)
 {
 }
 
@@ -32,7 +34,18 @@ void DayNightController::update(float deltaTime) {
         m_currentTime += 24.0f;
     }
     
-    // Sun direction and intensity calculated by CSM shadow system (no lightmap manager needed)
+    // Update moon phase (independent from sun, much slower orbit)
+    // Moon advances at 1/29.53 the rate of the sun
+    float moonIncrement = (timeIncrement / 24.0f) * m_moonOrbitSpeed * 29.53f;
+    m_moonPhase += moonIncrement;
+    
+    // Wrap moon phase around 29.53 day cycle
+    while (m_moonPhase >= 29.53f) {
+        m_moonPhase -= 29.53f;
+    }
+    while (m_moonPhase < 0.0f) {
+        m_moonPhase += 29.53f;
+    }
 }
 
 void DayNightController::setTimeOfDay(float hours) {
@@ -55,43 +68,75 @@ float DayNightController::calculateSunAngle() const {
     return sunAngle * (M_PI / 180.0f); // Convert to radians
 }
 
+float DayNightController::calculateMoonAngle() const {
+    // Moon has its own independent cycle (29.53 days)
+    // Map 0-29.53 days to 0-360 degrees
+    float moonAngle = (m_moonPhase / 29.53f) * 360.0f;
+    
+    // Offset so moon starts opposite the sun at initialization
+    moonAngle -= 90.0f;
+    
+    return moonAngle * (M_PI / 180.0f); // Convert to radians
+}
+
 Vec3 DayNightController::getSunDirection() const {
     float angle = calculateSunAngle();
     
     // Sun moves in an arc across the sky
-    // X and Z components create the arc, Y is elevation
+    // The sun should trace a single arc from east to west
+    // Y component is the elevation (up/down)
+    // X component is the horizontal movement (east/west)
     float elevation = std::sin(angle);
-    float azimuth = std::cos(angle);
+    float horizontalDistance = std::cos(angle);
     
     // Create directional vector (pointing FROM sun TO world, for lighting calculations)
+    // The sun rises in the east (positive X), moves overhead, sets in the west (negative X)
     Vec3 sunDir(
-        azimuth * 0.5f,     // East-West movement
-        -elevation,         // Up-Down (negative because light points down)
-        0.3f                // Slight north-south offset for interesting shadows
+        horizontalDistance,  // East-West movement along the arc
+        -elevation,          // Up-Down (negative because light points down)
+        0.0f                 // No north-south offset - keep sun on consistent path
     );
     
     return sunDir.normalized();
 }
 
 Vec3 DayNightController::getMoonDirection() const {
-    // Moon is opposite the sun
-    Vec3 sunDir = getSunDirection();
-    return Vec3(-sunDir.x, -sunDir.y, -sunDir.z);
+    float angle = calculateMoonAngle();
+    
+    // Moon moves in a different arc than the sun (independent orbital plane)
+    // To create a tilted orbital plane, we'll use a different approach than the sun
+    float elevation = std::sin(angle);
+    float horizontalDistance = std::cos(angle);
+    
+    // Create directional vector (pointing FROM moon TO world, for lighting calculations)
+    // Moon follows a similar but independent path on a slightly tilted plane
+    // Instead of Z offset, we'll tilt the entire arc by rotating around X axis slightly
+    Vec3 moonDir(
+        horizontalDistance,      // East-West movement along the arc
+        -elevation,              // Up-Down (negative because light points down)
+        0.0f                     // No Z offset to avoid dual moon issue
+    );
+    
+    return moonDir.normalized();
 }
 
 float DayNightController::getSunIntensity() const {
     float angle = calculateSunAngle();
     float elevation = std::sin(angle);
     
-    // Sun intensity based on elevation
-    // Full brightness when sun is high (noon), dim at sunrise/sunset, very dim at night
-    if (elevation > 0.0f) {
-        // Daytime: 0.5 to 1.0 intensity
-        return 0.5f + (elevation * 0.5f);
-    } else {
-        // Nighttime: very dim (for moonlight simulation)
-        return std::max(0.05f, elevation * 0.2f + 0.05f);
-    }
+    // Sun is always active, brightness varies with elevation
+    // Full brightness at zenith, dimmer near horizon, but never off
+    // Map -1 to 1 elevation to 0.3 to 1.0 intensity
+    return 0.3f + (elevation * 0.5f + 0.5f) * 0.7f;
+}
+
+float DayNightController::getMoonIntensity() const {
+    float angle = calculateMoonAngle();
+    float elevation = std::sin(angle);
+    
+    // Moon is always active, but much dimmer than sun
+    // Map -1 to 1 elevation to 0.05 to 0.2 intensity
+    return 0.05f + (elevation * 0.5f + 0.5f) * 0.15f;
 }
 
 float DayNightController::smoothTransition(float t) const {

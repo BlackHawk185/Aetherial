@@ -161,51 +161,52 @@ const vec2 POISSON[32] = vec2[32](
     vec2(0.13814290, 0.98162460), vec2(-0.46671060, 0.16780830)
 );
 
-float sampleShadowPCF(float bias)
-{
-    // Hard cascade switch with overlap zone
-    // Near cascade: 0-128 blocks (high detail)
-    // Far cascade: 32+ blocks (low detail, large coverage)
-    // Overlap zone: 32-128 blocks (both render, near wins)
-    float viewDepth = abs(vViewZ);
-    
-    // Use near cascade if within 128 blocks
-    int cascadeIndex = (viewDepth <= 128.0) ? 0 : 1;
-    
-    // Transform to light space for selected cascade
-    vec4 lightSpacePos = uCascadeVP[cascadeIndex] * vec4(vWorldPos, 1.0);
+// Cascade split: hard cutoff at 128 blocks (no blending)
+const float CASCADE_SPLIT = 128.0;
+
+// Interleaved gradient noise for Poisson disk rotation
+float interleavedGradientNoise(vec2 screenPos) {
+    vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
+    return fract(magic.z * fract(dot(screenPos, magic.xy)));
+}
+
+float sampleCascadePCF(int cascadeIndex, vec3 worldPos, float bias) {
+    vec4 lightSpacePos = uCascadeVP[cascadeIndex] * vec4(worldPos, 1.0);
     vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
     proj = proj * 0.5 + 0.5;
     
-    // If outside light frustum, surface receives NO light (dark by default)
+    // Out of bounds - return -1.0 to signal invalid
     if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0 || proj.z > 1.0)
-        return 0.0;
+        return -1.0;
     
     float current = proj.z - bias;
     
-    // Adjust PCF radius based on cascade to maintain consistent world-space blur
-    float baseRadius = 512.0;
-    float radiusScale = (cascadeIndex == 0) ? 1.0 : 0.125;  // 1/8 for far cascade
+    float baseRadius = 2048.0;
+    float radiusScale = (cascadeIndex == 0) ? 1.0 : 0.125;
     float radius = baseRadius * radiusScale * uShadowTexel;
     
-    // Sample center first using array shadow sampler
-    float center = texture(uShadowMap, vec4(proj.xy, cascadeIndex, current));
-    
-    // Early exit if fully lit - prevents shadow bleeding
-    if (center >= 1.0) {
-        return 1.0;
-    }
-    
-    // Poisson disk sampling
-    float sum = center;
-    for (int i = 0; i < 32; ++i) {
+    float sum = 0.0;
+    for (int i = 0; i < 64; ++i) {
         vec2 offset = POISSON[i] * radius;
-        float d = texture(uShadowMap, vec4(proj.xy + offset, cascadeIndex, current));
-        sum += d;
+        sum += texture(uShadowMap, vec4(proj.xy + offset, cascadeIndex, current));
     }
+    return sum / 64.0;
+}
+
+float sampleShadowPCF(float bias)
+{
+    // Sample both cascades
+    float shadowNear = sampleCascadePCF(0, vWorldPos, bias);
+    float shadowFar = sampleCascadePCF(1, vWorldPos, bias);
     
-    // Average and lighten-only
-    return max(center, sum / 33.0);  // 33 = 32 samples + 1 center
+    // Prefer near cascade if valid, otherwise use far
+    if (shadowNear >= 0.0) {
+        return shadowNear;
+    } else if (shadowFar >= 0.0) {
+        return shadowFar;
+    } else {
+        return 0.0;  // Both out of bounds - shadowed (don't create bright halos)
+    }
 }
 
 void main(){
@@ -471,8 +472,8 @@ bool ModelInstanceRenderer::loadModel(uint8_t blockID, const std::string& path) 
     }
     m_albedoTextures[blockID] = albedoTex;
     
-    // Special case: Load engine grass.png texture for grass block (BlockID::DECOR_GRASS = 13)
-    if (blockID == 13) {
+    // Special case: Load engine grass.png texture for grass block (BlockID::DECOR_GRASS = 102)
+    if (blockID == 102) {
         if (!g_textureManager) g_textureManager = new TextureManager();
         m_engineGrassTex = g_textureManager->getTexture("grass.png");
         if (m_engineGrassTex == 0) {
@@ -632,127 +633,6 @@ void ModelInstanceRenderer::updateModelMatrix(uint8_t blockID, VoxelChunk* chunk
     ensureChunkInstancesUploaded(blockID, chunk);
 }
 
-void ModelInstanceRenderer::renderAll(const glm::mat4& view, const glm::mat4& proj) {
-    // Update lighting once for all models
-    updateLightingIfNeeded();
-    
-    // Set global GL state once
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glDrawBuffer(GL_BACK);
-    glReadBuffer(GL_BACK);
-    glEnable(GL_DEPTH_TEST);
-    glDisable(GL_POLYGON_OFFSET_FILL);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    
-    // Disable culling once for foliage rendering
-    GLboolean wasCull = glIsEnabled(GL_CULL_FACE);
-    if (wasCull) glDisable(GL_CULL_FACE);
-    
-    // Extract camera position from view matrix for distance culling
-    glm::mat4 invView = glm::inverse(view);
-    glm::vec3 cameraPos = glm::vec3(invView[3]);
-    const float maxRenderDistance = 512.0f;  // LOD render limit for GLB objects
-    const float maxRenderDistanceSq = maxRenderDistance * maxRenderDistance;
-    
-    // Calculate shadow map data once
-    int numCascades = g_shadowMap.getNumCascades();
-    int shadowSize = g_shadowMap.getSize();
-    float shadowTexel = shadowSize > 0 ? (1.0f / float(shadowSize)) : (1.0f / 8192.0f);
-    
-    // Bind shadow map texture once (all shaders use same binding)
-    glActiveTexture(GL_TEXTURE7);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, g_shadowMap.getDepthTexture());
-    
-    // Iterate through each block type with loaded models
-    for (const auto& [blockID, model] : m_models) {
-        if (!model.valid) continue;
-        
-        // Get shader for this block type
-        auto shaderIt = m_shaders.find(blockID);
-        if (shaderIt == m_shaders.end()) continue;
-        GLuint shader = shaderIt->second;
-        
-        // Bind shader ONCE per block type
-        glUseProgram(shader);
-        
-        // Cache uniform locations for this shader
-        int loc_View = glGetUniformLocation(shader, "uView");
-        int loc_Proj = glGetUniformLocation(shader, "uProjection");
-        int loc_Model = glGetUniformLocation(shader, "uModel");
-        int loc_Time = glGetUniformLocation(shader, "uTime");
-        int loc_LightDir = glGetUniformLocation(shader, "uLightDir");
-        int loc_ShadowTexel = glGetUniformLocation(shader, "uShadowTexel");
-        int loc_ShadowMap = glGetUniformLocation(shader, "uShadowMap");
-        int loc_Texture = glGetUniformLocation(shader, "uGrassTexture");
-        int loc_NumCascades = glGetUniformLocation(shader, "uNumCascades");
-        
-        // Set uniforms that are constant across all chunks (ONCE per block type)
-        glUniformMatrix4fv(loc_View, 1, GL_FALSE, &view[0][0]);
-        glUniformMatrix4fv(loc_Proj, 1, GL_FALSE, &proj[0][0]);
-        glUniform1f(loc_Time, m_time);
-        glUniform3f(loc_LightDir, m_lightDir.x, m_lightDir.y, m_lightDir.z);
-        glUniform1f(loc_ShadowTexel, shadowTexel);
-        glUniform1i(loc_ShadowMap, 7);
-        glUniform1i(loc_NumCascades, numCascades);
-        
-        // Set cascade shadow map data ONCE per block type
-        for (int i = 0; i < numCascades; ++i) {
-            const CascadeData& cascade = g_shadowMap.getCascade(i);
-            std::string vpName = "uCascadeVP[" + std::to_string(i) + "]";
-            std::string splitName = "uCascadeSplits[" + std::to_string(i) + "]";
-            int loc_CascadeVP = glGetUniformLocation(shader, vpName.c_str());
-            int loc_CascadeSplit = glGetUniformLocation(shader, splitName.c_str());
-            glUniformMatrix4fv(loc_CascadeVP, 1, GL_FALSE, &cascade.viewProj[0][0]);
-            glUniform1f(loc_CascadeSplit, cascade.splitDistance);
-        }
-        
-        // Bind texture ONCE per block type
-        if (loc_Texture >= 0) {
-            glActiveTexture(GL_TEXTURE5);
-            GLuint tex = 0;
-            if (blockID == 13 && m_engineGrassTex) {  // 13 = BlockID::DECOR_GRASS
-                tex = m_engineGrassTex;
-            } else {
-                auto texIt = m_albedoTextures.find(blockID);
-                if (texIt != m_albedoTextures.end()) {
-                    tex = texIt->second;
-                }
-            }
-            if (tex) {
-                glBindTexture(GL_TEXTURE_2D, tex);
-                glUniform1i(loc_Texture, 5);
-            }
-        }
-        
-        // Now render ALL chunks that have instances of this block type
-        for (auto& [key, buf] : m_chunkInstances) {
-            // Only render chunks with this specific blockID
-            if (key.second != blockID) continue;
-            if (buf.count == 0) continue;
-            if (!buf.isUploaded) continue;
-            
-            // Distance culling: Extract chunk position from model matrix and check distance
-            glm::vec3 chunkPos = glm::vec3(buf.modelMatrix[3]);
-            glm::vec3 delta = cameraPos - chunkPos;
-            float distanceSq = glm::dot(delta, delta);
-            if (distanceSq > maxRenderDistanceSq) continue;  // Skip distant chunks
-            
-            // Set model matrix (this is the ONLY per-chunk uniform)
-            glUniformMatrix4fv(loc_Model, 1, GL_FALSE, &buf.modelMatrix[0][0]);
-            
-            // Render instanced models using per-chunk VAOs
-            for (size_t i = 0; i < buf.vaos.size() && i < model.primitives.size(); ++i) {
-                glBindVertexArray(buf.vaos[i]);
-                glDrawElementsInstanced(GL_TRIANGLES, model.primitives[i].indexCount, GL_UNSIGNED_INT, 0, buf.count);
-            }
-        }
-    }
-    
-    // Cleanup
-    glBindVertexArray(0);
-    if (wasCull) glEnable(GL_CULL_FACE);
-}
-
 void ModelInstanceRenderer::renderToGBuffer(const glm::mat4& view, const glm::mat4& proj) {
     // Disable culling for foliage rendering
     GLboolean wasCull = glIsEnabled(GL_CULL_FACE);
@@ -804,22 +684,32 @@ void ModelInstanceRenderer::renderToGBuffer(const glm::mat4& view, const glm::ma
         glUniformMatrix4fv(loc_Proj, 1, GL_FALSE, &proj[0][0]);
         glUniform1f(loc_Time, m_time);
         
-        // Bind texture
-        if (loc_Texture >= 0) {
+        // Bind texture - CRITICAL: Must bind before rendering or will sample wrong texture!
+        GLuint tex = 0;
+        if (blockID == 102 && m_engineGrassTex) {
+            tex = m_engineGrassTex;
+        } else {
+            auto texIt = m_albedoTextures.find(blockID);
+            if (texIt != m_albedoTextures.end()) {
+                tex = texIt->second;
+            }
+        }
+        
+        // Fallback: If no texture found, use a default texture (prevents sampling voxel array)
+        if (!tex) {
+            static GLuint fallbackTex = 0;
+            if (!fallbackTex) {
+                // Load fallback texture once (iron_block.png)
+                if (!g_textureManager) g_textureManager = new TextureManager();
+                fallbackTex = g_textureManager->getTexture("iron_block.png");
+            }
+            tex = fallbackTex;
+        }
+        
+        if (tex && loc_Texture >= 0) {
             glActiveTexture(GL_TEXTURE5);
-            GLuint tex = 0;
-            if (blockID == 13 && m_engineGrassTex) {
-                tex = m_engineGrassTex;
-            } else {
-                auto texIt = m_albedoTextures.find(blockID);
-                if (texIt != m_albedoTextures.end()) {
-                    tex = texIt->second;
-                }
-            }
-            if (tex) {
-                glBindTexture(GL_TEXTURE_2D, tex);
-                glUniform1i(loc_Texture, 5);
-            }
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glUniform1i(loc_Texture, 5);
         }
         
         // Render all chunks with this block type

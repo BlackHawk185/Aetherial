@@ -79,6 +79,16 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
     meshDirty = true; // Keep for backwards compatibility with generateMesh()
 }
 
+void VoxelChunk::setVoxelDataDirect(int x, int y, int z, uint8_t type)
+{
+    // SERVER-ONLY: Direct voxel data modification without any mesh operations
+    if (x < 0 || x >= SIZE || y < 0 || y >= SIZE || z < 0 || z >= SIZE)
+        return;
+    
+    voxels[x + y * SIZE + z * SIZE * SIZE] = type;
+    meshDirty = true;  // Mark dirty for consistency, but no mesh generation happens
+}
+
 void VoxelChunk::setRawVoxelData(const uint8_t* data, uint32_t size)
 {
     if (size != VOLUME)
@@ -185,8 +195,10 @@ void VoxelChunk::generateMesh(bool generateLighting)
     
     meshDirty = false;
     
-    // Enable incremental updates after first full mesh generation
-    m_incrementalUpdatesEnabled = true;
+    // Enable incremental updates after first full mesh generation (client-only)
+    if (m_isClientChunk) {
+        m_incrementalUpdatesEnabled = true;
+    }
     
     auto t_end = std::chrono::high_resolution_clock::now();
     

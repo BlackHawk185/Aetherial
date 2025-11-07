@@ -24,10 +24,7 @@ public:
     // Update chunk transform (for moving islands)
     void updateChunkTransform(VoxelChunk* chunk, const glm::mat4& transform);
     
-    // Render all registered chunks with CSM/PCF shadows
-    void render(const glm::mat4& viewProjection, const glm::mat4& view);
-    
-    // Render to G-buffer (deferred rendering)
+    // Render to G-buffer (deferred rendering - geometry only, lighting applied later)
     void renderToGBuffer(const glm::mat4& viewProjection, const glm::mat4& view);
     
     // Shadow depth pass (for casting shadows)
@@ -44,10 +41,7 @@ private:
     GLuint m_unitQuadVBO;
     GLuint m_unitQuadEBO;
     
-    // Shader program
-    GLuint m_shaderProgram;
-    
-    // G-buffer shader (deferred rendering)
+    // G-buffer shader (deferred rendering - writes geometry data only)
     GLuint m_gbufferProgram;
     GLint m_gbuffer_uViewProjection;
     GLint m_gbuffer_uBlockTextures;
@@ -55,17 +49,6 @@ private:
     // Depth-only shader for shadow map rendering
     GLuint m_depthProgram;
     GLint m_depth_uLightVP;
-    
-    // Uniform locations
-    GLint m_uViewProjection;
-    GLint m_uView;
-    GLint m_uBlockTextures;
-    
-    // CSM/PCF shadow uniforms
-    GLint m_uShadowMap;
-    GLint m_uShadowTexel;
-    GLint m_uLightDir;
-    GLint m_uCascadeVP;
     
     // MDI: DrawElementsIndirectCommand structure
     struct DrawElementsIndirectCommand {

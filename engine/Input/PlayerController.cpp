@@ -129,35 +129,9 @@ void PlayerController::updateNoclip(GLFWwindow* window, float deltaTime)
 void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, IslandChunkSystem* islandSystem, PhysicsSystem* physics)
 {
     PROFILE_FUNCTION();
-    (void)islandSystem; // Reserved for future island-specific physics interactions
     
     if (!physics)
         return; // Cannot update physics without physics system
-    
-    // ==========================================
-    // PHASE 0: UPDATE STEP-UP ANIMATION
-    // ==========================================
-    
-    if (m_isStepping)
-    {
-        m_stepProgress += deltaTime / m_stepDuration;
-        
-        if (m_stepProgress >= 1.0f)
-        {
-            // Step complete
-            m_isStepping = false;
-            m_stepProgress = 0.0f;
-        }
-        else
-        {
-            // Interpolate height during step
-            float t = m_stepProgress;
-            // Use smoothstep for smooth animation: 3t^2 - 2t^3
-            float smoothT = t * t * (3.0f - 2.0f * t);
-            float currentStepHeight = m_stepStartHeight + (m_stepTargetHeight - m_stepStartHeight) * smoothT;
-            m_physicsPosition.y = currentStepHeight;
-        }
-    }
     
     // ==========================================
     // PHASE 1: GATHER INPUT
@@ -170,13 +144,6 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
     if (!m_uiBlocking)
     {
         jumpThisFrame = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
-    }
-    
-    // If jumping, cancel any active step animation
-    if (jumpThisFrame && m_isStepping)
-    {
-        m_isStepping = false;
-        m_stepProgress = 0.0f;
     }
     
     // ==========================================
@@ -192,11 +159,8 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
     // PHASE 3: APPLY PHYSICS
     // ==========================================
     
-    // Apply gravity (not during stepping)
-    if (!m_isStepping)
-    {
-        m_playerVelocity.y -= m_gravity * deltaTime;
-    }
+    // Apply gravity
+    m_playerVelocity.y -= m_gravity * deltaTime;
     
     // Ground physics and jumping
     if (m_isGrounded)
@@ -219,29 +183,6 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
     }
     else
     {
-        // Check for climbing - if holding space in air and moving into a wall
-        if (jumpThisFrame && inputDirection.lengthSquared() > 0.01f)
-        {
-            // Try moving forward slightly to detect wall collision
-            Vec3 forwardTest = m_physicsPosition + (inputDirection.normalized() * 0.3f);
-            Vec3 climbNormal;
-            if (physics->checkCapsuleCollision(forwardTest, m_capsuleRadius, m_capsuleHeight, climbNormal, nullptr))
-            {
-                // Wall detected! Check if we can climb over it (max 3 blocks)
-                // Check 1 block forward and 1 block above player's top
-                Vec3 climbCheckPos = m_physicsPosition + (inputDirection.normalized() * 1.0f);
-                climbCheckPos.y += (m_capsuleHeight * 0.5f) + 1.0f; // Top of capsule + 1 block
-                
-                Vec3 topCheckNormal;
-                if (!physics->checkCapsuleCollision(climbCheckPos, m_capsuleRadius, m_capsuleHeight, topCheckNormal, nullptr))
-                {
-                    // No obstruction above - can climb!
-                    m_playerVelocity.y = m_climbSpeed;
-                }
-                // else: Wall is too tall (>3 blocks), don't allow climbing
-            }
-        }
-        
         // Apply air resistance
         m_playerVelocity.x *= m_airFriction;
         m_playerVelocity.z *= m_airFriction;
@@ -249,9 +190,9 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
     
     m_jumpPressed = jumpThisFrame;
     
-    // Apply input acceleration (with slowdown during stepping and in air)
+    // Apply input acceleration
     float controlStrength = m_isGrounded ? 1.0f : m_airControl;
-    float speedMultiplier = m_isStepping ? m_stepSlowdown : 1.0f;
+    float speedMultiplier = 1.0f;
     
     // Reduce max speed in air (70% of ground speed)
     if (!m_isGrounded) {
@@ -265,172 +206,62 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
     m_playerVelocity.x += velocityDelta.x;
     m_playerVelocity.z += velocityDelta.z;
     
-    // Calculate intended movement
-    Vec3 intendedMovement = m_playerVelocity * deltaTime;
-    
     // ==========================================
-    // PHASE 4: COLLISION DETECTION
+    // PHASE 4: UNIFIED COLLISION RESOLUTION
     // ==========================================
     
-    Vec3 intendedPosition = m_physicsPosition + intendedMovement;
+    // Use unified physics resolver with aggressive anti-stuck
+    // Player can step up 37% of their height (1.1 / 3.0 = 0.37)
+    float playerStepRatio = m_maxStepHeight / m_capsuleHeight; // ~0.37
+    m_physicsPosition = physics->resolveCapsuleMovement(
+        m_physicsPosition,
+        m_playerVelocity,
+        deltaTime,
+        m_capsuleRadius,
+        m_capsuleHeight,
+        playerStepRatio
+    );
     
-    Vec3 collisionNormal;
-    const FloatingIsland* collidingIsland = nullptr;
-    if (physics->checkCapsuleCollision(intendedPosition, m_capsuleRadius, m_capsuleHeight,
-                                       collisionNormal, &collidingIsland))
+    // ==========================================
+    // PHASE 5: ISLAND RIDING (if grounded)
+    // ==========================================
+    
+    if (m_isGrounded && groundInfo.standingOnIslandID != 0)
     {
-        // Collision detected - use axis-separated movement
-        Vec3 relativeMovement = intendedMovement;
-        
-        // Try axis-separated movement
-        // Process Y first to allow jumping/climbing to work smoothly
-        Vec3 testPos;
-        
-        // Try Y (vertical movement - jumping/falling/climbing)
-        testPos = m_physicsPosition + Vec3(0, relativeMovement.y, 0);
-        if (!physics->checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
+        FloatingIsland* island = islandSystem->getIsland(groundInfo.standingOnIslandID);
+        if (island)
         {
-            m_physicsPosition = testPos;
-        }
-        else
-        {
-            m_playerVelocity.y = 0;
-        }
-        
-        // Try X with step-up (includes unstuck logic)
-        testPos = m_physicsPosition + Vec3(relativeMovement.x, 0, 0);
-        if (!physics->checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
-        {
-            m_physicsPosition = testPos;
-        }
-        else
-        {
-            // Collision detected - try step-up
-            bool stepped = false;
+            // Apply linear velocity
+            m_physicsPosition = m_physicsPosition + (groundInfo.groundVelocity * deltaTime);
             
-            // Step-up works in TWO cases:
-            // 1. When grounded (normal terrain climbing)
-            // 2. When stuck inside terrain (unstuck mechanism - always enabled)
-            if (!m_isStepping) // Don't interrupt existing step
+            // Apply angular velocity (rotation around island center)
+            if (island->angularVelocity.lengthSquared() > 0.0001f)
             {
-                // Try stepping up in increments to find the minimum step height
-                // Use 0.4f increment (4x more aggressive) for faster unstuck
-                for (float stepHeight = 0.4f; stepHeight <= m_maxStepHeight; stepHeight += 0.4f)
-                {
-                    Vec3 stepUpPos = m_physicsPosition + Vec3(relativeMovement.x, stepHeight, 0);
-                    if (!physics->checkCapsuleCollision(stepUpPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
-                    {
-                        // Initialize step-up animation
-                        m_isStepping = true;
-                        m_stepProgress = 0.0f;
-                        m_stepStartHeight = m_physicsPosition.y;
-                        m_stepTargetHeight = m_physicsPosition.y + stepHeight;
-                        
-                        // Apply horizontal movement immediately
-                        m_physicsPosition.x += relativeMovement.x;
-                        stepped = true;
-                        break;
-                    }
-                }
-            }
-            
-            if (!stepped)
-            {
-                m_playerVelocity.x = 0;
-            }
-        }
-        
-        // Try Z with step-up (includes unstuck logic)
-        testPos = m_physicsPosition + Vec3(0, 0, relativeMovement.z);
-        if (!physics->checkCapsuleCollision(testPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
-        {
-            m_physicsPosition = testPos;
-        }
-        else
-        {
-            // Collision detected - try step-up
-            bool stepped = false;
-            
-            // Step-up works in TWO cases:
-            // 1. When grounded (normal terrain climbing)
-            // 2. When stuck inside terrain (unstuck mechanism - always enabled)
-            if (!m_isStepping) // Don't interrupt existing step
-            {
-                // Try stepping up in increments to find the minimum step height
-                for (float stepHeight = 0.1f; stepHeight <= m_maxStepHeight; stepHeight += 0.1f)
-                {
-                    Vec3 stepUpPos = m_physicsPosition + Vec3(0, stepHeight, relativeMovement.z);
-                    if (!physics->checkCapsuleCollision(stepUpPos, m_capsuleRadius, m_capsuleHeight, collisionNormal, nullptr))
-                    {
-                        // Initialize step-up animation
-                        m_isStepping = true;
-                        m_stepProgress = 0.0f;
-                        m_stepStartHeight = m_physicsPosition.y;
-                        m_stepTargetHeight = m_physicsPosition.y + stepHeight;
-                        
-                        // Apply horizontal movement immediately
-                        m_physicsPosition.z += relativeMovement.z;
-                        stepped = true;
-                        break;
-                    }
-                }
-            }
-            
-            if (!stepped)
-            {
-                m_playerVelocity.z = 0;
-            }
-        }
-        
-        // Apply island movement
-        if (collidingIsland)
-        {
-            m_physicsPosition = m_physicsPosition + (collidingIsland->velocity * deltaTime);
-        }
-    }
-    else
-    {
-        // No collision - move freely
-        m_physicsPosition = intendedPosition;
-        
-        // If grounded, move with the island (raycast-based riding)
-        if (m_isGrounded && groundInfo.standingOnIslandID != 0)
-        {
-            FloatingIsland* island = islandSystem->getIsland(groundInfo.standingOnIslandID);
-            if (island)
-            {
-                // Apply linear velocity
-                m_physicsPosition = m_physicsPosition + (groundInfo.groundVelocity * deltaTime);
+                // Get player's offset from island center
+                Vec3 offset = m_physicsPosition - island->physicsCenter;
                 
-                // Apply angular velocity (rotation around island center)
-                if (island->angularVelocity.lengthSquared() > 0.0001f)
-                {
-                    // Get player's offset from island center
-                    Vec3 offset = m_physicsPosition - island->physicsCenter;
-                    
-                    // Rotate offset around Y axis
-                    float angleChange = island->angularVelocity.y * deltaTime;
-                    float cosAngle = std::cos(angleChange);
-                    float sinAngle = std::sin(angleChange);
-                    
-                    Vec3 rotatedOffset;
-                    rotatedOffset.x = offset.x * cosAngle + offset.z * sinAngle;
-                    rotatedOffset.y = offset.y;
-                    rotatedOffset.z = -offset.x * sinAngle + offset.z * cosAngle;
-                    
-                    // Update position
-                    m_physicsPosition = island->physicsCenter + rotatedOffset;
-                    
-                    // Rotate camera yaw to match island rotation (negative because camera is inverted)
-                    m_camera.yaw -= angleChange * (180.0f / 3.14159265f);
-                    m_camera.updateCameraVectors();
-                }
+                // Rotate offset around Y axis
+                float angleChange = island->angularVelocity.y * deltaTime;
+                float cosAngle = std::cos(angleChange);
+                float sinAngle = std::sin(angleChange);
+                
+                Vec3 rotatedOffset;
+                rotatedOffset.x = offset.x * cosAngle + offset.z * sinAngle;
+                rotatedOffset.y = offset.y;
+                rotatedOffset.z = -offset.x * sinAngle + offset.z * cosAngle;
+                
+                // Update position
+                m_physicsPosition = island->physicsCenter + rotatedOffset;
+                
+                // Rotate camera yaw to match island rotation (negative because camera is inverted)
+                m_camera.yaw -= angleChange * (180.0f / 3.14159265f);
+                m_camera.updateCameraVectors();
             }
         }
     }
     
     // ==========================================
-    // PHASE 5: UPDATE PILOTING STATE
+    // PHASE 6: UPDATE PILOTING STATE
     // ==========================================
     
     if (m_isGrounded)

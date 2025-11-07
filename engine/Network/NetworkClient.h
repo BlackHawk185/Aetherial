@@ -29,7 +29,7 @@ public:
     
     // Send messages to server
     void sendMovementRequest(const Vec3& intendedPosition, const Vec3& velocity, float deltaTime);
-    void sendVoxelChangeRequest(uint32_t islandID, const Vec3& localPos, uint8_t voxelType);
+    uint32_t sendVoxelChangeRequest(uint32_t islandID, const Vec3& localPos, uint8_t voxelType);  // Returns sequence number
     void sendPilotingInput(uint32_t islandID, float thrustY, float rotationYaw);
     void sendToServer(const void* data, size_t size);
     

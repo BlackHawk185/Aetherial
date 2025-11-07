@@ -634,6 +634,42 @@ void IslandChunkSystem::setVoxelInIsland(uint32_t islandID, const Vec3& islandRe
     // to allow batch updates and neighbor chunk updates
 }
 
+void IslandChunkSystem::setVoxelDataOnly(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType)
+{
+    // SERVER-ONLY: Modify voxel data WITHOUT triggering any mesh operations
+    // This method directly modifies the voxel array and never calls chunk->setVoxel()
+    VoxelChunk* chunk = nullptr;
+    Vec3 localPos;
+    Vec3 chunkCoord;
+    {
+        std::lock_guard<std::mutex> lock(m_islandsMutex);
+        auto itIsl = m_islands.find(islandID);
+        if (itIsl == m_islands.end())
+            return;
+        FloatingIsland& island = itIsl->second;
+        chunkCoord = FloatingIsland::islandPosToChunkCoord(islandRelativePosition);
+        localPos = FloatingIsland::islandPosToLocalPos(islandRelativePosition);
+        std::unique_ptr<VoxelChunk>& chunkPtr = island.chunks[chunkCoord];
+        if (!chunkPtr)
+        {
+            chunkPtr = std::make_unique<VoxelChunk>();
+            chunkPtr->setIslandContext(islandID, chunkCoord);
+            chunkPtr->setIsClient(false);  // Server chunks are never client chunks
+        }
+        chunk = chunkPtr.get();
+    }
+
+    // Directly modify voxel data without calling chunk->setVoxel()
+    int x = static_cast<int>(localPos.x);
+    int y = static_cast<int>(localPos.y);
+    int z = static_cast<int>(localPos.z);
+    if (x < 0 || x >= VoxelChunk::SIZE || y < 0 || y >= VoxelChunk::SIZE || z < 0 || z >= VoxelChunk::SIZE)
+        return;
+    
+    // Use the direct data modification method (no mesh operations)
+    chunk->setVoxelDataDirect(x, y, z, voxelType);
+}
+
 void IslandChunkSystem::setVoxelWithAutoChunk(uint32_t islandID, const Vec3& islandRelativePos, uint8_t voxelType)
 {
     // Acquire chunk pointer under lock, then write outside the lock

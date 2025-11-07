@@ -1,6 +1,9 @@
 # Add all engine source files (including new systems)
 add_library(engine STATIC
     # Core systems (new modular architecture)
+    Core/SimulationState.cpp
+    Core/ServerWorld.cpp
+    Core/ClientWorld.cpp
     Core/GameState.cpp
     Core/GameServer.cpp
     Core/GameClient.cpp
@@ -19,6 +22,7 @@ add_library(engine STATIC
     World/AsyncMeshGenerator.cpp
     World/BiomeSystem.cpp
     World/TreeGenerator.cpp
+    World/FluidSystem.cpp
     
     # Rendering systems
     Rendering/InstancedQuadRenderer.cpp  # GPU instanced quad renderer with shared unit quad
@@ -27,10 +31,12 @@ add_library(engine STATIC
     Rendering/CascadedShadowMap.cpp
     Rendering/ModelInstanceRenderer.cpp
     Rendering/BlockHighlightRenderer.cpp
+    Rendering/FluidParticleRenderer.cpp  # Fluid particle visualization
     Rendering/GBuffer.cpp               # Deferred rendering G-buffer
     Rendering/HDRFramebuffer.cpp        # HDR framebuffer for proper lighting pipeline
     Rendering/SkyRenderer.cpp           # Sky gradient and sun disc rendering
     Rendering/DeferredLightingPass.cpp  # Deferred lighting shader
+    Rendering/ShadowBlur.cpp            # Bilateral blur for smooth shadows
     Rendering/PostProcessingPipeline.cpp  # Post-processing effects (godrays, tone mapping)
     Assets/GLBLoader.cpp
     

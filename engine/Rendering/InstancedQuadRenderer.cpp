@@ -15,198 +15,12 @@ std::unique_ptr<InstancedQuadRenderer> g_instancedQuadRenderer;
 extern ShadowMap g_shadowMap;
 extern DayNightController* g_dayNightController;
 
-// Vertex shader - MDI version with SSBO transform lookup
-static const char* VERTEX_SHADER = R"(
-#version 460 core
-
-// Unit quad vertex attributes (shared by all instances)
-layout(location = 0) in vec3 aPosition;  // -0.5 to 0.5 range
-
-// Instance attributes
-layout(location = 1) in vec3 aInstancePosition;
-layout(location = 2) in vec3 aInstanceNormal;
-layout(location = 3) in float aInstanceWidth;
-layout(location = 4) in float aInstanceHeight;
-layout(location = 5) in uint aInstanceBlockType;
-layout(location = 6) in uint aInstanceFaceDir;
-
-// Chunk transforms in SSBO (accessed via gl_DrawID)
-layout(std430, binding = 0) readonly buffer TransformBuffer {
-    mat4 chunkTransforms[];
-};
-
-// Uniforms
-uniform mat4 uViewProjection;
-
-// Outputs to fragment shader
-out vec2 TexCoord;
-out vec3 Normal;
-out vec3 WorldPos;
-flat out uint BlockType;
-flat out uint FaceDir;
-
-void main() {
-    // Get this chunk's transform using gl_DrawID (which draw command we're in)
-    mat4 uChunkTransform = chunkTransforms[gl_DrawID];
-    
-    // Scale unit quad by instance dimensions
-    vec3 scaledPos = vec3(
-        aPosition.x * aInstanceWidth,
-        aPosition.y * aInstanceHeight,
-        0.0
-    );
-    
-    // Rotate to align with face normal
-    // Face direction: 0=-Y, 1=+Y, 2=-Z, 3=+Z, 4=-X, 5=+X
-    vec3 rotatedPos;
-    if (aInstanceFaceDir == 0u) {
-        rotatedPos = vec3(scaledPos.x, 0.0, scaledPos.y);
-    } else if (aInstanceFaceDir == 1u) {
-        rotatedPos = vec3(-scaledPos.x, 0.0, scaledPos.y);
-    } else if (aInstanceFaceDir == 2u) {
-        rotatedPos = vec3(-scaledPos.x, scaledPos.y, 0.0);
-    } else if (aInstanceFaceDir == 3u) {
-        rotatedPos = vec3(scaledPos.x, scaledPos.y, 0.0);
-    } else if (aInstanceFaceDir == 4u) {
-        rotatedPos = vec3(0.0, scaledPos.y, scaledPos.x);
-    } else {
-        rotatedPos = vec3(0.0, scaledPos.y, -scaledPos.x);
-    }
-    
-    // Position is the face center - add rotated offset to get vertex position
-    vec3 localPos = aInstancePosition + rotatedPos;
-    
-    // Transform by chunk matrix, then view-projection
-    vec4 worldPos4 = uChunkTransform * vec4(localPos, 1.0);
-    WorldPos = worldPos4.xyz;
-    gl_Position = uViewProjection * worldPos4;
-    
-    // Texture coordinates
-    TexCoord = (aPosition.xy + 0.5) * vec2(aInstanceWidth, aInstanceHeight);
-    
-    // Pass through normal and block type
-    Normal = mat3(uChunkTransform) * aInstanceNormal;
-    BlockType = aInstanceBlockType;
-    FaceDir = aInstanceFaceDir;
-}
-)";
-
-// Fragment shader - Uses texture array for all block types
-static const char* FRAGMENT_SHADER = R"(
-#version 460 core
-
-in vec2 TexCoord;
-in vec3 Normal;
-in vec3 WorldPos;
-flat in uint BlockType;
-flat in uint FaceDir;
-
-uniform sampler2DArray uBlockTextures;  // Texture array with all block textures
-
-// Real-time shadow system (CSM/PCF)
-uniform sampler2DArrayShadow uShadowMap;  // Cascaded shadow map array
-uniform float uShadowTexel;
-uniform vec3 uLightDir;
-
-// Cascade uniforms
-uniform mat4 uCascadeVP[2];      // View-projection for each cascade
-uniform float uCascadeSplits[2];  // Split distances for cascades
-uniform int uNumCascades;         // Number of cascades (typically 2)
-
-// View matrix for view-space depth calculation
-uniform mat4 uView;
-
-out vec4 FragColor;
-
-// Poisson disk with 32 samples for high-quality soft shadows (match ModelInstanceRenderer)
-const vec2 POISSON[32] = vec2[32](
-    vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725),
-    vec2(-0.09418410, -0.92938870), vec2(0.34495938, 0.29387760),
-    vec2(-0.91588581, 0.45771432), vec2(-0.81544232, -0.87912464),
-    vec2(-0.38277543, 0.27676845), vec2(0.97484398, 0.75648379),
-    vec2(0.44323325, -0.97511554), vec2(0.53742981, -0.47373420),
-    vec2(-0.26496911, -0.41893023), vec2(0.79197514, 0.19090188),
-    vec2(-0.24188840, 0.99706507), vec2(-0.81409955, 0.91437590),
-    vec2(0.19984126, 0.78641367), vec2(0.14383161, -0.14100790),
-    vec2(-0.52748980, -0.18467720), vec2(0.64042155, 0.55584620),
-    vec2(-0.58689597, 0.67128760), vec2(0.24767240, -0.51805620),
-    vec2(-0.09192791, -0.54150760), vec2(0.89877152, -0.24330990),
-    vec2(0.33697340, 0.90091330), vec2(-0.41818693, -0.85628360),
-    vec2(0.69197035, -0.06798679), vec2(-0.97010720, 0.16373110),
-    vec2(0.06372385, 0.37408390), vec2(-0.63902735, -0.56419730),
-    vec2(0.56546623, 0.25234550), vec2(-0.23892370, 0.51662970),
-    vec2(0.13814290, 0.98162460), vec2(-0.46671060, 0.16780830)
-);
-
-float sampleShadowPCF(float bias, float viewZ)
-{
-    // Hard cascade switch with overlap zone
-    // Near cascade: 0-128 blocks (high detail)
-    // Far cascade: 32+ blocks (low detail, large coverage)
-    // Overlap zone: 32-128 blocks (both render, near wins)
-    float viewDepth = abs(viewZ);
-    
-    // Use near cascade if within 128 blocks
-    int cascadeIndex = (viewDepth <= 128.0) ? 0 : 1;
-    
-    // Transform to light space for selected cascade
-    vec4 lightSpacePos = uCascadeVP[cascadeIndex] * vec4(WorldPos, 1.0);
-    vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
-    proj = proj * 0.5 + 0.5;
-    
-    // If outside light frustum, surface receives NO light (dark by default)
-    if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0 || proj.z > 1.0)
-        return 0.0;
-    
-    float current = proj.z - bias;
-    
-    // Adjust PCF radius based on cascade to maintain consistent world-space blur
-    float baseRadius = 512.0;
-    float radiusScale = (cascadeIndex == 0) ? 1.0 : 0.125;  // 1/8 for far cascade
-    float radius = baseRadius * radiusScale * uShadowTexel;
-    
-    // Sample center first using array shadow sampler
-    float center = texture(uShadowMap, vec4(proj.xy, cascadeIndex, current));
-    
-    // Early exit if fully lit - prevents shadow bleeding
-    if (center >= 1.0) {
-        return 1.0;
-    }
-    
-    // Poisson disk sampling
-    float sum = center;
-    for (int i = 0; i < 32; ++i) {
-        vec2 offset = POISSON[i] * radius;
-        float d = texture(uShadowMap, vec4(proj.xy + offset, cascadeIndex, current));
-        sum += d;
-    }
-    
-    // Average and lighten-only
-    return max(center, sum / 33.0);  // 33 = 32 samples + 1 center
-}
-
-void main() {
-    // Sample texture from array using BlockType as layer index
-    vec4 texColor = texture(uBlockTextures, vec3(TexCoord, float(BlockType)));
-    
-    // Calculate view-space Z for cascade selection
-    vec4 viewPos = uView * vec4(WorldPos, 1.0);
-    float viewZ = -viewPos.z;
-    
-    // Slope-scale bias based on surface angle to light
-    vec3 N = normalize(Normal);
-    vec3 L = normalize(-uLightDir);
-    float ndotl = max(dot(N, L), 0.0);
-    float bias = max(0.0, 0.0001 * (1.0 - ndotl));
-    
-    // Sample real-time CSM/PCF shadow
-    float visibility = sampleShadowPCF(bias, viewZ);
-    
-    // Apply shadow visibility (no ambient, pure PCF/CSM like ModelInstanceRenderer)
-    vec3 lit = texColor.rgb * visibility;
-    FragColor = vec4(lit, texColor.a);
-}
-)";
+// ============================================================================
+// DEFERRED RENDERING SHADERS (G-Buffer Pass)
+// ============================================================================
+// These shaders write geometry data to G-buffer. Lighting is applied later
+// by DeferredLightingPass which samples shadows once for the entire screen.
+// ============================================================================
 
 // Depth-only shader for shadow map rendering - MDI version with SSBO
 static const char* DEPTH_VERTEX_SHADER = R"(
@@ -365,7 +179,7 @@ void main() {
 )";
 
 InstancedQuadRenderer::InstancedQuadRenderer()
-    : m_unitQuadVAO(0), m_unitQuadVBO(0), m_unitQuadEBO(0), m_shaderProgram(0), m_gbufferProgram(0), m_depthProgram(0),
+    : m_unitQuadVAO(0), m_unitQuadVBO(0), m_unitQuadEBO(0), m_gbufferProgram(0), m_depthProgram(0),
       m_globalVAO(0), m_globalInstanceVBO(0), m_indirectCommandBuffer(0), m_transformSSBO(0), 
       m_mdiDirty(false), m_totalAllocatedInstances(0)
 {
@@ -381,7 +195,6 @@ bool InstancedQuadRenderer::initialize()
     std::cout << "🎨 Initializing InstancedQuadRenderer..." << std::endl;
     
     createUnitQuad();
-    createShader();
     createGBufferShader();  // For deferred rendering
     createDepthShader();    // For shadow casting
     
@@ -450,42 +263,6 @@ void InstancedQuadRenderer::createUnitQuad()
     glBindVertexArray(0);
     
     std::cout << "   ├─ Unit quad created (4 vertices, 6 indices)" << std::endl;
-}
-
-void InstancedQuadRenderer::createShader()
-{
-    GLuint vertexShader = compileShader(VERTEX_SHADER, GL_VERTEX_SHADER);
-    GLuint fragmentShader = compileShader(FRAGMENT_SHADER, GL_FRAGMENT_SHADER);
-    
-    m_shaderProgram = glCreateProgram();
-    glAttachShader(m_shaderProgram, vertexShader);
-    glAttachShader(m_shaderProgram, fragmentShader);
-    glLinkProgram(m_shaderProgram);
-    
-    // Check linking
-    GLint success;
-    glGetProgramiv(m_shaderProgram, GL_LINK_STATUS, &success);
-    if (!success) {
-        char infoLog[512];
-        glGetProgramInfoLog(m_shaderProgram, 512, nullptr, infoLog);
-        std::cerr << "❌ Shader linking FAILED:\n" << infoLog << std::endl;
-    }
-    
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
-    
-    // Get uniform locations (no more uChunkTransform - using SSBO)
-    m_uViewProjection = glGetUniformLocation(m_shaderProgram, "uViewProjection");
-    m_uView = glGetUniformLocation(m_shaderProgram, "uView");
-    m_uBlockTextures = glGetUniformLocation(m_shaderProgram, "uBlockTextures");
-    
-    // CSM/PCF shadow uniforms
-    m_uShadowMap = glGetUniformLocation(m_shaderProgram, "uShadowMap");
-    m_uShadowTexel = glGetUniformLocation(m_shaderProgram, "uShadowTexel");
-    m_uLightDir = glGetUniformLocation(m_shaderProgram, "uLightDir");
-    m_uCascadeVP = glGetUniformLocation(m_shaderProgram, "uCascadeVP");
-    
-    std::cout << "   └─ Shader compiled and linked (CSM/PCF enabled)" << std::endl;
 }
 
 void InstancedQuadRenderer::createDepthShader()
@@ -976,92 +753,6 @@ void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
     }
 }
 
-void InstancedQuadRenderer::render(const glm::mat4& viewProjection, const glm::mat4& view)
-{
-    if (m_chunks.empty())
-        return;
-    
-    // Enable face culling to catch winding order issues
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
-    
-    glUseProgram(m_shaderProgram);
-    glUniformMatrix4fv(m_uViewProjection, 1, GL_FALSE, glm::value_ptr(viewProjection));
-    glUniformMatrix4fv(m_uView, 1, GL_FALSE, glm::value_ptr(view));
-    
-    // Bind texture array
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, m_blockTextureArray);
-    glUniform1i(m_uBlockTextures, 0);
-    
-    // Bind CSM/PCF shadow map (matches ModelInstanceRenderer)
-    extern class ShadowMap g_shadowMap;
-    extern class DayNightController* g_dayNightController;
-    
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, g_shadowMap.getDepthTexture());
-    glUniform1i(m_uShadowMap, 1);
-    
-    // Shadow texel size for PCF radius calculation
-    float shadowTexel = 1.0f / static_cast<float>(g_shadowMap.getSize());
-    glUniform1f(m_uShadowTexel, shadowTexel);
-    
-    // Sun direction from day/night controller
-    glm::vec3 sunDir(0.3f, -1.0f, 0.2f);  // Default fallback
-    if (g_dayNightController) {
-        auto sd = g_dayNightController->getSunDirection();
-        sunDir = glm::vec3(sd.x, sd.y, sd.z);
-    }
-    glUniform3fv(m_uLightDir, 1, glm::value_ptr(sunDir));
-    
-    // Cascade view-projection matrices
-    glm::mat4 cascadeVPs[2];
-    for (int i = 0; i < 2; ++i) {
-        cascadeVPs[i] = g_shadowMap.getCascade(i).viewProj;
-    }
-    glUniformMatrix4fv(m_uCascadeVP, 2, GL_FALSE, glm::value_ptr(cascadeVPs[0]));
-    
-    // Rebuild MDI buffers if dirty (chunks added/removed/updated)
-    if (m_mdiDirty) {
-        rebuildMDIBuffers();
-    }
-    
-    // Count non-empty draws
-    size_t drawCount = 0;
-    for (const auto& entry : m_chunks) {
-        if (entry.instanceCount > 0) drawCount++;
-    }
-    
-    if (drawCount == 0) {
-        return;
-    }
-    
-    // OPTIMIZED: Directly update SSBO buffer with transforms (no temp vector)
-    // Map the buffer for writing, copy transforms directly
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
-    glm::mat4* mappedTransforms = (glm::mat4*)glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_WRITE_ONLY);
-    if (mappedTransforms) {
-        size_t index = 0;
-        for (const auto& entry : m_chunks) {
-            if (entry.instanceCount > 0) {
-                mappedTransforms[index++] = entry.transform;
-            }
-        }
-        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-    }
-    
-    // Bind global VAO and transform SSBO
-    glBindVertexArray(m_globalVAO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_transformSSBO);
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
-    
-    // SINGLE MDI CALL FOR ALL CHUNKS! (GPU-driven rendering)
-    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
-                                static_cast<GLsizei>(drawCount), 0);
-    
-    glBindVertexArray(0);
-}
-
 void InstancedQuadRenderer::renderToGBuffer(const glm::mat4& viewProjection, const glm::mat4& view)
 {
     (void)view;  // Not needed for G-buffer pass
@@ -1166,11 +857,6 @@ void InstancedQuadRenderer::shutdown()
     if (m_transformSSBO != 0) {
         glDeleteBuffers(1, &m_transformSSBO);
         m_transformSSBO = 0;
-    }
-    
-    if (m_shaderProgram != 0) {
-        glDeleteProgram(m_shaderProgram);
-        m_shaderProgram = 0;
     }
     
     if (m_gbufferProgram != 0) {

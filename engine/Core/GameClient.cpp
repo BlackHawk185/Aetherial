@@ -11,13 +11,16 @@
 #include <memory>
 #include <tuple>
 
-#include "GameState.h"
+#include "ClientWorld.h"
 #include "../Profiling/Profiler.h"
 #include "../World/BlockType.h"
+#include "../ECS/ECS.h"
+#include "../World/FluidComponents.h"  // For FluidParticleComponent (render-only on client)
 
 #include "../Network/NetworkManager.h"
 #include "../Network/NetworkMessages.h"
 #include "../Rendering/BlockHighlightRenderer.h"
+#include "../Rendering/FluidParticleRenderer.h"
 #include "../Rendering/GBuffer.h"
 #include "../Rendering/DeferredLightingPass.h"
 #include "../Rendering/PostProcessingPipeline.h"
@@ -125,27 +128,27 @@ bool GameClient::initialize(bool enableDebug)
     return true;
 }
 
-bool GameClient::connectToGameState(GameState* gameState)
+bool GameClient::connectToClientWorld(ClientWorld* clientWorld)
 {
-    if (!gameState)
+    if (!clientWorld)
     {
-        std::cerr << "Cannot connect to null game state!" << std::endl;
+        std::cerr << "Cannot connect to null client world!" << std::endl;
         return false;
     }
 
-    m_gameState = gameState;
+    m_clientWorld = clientWorld;
     m_isRemoteClient = false;  // Local connection
 
     // **NEW: Connect physics system to island system for collision detection**
-    if (gameState && gameState->getIslandSystem())
+    if (clientWorld && clientWorld->getIslandSystem())
     {
-        m_clientPhysics.setIslandSystem(gameState->getIslandSystem());
+        m_clientPhysics.setIslandSystem(clientWorld->getIslandSystem());
         // Mark chunks as client-side (need GPU upload)
-        gameState->getIslandSystem()->setIsClient(true);
+        clientWorld->getIslandSystem()->setIsClient(true);
     }
 
     // Use calculated spawn position from world generation
-    Vec3 playerSpawnPos = gameState->getPlayerSpawnPosition();
+    Vec3 playerSpawnPos = clientWorld->getPlayerSpawnPosition();
     m_playerController.setPosition(playerSpawnPos);
 
     return true;
@@ -213,10 +216,10 @@ bool GameClient::update(float deltaTime)
     }
 
     // Update client-side physics for smooth island movement
-    if (m_gameState)
+    if (m_clientWorld)
     {
         PROFILE_SCOPE("updateIslandPhysics");
-        auto* islandSystem = m_gameState->getIslandSystem();
+        auto* islandSystem = m_clientWorld->getIslandSystem();
         if (islandSystem)
         {
             // Run client-side island physics between server updates
@@ -277,7 +280,7 @@ void GameClient::shutdown()
     }
 
     // Disconnect from game state
-    m_gameState = nullptr;
+    m_clientWorld = nullptr;
 
     // Cleanup renderers (unique_ptr handles deletion automatically)
     if (g_instancedQuadRenderer)
@@ -326,7 +329,7 @@ void GameClient::processInput(float deltaTime)
     processKeyboard(deltaTime);
     
     // Update player controller (handles movement, physics, and camera)
-    if (m_gameState)
+    if (m_clientWorld)
     {
         // Tell PlayerController if UI is blocking input
         bool uiBlocking = (m_periodicTableUI && m_periodicTableUI->isOpen());
@@ -336,7 +339,7 @@ void GameClient::processInput(float deltaTime)
         m_playerController.processMouse(m_window->getHandle());
         
         // Update player controller (physics and camera)
-        m_playerController.update(m_window->getHandle(), deltaTime, m_gameState->getIslandSystem(), &m_clientPhysics);
+        m_playerController.update(m_window->getHandle(), deltaTime, m_clientWorld->getIslandSystem(), &m_clientPhysics);
         
         // Send movement to server if remote client
         if (m_isRemoteClient && m_networkManager)
@@ -348,7 +351,7 @@ void GameClient::processInput(float deltaTime)
     }
 
     // Process block interaction
-    if (m_gameState)
+    if (m_clientWorld)
     {
         processBlockInteraction(deltaTime);
     }
@@ -373,7 +376,7 @@ void GameClient::render()
     }
 
     // Render world (only if we have local game state)
-    if (m_gameState)
+    if (m_clientWorld)
     {
         PROFILE_SCOPE("renderWorld");
         renderWorld();
@@ -430,10 +433,11 @@ bool GameClient::initializeGraphics()
     }
     std::cout << "✅ InstancedQuadRenderer initialized - shared unit quad ready!" << std::endl;
 
-    // Initialize shadow map system (must happen before renderers that use it)
-    if (!g_shadowMap.initialize(8192, 2))
+    // Initialize light map system (must happen before renderers that use it)
+    // 4 cascades: 2 for sun (near+far), 2 for moon (near+far)
+    if (!g_shadowMap.initialize(8192, 4))
     {
-        std::cerr << "❌ Failed to initialize shadow map system!" << std::endl;
+        std::cerr << "❌ Failed to initialize light map system!" << std::endl;
         return false;
     }
 
@@ -465,7 +469,7 @@ bool GameClient::initializeGraphics()
         return false;
     }
 
-    // Initialize post-processing pipeline (godrays, tone mapping)
+    // Initialize post-processing pipeline (tone mapping only)
     if (!g_postProcessing.initialize(m_windowWidth, m_windowHeight))
     {
         std::cerr << "❌ Failed to initialize post-processing pipeline!" << std::endl;
@@ -501,6 +505,14 @@ bool GameClient::initializeGraphics()
     {
         std::cerr << "Warning: Failed to initialize BlockHighlightRenderer" << std::endl;
         m_blockHighlighter.reset();
+    }
+    
+    // Initialize fluid particle renderer
+    m_fluidParticleRenderer = std::make_unique<FluidParticleRenderer>();
+    if (!m_fluidParticleRenderer->initialize())
+    {
+        std::cerr << "Warning: Failed to initialize FluidParticleRenderer" << std::endl;
+        m_fluidParticleRenderer.reset();
     }
     
     // Initialize HUD overlay
@@ -666,32 +678,9 @@ void GameClient::processKeyboard(float deltaTime)
     if (isPostProcessingKeyPressed && !wasPostProcessingKeyPressed)
     {
         g_postProcessing.setEnabled(!g_postProcessing.isEnabled());
-        std::cout << (g_postProcessing.isEnabled() ? "🌈 Post-processing enabled (godrays + tone mapping)" : "🌈 Post-processing disabled (raw scene)") << std::endl;
+        std::cout << (g_postProcessing.isEnabled() ? "🌈 Post-processing enabled (tone mapping)" : "🌈 Post-processing disabled (raw HDR)") << std::endl;
     }
     wasPostProcessingKeyPressed = isPostProcessingKeyPressed;
-
-    // Adjust godray intensity ([ and ] keys)
-    static bool wasBracketLeftPressed = false;
-    static bool wasBracketRightPressed = false;
-    bool isBracketLeftPressed = glfwGetKey(m_window->getHandle(), GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS;
-    bool isBracketRightPressed = glfwGetKey(m_window->getHandle(), GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS;
-    
-    if (isBracketLeftPressed && !wasBracketLeftPressed)
-    {
-        float currentIntensity = g_postProcessing.getGodrayIntensity();
-        float newIntensity = std::max(0.0f, currentIntensity - 0.1f);
-        g_postProcessing.setGodrayIntensity(newIntensity);
-        std::cout << "☀️ Godray intensity decreased to " << newIntensity << std::endl;
-    }
-    if (isBracketRightPressed && !wasBracketRightPressed)
-    {
-        float currentIntensity = g_postProcessing.getGodrayIntensity();
-        float newIntensity = std::min(2.0f, currentIntensity + 0.1f);
-        g_postProcessing.setGodrayIntensity(newIntensity);
-        std::cout << "☀️ Godray intensity increased to " << newIntensity << std::endl;
-    }
-    wasBracketLeftPressed = isBracketLeftPressed;
-    wasBracketRightPressed = isBracketRightPressed;
 
     // Apply piloting controls (arrow keys for movement and rotation)
     // Send inputs to server instead of directly modifying island
@@ -739,7 +728,7 @@ void GameClient::processKeyboard(float deltaTime)
 
 void GameClient::processBlockInteraction(float deltaTime)
 {
-    if (!m_gameState)
+    if (!m_clientWorld)
     {
         return;
     }
@@ -749,7 +738,7 @@ void GameClient::processBlockInteraction(float deltaTime)
     if (m_inputState.raycastTimer > 0.05f)
     {  // 20 FPS raycasting for more responsive block selection
         m_inputState.cachedTargetBlock = VoxelRaycaster::raycast(
-            m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_gameState->getIslandSystem());
+            m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_clientWorld->getIslandSystem());
         m_inputState.raycastTimer = 0.0f;
     }
 
@@ -763,17 +752,33 @@ void GameClient::processBlockInteraction(float deltaTime)
 
         if (m_inputState.cachedTargetBlock.hit)
         {
-            // OPTIMISTIC UPDATE: Apply change immediately on client
-            m_gameState->setVoxel(m_inputState.cachedTargetBlock.islandID,
-                                  m_inputState.cachedTargetBlock.localBlockPos, 0);
+            // Get the current voxel type before changing it
+            uint8_t previousType = m_clientWorld->getIslandSystem()->getVoxelFromIsland(
+                m_inputState.cachedTargetBlock.islandID,
+                m_inputState.cachedTargetBlock.localBlockPos);
             
-            // Send network request for server validation
+            // OPTIMISTIC UPDATE: Apply predicted change immediately on client
+            m_clientWorld->applyPredictedVoxelChange(
+                m_inputState.cachedTargetBlock.islandID,
+                m_inputState.cachedTargetBlock.localBlockPos,
+                0,  // newType (air = break block)
+                previousType);
+            
+            // Send network request for server validation (sequence number is tracked internally)
             if (m_networkManager && m_networkManager->getClient() &&
                 m_networkManager->getClient()->isConnected())
             {
-                m_networkManager->getClient()->sendVoxelChangeRequest(
+                uint32_t seqNum = m_networkManager->getClient()->sendVoxelChangeRequest(
                     m_inputState.cachedTargetBlock.islandID,
                     m_inputState.cachedTargetBlock.localBlockPos, 0);
+                
+                // Track this prediction for reconciliation
+                m_pendingVoxelChanges[seqNum] = {
+                    m_inputState.cachedTargetBlock.islandID,
+                    m_inputState.cachedTargetBlock.localBlockPos,
+                    0,  // predictedType (air)
+                    previousType  // For rollback if server rejects
+                };
             }
 
             // Server will confirm or revert via VoxelChangeUpdate
@@ -783,7 +788,7 @@ void GameClient::processBlockInteraction(float deltaTime)
 
             // **FIXED**: Force immediate raycast to update block selection after breaking
             m_inputState.cachedTargetBlock = VoxelRaycaster::raycast(
-                m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_gameState->getIslandSystem());
+                m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_clientWorld->getIslandSystem());
             m_inputState.raycastTimer = 0.0f;
         }
     }
@@ -820,22 +825,34 @@ void GameClient::processBlockInteraction(float deltaTime)
         {
             Vec3 placePos = VoxelRaycaster::getPlacementPosition(m_inputState.cachedTargetBlock);
             uint8_t existingVoxel =
-                m_gameState->getVoxel(m_inputState.cachedTargetBlock.islandID, placePos);
+                m_clientWorld->getVoxel(m_inputState.cachedTargetBlock.islandID, placePos);
 
             if (existingVoxel == 0)
             {
                 // Use locked recipe block
                 uint8_t blockToPlace = m_lockedRecipe->blockID;
                 
-                // OPTIMISTIC UPDATE: Apply change immediately on client
-                m_gameState->setVoxel(m_inputState.cachedTargetBlock.islandID, placePos, blockToPlace);
+                // OPTIMISTIC UPDATE: Apply predicted change immediately on client
+                m_clientWorld->applyPredictedVoxelChange(
+                    m_inputState.cachedTargetBlock.islandID,
+                    placePos,
+                    blockToPlace,
+                    0);  // previousType is air
                 
-                // Send network request for server validation
+                // Send network request for server validation (sequence number is tracked internally)
                 if (m_networkManager && m_networkManager->getClient() &&
                     m_networkManager->getClient()->isConnected())
                 {
-                    m_networkManager->getClient()->sendVoxelChangeRequest(
+                    uint32_t seqNum = m_networkManager->getClient()->sendVoxelChangeRequest(
                         m_inputState.cachedTargetBlock.islandID, placePos, blockToPlace);
+                    
+                    // Track this prediction
+                    m_pendingVoxelChanges[seqNum] = {
+                        m_inputState.cachedTargetBlock.islandID,
+                        placePos,
+                        blockToPlace,  // predictedType
+                        existingVoxel  // previousType (air)
+                    };
                 }
 
                 // Server will confirm or revert via VoxelChangeUpdate
@@ -848,7 +865,7 @@ void GameClient::processBlockInteraction(float deltaTime)
 
                 // **FIXED**: Force immediate raycast to update block selection after placing
                 m_inputState.cachedTargetBlock = VoxelRaycaster::raycast(
-                    m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_gameState->getIslandSystem());
+                    m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_clientWorld->getIslandSystem());
                 m_inputState.raycastTimer = 0.0f;
             }
         }
@@ -863,7 +880,7 @@ void GameClient::renderWorld()
 {
     PROFILE_SCOPE("GameClient::renderWorld");
     
-    if (!m_gameState)
+    if (!m_clientWorld)
     {
         return;
     }
@@ -879,7 +896,7 @@ void GameClient::renderWorld()
     glm::mat4 projectionMatrix = m_playerController.getCamera().getProjectionMatrix(aspect);
     glm::mat4 viewMatrix = m_playerController.getCamera().getViewMatrix();
 
-    // Shadow depth pass (throttled - only update every Nth frame for performance)
+    // Light depth pass (throttled - only update every Nth frame for performance)
     m_frameCounter++;
     if (m_frameCounter % m_shadowUpdateInterval == 0)
     {
@@ -913,24 +930,29 @@ void GameClient::renderWorld()
     
     // Get shared data for lighting and sky rendering
     Vec3 sunDir = m_dayNightController ? m_dayNightController->getSunDirection() : Vec3(-0.3f, -1.0f, -0.2f).normalized();
+    Vec3 moonDir = m_dayNightController ? m_dayNightController->getMoonDirection() : Vec3(0.3f, -1.0f, 0.2f).normalized();
     glm::vec3 sunDirGLM(sunDir.x, sunDir.y, sunDir.z);
+    glm::vec3 moonDirGLM(moonDir.x, moonDir.y, moonDir.z);
+    
+    float sunIntensity = m_dayNightController ? m_dayNightController->getSunIntensity() : 0.8f;
+    float moonIntensity = m_dayNightController ? m_dayNightController->getMoonIntensity() : 0.15f;
     
     const Vec3& camPos = m_playerController.getCamera().position;
     glm::vec3 cameraPosGLM(camPos.x, camPos.y, camPos.z);
 
-    // 2. Lighting Pass: Read G-buffer, apply shadows + lighting, output to HDR framebuffer
+    // 2. Lighting Pass: Read G-buffer, apply light maps, output to HDR framebuffer
     {
         PROFILE_SCOPE("Deferred_Lighting_Pass");
         
-        // Update cascade data in deferred lighting pass
+        // Update cascade data in deferred lighting pass (4 cascades: 2 sun + 2 moon)
         for (int i = 0; i < g_shadowMap.getNumCascades(); ++i)
         {
             const CascadeData& cascade = g_shadowMap.getCascade(i);
-            g_deferredLighting.setCascadeData(i, cascade.viewProj, cascade.splitDistance);
+            g_deferredLighting.setCascadeData(i, cascade.viewProj, cascade.splitDistance, cascade.orthoSize);
         }
         
         // Render full-screen quad with deferred lighting to HDR framebuffer
-        g_deferredLighting.render(sunDirGLM, cameraPosGLM);
+        g_deferredLighting.render(sunDirGLM, moonDirGLM, sunIntensity, moonIntensity, cameraPosGLM);
     }
     
     // 3. Sky Pass: Render sky gradient with sun disc to HDR framebuffer
@@ -946,24 +968,27 @@ void GameClient::renderWorld()
         glBlitFramebuffer(0, 0, m_windowWidth, m_windowHeight, 0, 0, m_windowWidth, m_windowHeight, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
         
         // Render sky (will only render where depth = 1.0, i.e., background pixels)
-        float sunIntensity = m_dayNightController ? m_dayNightController->getSunIntensity() : 0.8f;
-        float aspectRatio = static_cast<float>(m_windowWidth) / static_cast<float>(m_windowHeight);
-        g_skyRenderer.render(sunDirGLM, sunIntensity, cameraPosGLM, viewMatrix, aspectRatio);
+        float timeOfDay = m_dayNightController ? m_dayNightController->getTimeOfDay() : 12.0f;
+        g_skyRenderer.render(sunDirGLM, sunIntensity, moonDirGLM, moonIntensity, 
+                           cameraPosGLM, viewMatrix, projectionMatrix, timeOfDay);
         
         g_hdrFramebuffer.unbind();
     }
     
-    // 4. Post-Processing Pass: Apply godrays, tone mapping, etc.
+    // 4. Post-Processing Pass: Apply tone mapping, etc.
     {
         PROFILE_SCOPE("Post_Processing_Pass");
         
-        // Process HDR framebuffer through post-processing pipeline
+        // Get current framebuffer output
+        GLuint currentTexture = g_hdrFramebuffer.getColorTexture();
         glm::mat4 viewProjectionMatrix = projectionMatrix * viewMatrix;
-        g_postProcessing.process(g_hdrFramebuffer.getColorTexture(), g_gBuffer.getDepthTexture(), 
+        
+        // Apply post-processing effects (tone mapping only - godrays removed)
+        g_postProcessing.process(currentTexture, g_gBuffer.getDepthTexture(), 
                                sunDirGLM, cameraPosGLM, viewProjectionMatrix);
     }
     
-    // 5. Forward Pass: Render transparent/special objects (block highlight, UI)
+    // 5. Forward Pass: Render transparent/special objects (block highlight, fluid particles, UI)
     {
         PROFILE_SCOPE("Forward_Pass");
         
@@ -972,7 +997,7 @@ void GameClient::renderWorld()
         {
             PROFILE_SCOPE("renderBlockHighlight");
             
-            auto& islands = m_gameState->getIslandSystem()->getIslands();
+            auto& islands = m_clientWorld->getIslandSystem()->getIslands();
             auto it = islands.find(m_inputState.cachedTargetBlock.islandID);
             if (it != islands.end())
             {
@@ -984,38 +1009,47 @@ void GameClient::renderWorld()
                     glm::value_ptr(viewMatrix), glm::value_ptr(projectionMatrix));
             }
         }
+        
+        // Render fluid particles
+        if (m_fluidParticleRenderer && m_clientWorld)
+        {
+            PROFILE_SCOPE("renderFluidParticles");
+            m_fluidParticleRenderer->render(&g_ecs, 
+                glm::value_ptr(viewMatrix), glm::value_ptr(projectionMatrix));
+        }
     }
 }
 
 void GameClient::renderShadowPass()
 {
-    PROFILE_SCOPE("GameClient::renderShadowPass");
+    PROFILE_SCOPE("GameClient::renderLightPass");
     
-    // Use dynamic sun direction from DayNightController for shadows
+    // Get sun and moon directions from DayNightController
     Vec3 sunDir = m_dayNightController ? m_dayNightController->getSunDirection() : Vec3(-0.3f, -1.0f, -0.2f).normalized();
+    Vec3 moonDir = m_dayNightController ? m_dayNightController->getMoonDirection() : Vec3(0.3f, -1.0f, 0.2f).normalized();
     glm::vec3 camPos(m_playerController.getCamera().position.x, m_playerController.getCamera().position.y, m_playerController.getCamera().position.z);
-    glm::vec3 lightDir(sunDir.x, sunDir.y, sunDir.z);
     
-    int numCascades = g_shadowMap.getNumCascades();
+    int numCascades = g_shadowMap.getNumCascades();  // Should be 4: 2 sun + 2 moon
     
-    // Cascade configuration for proper coverage with 32-block overlap
-    // Cascade 0 (near): covers 0-128 blocks from camera, 128x128 units ortho (high detail)
-    // Cascade 1 (far):  covers 0-1000 blocks from camera (render distance), 2048x2048 units ortho
-    // 28-block overlap zone from 100-128 blocks for smooth transitions
+    // Cascade configuration
     const float cascade0Split = 128.0f;   // Near cascade max distance
-    const float cascade1Split = 1000.0f;  // Far cascade = camera far plane (render distance)
-    
+    const float cascade1Split = 1000.0f;  // Far cascade = camera far plane
     const float nearOrthoSize = 64.0f;    // Near: 128x128 units coverage
     const float farOrthoSize = 1024.0f;   // Far: 2048x2048 units coverage
     
-    // Render each cascade
+    // Render all 4 cascades (0-1: sun, 2-3: moon)
     for (int cascadeIdx = 0; cascadeIdx < numCascades; ++cascadeIdx)
     {
-        // Select cascade parameters based on index
-        float splitDistance = (cascadeIdx == 0) ? cascade0Split : cascade1Split;
-        float orthoSize = (cascadeIdx == 0) ? nearOrthoSize : farOrthoSize;
+        // Determine which light source (sun or moon) this cascade is for
+        bool isSunCascade = (cascadeIdx < 2);
+        glm::vec3 lightDir = isSunCascade ? glm::vec3(sunDir.x, sunDir.y, sunDir.z) : glm::vec3(moonDir.x, moonDir.y, moonDir.z);
+        
+        // Determine near or far within the light source pair
+        bool isNear = (cascadeIdx % 2 == 0);
+        float splitDistance = isNear ? cascade0Split : cascade1Split;
+        float orthoSize = isNear ? nearOrthoSize : farOrthoSize;
         float nearPlane = 1.0f;
-        float farPlane = splitDistance + 50.0f;  // Extra depth for light frustum
+        float farPlane = splitDistance + 50.0f;
         
         // Build light view matrix centered on camera
         glm::vec3 lightTarget = camPos;
@@ -1025,7 +1059,7 @@ void GameClient::renderShadowPass()
         // Build light projection with texel snapping for stability
         glm::mat4 lightProj = glm::ortho(-orthoSize, orthoSize, -orthoSize, orthoSize, nearPlane, farPlane);
         
-        // Snap to texel grid to prevent shadow shimmering
+        // Snap to texel grid to prevent light map shimmering
         glm::vec4 centerLS = lightView * glm::vec4(lightTarget, 1.0f);
         int smWidth = g_shadowMap.getSize();
         float texelSize = (2.0f * orthoSize) / float(smWidth);
@@ -1034,20 +1068,20 @@ void GameClient::renderShadowPass()
         glm::mat4 snapMat = glm::translate(glm::mat4(1.0f), glm::vec3(-delta.x, -delta.y, 0.0f));
         glm::mat4 lightVP = lightProj * snapMat * lightView;
         
-        // Store cascade data for shader (splitDistance is the MAX view-space depth for this cascade)
+        // Store cascade data for shader
         CascadeData cascadeData;
         cascadeData.viewProj = lightVP;
-        cascadeData.splitDistance = splitDistance;  // Shader compares fragment depth against this
+        cascadeData.splitDistance = splitDistance;
         cascadeData.orthoSize = orthoSize;
         g_shadowMap.setCascadeData(cascadeIdx, cascadeData);
         
-        // Render shadow depth pass for this cascade
+        // Render light depth pass for this cascade
         if (m_windowWidth > 0 && m_windowHeight > 0)
         {
-            // Begin shadow map rendering (clears depth buffer, sets up FBO)
+            // Begin light map rendering (clears depth buffer, sets up FBO)
             g_shadowMap.begin(cascadeIdx);
             
-            // Render voxels into shadow map (they cast shadows!)
+            // Render voxels into light map (they block light!)
             if (g_instancedQuadRenderer)
             {
                 g_instancedQuadRenderer->beginDepthPass(lightVP, cascadeIdx);
@@ -1055,27 +1089,27 @@ void GameClient::renderShadowPass()
                 g_instancedQuadRenderer->endDepthPass(m_windowWidth, m_windowHeight);
             }
             
-            // Render GLB models into shadow map
+            // Render GLB models into light map
             if (g_modelRenderer) {
                 g_modelRenderer->beginDepthPass(lightVP, cascadeIdx);
                 g_modelRenderer->renderDepth();
                 g_modelRenderer->endDepthPass(m_windowWidth, m_windowHeight);
             }
             
-            // End shadow map rendering (restores viewport/framebuffer)
+            // End light map rendering (restores viewport/framebuffer)
             g_shadowMap.end(m_windowWidth, m_windowHeight);
         }
     }
     
-    // Restore culling for forward rendering pass (shadow pass disabled it)
+    // Restore culling for forward rendering pass
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
     
-    // Set lighting data for forward pass (use first cascade for now - will update shader to pick cascade)
-    glm::vec3 lightDirVec(lightDir.x, lightDir.y, lightDir.z);
+    // Set lighting data for forward pass (use sun cascade 0 for basic forward lighting)
+    glm::vec3 sunDirVec(sunDir.x, sunDir.y, sunDir.z);
     if (g_modelRenderer)
     {
-        g_modelRenderer->setLightingData(g_shadowMap.getCascade(0).viewProj, lightDirVec);
+        g_modelRenderer->setLightingData(g_shadowMap.getCascade(0).viewProj, sunDirVec);
     }
 }
 
@@ -1107,9 +1141,9 @@ void GameClient::renderUI()
         m_hud->setCurrentBlock("Stone");
         
         // Set target block (block player is looking at) with elemental formula
-        if (m_inputState.cachedTargetBlock.hit && m_gameState)
+        if (m_inputState.cachedTargetBlock.hit && m_clientWorld)
         {
-            uint8_t blockID = m_gameState->getVoxel(
+            uint8_t blockID = m_clientWorld->getVoxel(
                 m_inputState.cachedTargetBlock.islandID,
                 m_inputState.cachedTargetBlock.localBlockPos
             );
@@ -1182,23 +1216,23 @@ void GameClient::onWindowResize(int width, int height)
 
 void GameClient::handleWorldStateReceived(const WorldStateMessage& worldState)
 {
-    // Create a new GameState for the client based on server data
-    m_gameState = new GameState();
+    // Create a new ClientWorld for the client based on server data
+    m_clientWorld = new ClientWorld();
 
-    if (!m_gameState->initialize(false))
+    if (!m_clientWorld->initialize(false))
     {  // Don't create default world, we'll use server data
         std::cerr << "Failed to initialize client game state!" << std::endl;
-        delete m_gameState;
-        m_gameState = nullptr;
+        delete m_clientWorld;
+        m_clientWorld = nullptr;
         return;
     }
 
     // Connect physics system to CLIENT's island system for collision detection
-    if (m_gameState && m_gameState->getIslandSystem())
+    if (m_clientWorld && m_clientWorld->getIslandSystem())
     {
-        m_clientPhysics.setIslandSystem(m_gameState->getIslandSystem());
+        m_clientPhysics.setIslandSystem(m_clientWorld->getIslandSystem());
         // Mark chunks as client-side (need GPU upload)
-        m_gameState->getIslandSystem()->setIsClient(true);
+        m_clientWorld->getIslandSystem()->setIsClient(true);
     }
 
     // Spawn player at server-provided location
@@ -1216,10 +1250,10 @@ void GameClient::registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* is
 
 void GameClient::syncPhysicsToChunks()
 {
-    if (!m_gameState || !g_instancedQuadRenderer)
+    if (!m_clientWorld || !g_instancedQuadRenderer)
         return;
     
-    auto* islandSystem = m_gameState->getIslandSystem();
+    auto* islandSystem = m_clientWorld->getIslandSystem();
     if (!islandSystem)
         return;
     
@@ -1283,13 +1317,13 @@ void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& p
                                                 const uint8_t* voxelData, uint32_t dataSize)
 {
     (void)islandID; // Island ID tracked by IslandChunkSystem internally
-    if (!m_gameState)
+    if (!m_clientWorld)
     {
         std::cerr << "Cannot handle island data: No game state initialized" << std::endl;
         return;
     }
 
-    auto* islandSystem = m_gameState->getIslandSystem();
+    auto* islandSystem = m_clientWorld->getIslandSystem();
     if (!islandSystem)
     {
         std::cerr << "No island system available" << std::endl;
@@ -1335,13 +1369,13 @@ void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& p
 void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& chunkCoord, const Vec3& islandPosition,
                                                const uint8_t* voxelData, uint32_t dataSize)
 {
-    if (!m_gameState)
+    if (!m_clientWorld)
     {
         std::cerr << "Cannot handle chunk data: No game state initialized" << std::endl;
         return;
     }
 
-    auto* islandSystem = m_gameState->getIslandSystem();
+    auto* islandSystem = m_clientWorld->getIslandSystem();
     if (!islandSystem)
     {
         std::cerr << "No island system available" << std::endl;
@@ -1397,29 +1431,59 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
 
 void GameClient::handleVoxelChangeReceived(const VoxelChangeUpdate& update)
 {
-    if (!m_gameState)
+    if (!m_clientWorld)
     {
         std::cerr << "Cannot apply voxel change: no game state!" << std::endl;
         return;
     }
 
-    // Apply the authoritative voxel change from server
-    // This uses incremental quad updates (addBlockQuads/removeBlockQuads) automatically
-    m_gameState->setVoxel(update.islandID, update.localPos, update.voxelType);
-
+    // Check if this is a confirmation of our own prediction
+    auto it = m_pendingVoxelChanges.find(update.sequenceNumber);
+    if (it != m_pendingVoxelChanges.end())
+    {
+        const PendingVoxelChange& prediction = it->second;
+        
+        // Check if server's result matches our prediction
+        if (prediction.islandID == update.islandID &&
+            prediction.localPos == update.localPos &&
+            prediction.predictedType == update.voxelType)
+        {
+            // Server confirmed our prediction - reconcile (no-op if already applied)
+            std::cout << "[CLIENT] Server confirmed prediction (seq " << update.sequenceNumber << ")" << std::endl;
+            m_clientWorld->reconcileVoxelChange(
+                update.sequenceNumber, update.islandID, update.localPos, update.voxelType);
+        }
+        else
+        {
+            // Server rejected or modified our prediction - apply correction
+            std::cout << "[CLIENT] Server corrected prediction (seq " << update.sequenceNumber 
+                      << ") - applying server's version" << std::endl;
+            m_clientWorld->reconcileVoxelChange(
+                update.sequenceNumber, update.islandID, update.localPos, update.voxelType);
+        }
+        
+        // Remove from pending predictions
+        m_pendingVoxelChanges.erase(it);
+    }
+    else
+    {
+        // This is a change from another player or server-initiated - apply directly
+        m_clientWorld->getIslandSystem()->setVoxelInIsland(
+            update.islandID, update.localPos, update.voxelType);
+    }
     // Incremental updates already handled by setVoxel() - no need to queue mesh generation!
     // The quad modifications are immediate and GPU upload happens on next render frame.
 
     // **FIXED**: Always force immediate raycast update when server sends voxel changes
     // This ensures block selection is immediately accurate after server updates
     m_inputState.cachedTargetBlock = VoxelRaycaster::raycast(
-        m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_gameState->getIslandSystem());
+        m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_clientWorld->getIslandSystem());
     m_inputState.raycastTimer = 0.0f;
 }
 
 void GameClient::handleEntityStateUpdate(const EntityStateUpdate& update)
 {
-    if (!m_gameState)
+    if (!m_clientWorld)
     {
         return;
     }
@@ -1429,7 +1493,7 @@ void GameClient::handleEntityStateUpdate(const EntityStateUpdate& update)
     {
         case 1:
         {  // Island
-            auto* islandSystem = m_gameState->getIslandSystem();
+            auto* islandSystem = m_clientWorld->getIslandSystem();
             if (islandSystem)
             {
                 FloatingIsland* island = islandSystem->getIsland(update.entityID);
@@ -1474,6 +1538,34 @@ void GameClient::handleEntityStateUpdate(const EntityStateUpdate& update)
                     // Mark for physics update synchronization
                     island->needsPhysicsUpdate = true;
                 }
+            }
+            break;
+        }
+        case 3:
+        {  // Fluid Particle
+            // Find or create the fluid particle entity on client
+            EntityID clientEntity = static_cast<EntityID>(update.entityID);
+            
+            // Check if entity exists
+            auto* fluidComp = g_ecs.getComponent<FluidParticleComponent>(clientEntity);
+            auto* transform = g_ecs.getComponent<TransformComponent>(clientEntity);
+            
+            if (!fluidComp || !transform) {
+                // Entity doesn't exist on client - create it
+                clientEntity = g_ecs.createEntity();
+                
+                TransformComponent newTransform;
+                newTransform.position = update.position;
+                g_ecs.addComponent(clientEntity, newTransform);
+                
+                FluidParticleComponent newFluid;
+                newFluid.velocity = update.velocity;
+                newFluid.state = FluidState::ACTIVE;
+                g_ecs.addComponent(clientEntity, newFluid);
+            } else {
+                // Entity exists - update from server
+                transform->position = update.position;
+                fluidComp->velocity = update.velocity;
             }
             break;
         }

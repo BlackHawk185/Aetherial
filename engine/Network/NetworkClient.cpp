@@ -333,11 +333,11 @@ void NetworkClient::sendMovementRequest(const Vec3& intendedPosition, const Vec3
     sendToServer(&request, sizeof(request));
 }
 
-void NetworkClient::sendVoxelChangeRequest(uint32_t islandID, const Vec3& localPos,
+uint32_t NetworkClient::sendVoxelChangeRequest(uint32_t islandID, const Vec3& localPos,
                                            uint8_t voxelType)
 {
     if (!serverConnection)
-        return;
+        return 0;
 
     VoxelChangeRequest request;
     request.sequenceNumber = nextSequenceNumber++;
@@ -346,6 +346,7 @@ void NetworkClient::sendVoxelChangeRequest(uint32_t islandID, const Vec3& localP
     request.voxelType = voxelType;
 
     sendToServer(&request, sizeof(request));
+    return request.sequenceNumber;
 }
 
 void NetworkClient::sendPilotingInput(uint32_t islandID, float thrustY, float rotationYaw)

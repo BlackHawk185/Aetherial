@@ -2,10 +2,12 @@
 // This class runs the authoritative game simulation without graphics
 #pragma once
 
-#include "GameState.h"
+#include "ServerWorld.h"
 #include "../Time/TimeManager.h"
 #include "../Network/NetworkManager.h"  // Re-enabled with ENet integration
 #include "../Network/NetworkMessages.h"  // For WorldStateMessage
+#include "../World/FluidSystem.h"  // For sleeping/waking fluid simulation
+#include "../ECS/ECS.h"  // For global ECS access
 #include <memory>
 #include <atomic>
 #include <thread>
@@ -63,14 +65,14 @@ public:
     // ================================
     
     /**
-     * Get read-only access to game state (thread-safe)
+     * Get read-only access to server world (thread-safe)
      */
-    const GameState* getGameState() const { return m_gameState.get(); }
+    const ServerWorld* getServerWorld() const { return m_serverWorld.get(); }
     
     /**
-     * Get mutable access to game state (for integrated mode)
+     * Get mutable access to server world (for integrated mode)
      */
-    GameState* getGameState() { return m_gameState.get(); }
+    ServerWorld* getServerWorld() { return m_serverWorld.get(); }
     
     /**
      * Check if server is currently running
@@ -124,9 +126,10 @@ private:
     void broadcastIslandStates();
     
     // Core systems
-    std::unique_ptr<GameState> m_gameState;
+    std::unique_ptr<ServerWorld> m_serverWorld;
     std::unique_ptr<TimeManager> m_timeManager;
     std::unique_ptr<NetworkManager> m_networkManager;  // Re-enabled with ENet integration
+    FluidSystem* m_fluidSystem = nullptr;  // Fluid simulation system
     
     // Server-side physics (separate from client)
     PhysicsSystem m_serverPhysics;

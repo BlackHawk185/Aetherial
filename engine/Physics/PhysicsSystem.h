@@ -38,6 +38,14 @@ class PhysicsSystem
     bool checkCapsuleCollision(const Vec3& capsuleCenter, float radius, float height, Vec3& outNormal, const FloatingIsland** outIsland = nullptr);
     GroundInfo detectGroundCapsule(const Vec3& capsuleCenter, float radius, float height, float rayMargin = 0.1f);
     
+    // Unified movement resolver with aggressive anti-stuck logic
+    // Attempts to move entity from currentPos by velocity*deltaTime
+    // Returns final position after collision resolution, step-up, and unstuck
+    // Updates velocity to reflect actual movement (stops velocity on collision)
+    // stepHeightRatio: fraction of entity height that can be climbed (default 0.4 = 40% of height)
+    Vec3 resolveCapsuleMovement(const Vec3& currentPos, Vec3& velocity, float deltaTime, 
+                                 float radius, float height, float stepHeightRatio = 0.4f);
+    
     // NOTE: For raycasting, use VoxelRaycaster::raycast() directly - it's faster and already handles rotated islands
     
     // Island system integration

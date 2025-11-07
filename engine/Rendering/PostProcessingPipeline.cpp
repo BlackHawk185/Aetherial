@@ -438,30 +438,19 @@ void PostProcessingPipeline::process(GLuint inputTexture, GLuint depthTexture, c
         return;
     }
     
-    // 1. Godray pass: inputTexture -> intermediateTexture (if enabled)
-    if (EngineParameters::PostProcessing::ENABLE_GODRAYS) {
-        renderGodrays(inputTexture, depthTexture, sunDirection, cameraPosition, viewProjectionMatrix);
-    } else {
-        // Skip godrays - copy input directly to intermediate
-        glBindFramebuffer(GL_FRAMEBUFFER, m_intermediateFBO);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, inputTexture);
-        glUseProgram(0); // Use fixed function for simple copy
-        // Simple fullscreen blit would go here, but we'll use tone mapping step
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    }
+    // 1. Skip godray pass (disabled - doesn't work properly)
+    // Just use input texture directly for tone mapping
     
-    // 2. Tone mapping pass: intermediateTexture -> finalTexture (if enabled)
+    // 2. Tone mapping pass: inputTexture -> finalTexture (if enabled)
     if (EngineParameters::PostProcessing::ENABLE_TONE_MAPPING) {
-        GLuint sourceTexture = EngineParameters::PostProcessing::ENABLE_GODRAYS ? m_intermediateTexture : inputTexture;
-        renderToneMapping(sourceTexture);
+        // Always use input texture directly (godrays disabled)
+        renderToneMapping(inputTexture);
     } else {
-        // Skip tone mapping - copy source directly to final
-        GLuint sourceTexture = EngineParameters::PostProcessing::ENABLE_GODRAYS ? m_intermediateTexture : inputTexture;
+        // Skip tone mapping - copy input directly to final
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_finalFBO);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, sourceTexture);
+        glBindTexture(GL_TEXTURE_2D, inputTexture);
         // Copy without tone mapping - just blit the HDR texture directly
         glBlitFramebuffer(0, 0, m_width, m_height, 0, 0, m_width, m_height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     }

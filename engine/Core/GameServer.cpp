@@ -7,6 +7,10 @@
 #include "../Network/NetworkMessages.h"
 #include "../World/VoxelChunk.h"  // For accessing voxel data
 #include "../World/ConnectivityAnalyzer.h"  // For island splitting
+#include "../ECS/ECS.h"  // For fluid particle ECS access
+#include "../World/FluidComponents.h"  // For FluidParticleComponent
+
+extern ECSWorld g_ecs;  // Global ECS instance
 
 GameServer::GameServer()
 {
@@ -30,21 +34,24 @@ bool GameServer::initialize(float targetTickRate, bool enableNetworking, uint16_
     // Initialize time manager
     m_timeManager = std::make_unique<TimeManager>();
 
-    // Initialize game state
-    m_gameState = std::make_unique<GameState>();
-    if (!m_gameState->initialize(true))
+    // Initialize server world
+    m_serverWorld = std::make_unique<ServerWorld>();
+    if (!m_serverWorld->initialize())
     {  // Create default world
-        std::cerr << "Failed to initialize game state!" << std::endl;
+        std::cerr << "Failed to initialize server world!" << std::endl;
         return false;
     }
     
     // Initialize player position for integrated mode
-    m_lastKnownPlayerPosition = m_gameState->getPlayerSpawnPosition();
+    m_lastKnownPlayerPosition = m_serverWorld->getPlayerSpawnPosition();
     m_hasPlayerPosition = true;
 
     // Log island generation mode once (noise is now default)
     // Connect physics system to island system for server-side collision detection
-    m_serverPhysics.setIslandSystem(m_gameState->getIslandSystem());
+    m_serverPhysics.setIslandSystem(m_serverWorld->getIslandSystem());
+    
+    // Connect to the already-initialized fluid system
+    m_fluidSystem = &g_fluidSystem;
 
     // Initialize networking if requested
     if (m_networkingEnabled)
@@ -147,10 +154,10 @@ void GameServer::shutdown()
     m_pendingPlayerMovements.clear();
 
     // Shutdown systems
-    if (m_gameState)
+    if (m_serverWorld)
     {
-        m_gameState->shutdown();
-        m_gameState.reset();
+        m_serverWorld->shutdown();
+        m_serverWorld.reset();
     }
 
     m_timeManager.reset();
@@ -251,16 +258,23 @@ void GameServer::processTick(float deltaTime)
     }
 
     // Update game simulation
-    if (m_gameState)
+    if (m_serverWorld)
     {
         PROFILE_SCOPE("GameState::updateSimulation");
-        m_gameState->updatePhysics(deltaTime, &m_serverPhysics);
-        m_gameState->updateSimulation(deltaTime);
+        m_serverWorld->updatePhysics(deltaTime, &m_serverPhysics);
+        m_serverWorld->updateSimulation(deltaTime);
+        
+        // Update fluid system
+        if (m_fluidSystem)
+        {
+            PROFILE_SCOPE("FluidSystem::update");
+            m_fluidSystem->update(deltaTime);
+        }
         
         // Check for island activation based on player position
         if (m_hasPlayerPosition)
         {
-            m_gameState->updateIslandActivation(m_lastKnownPlayerPosition);
+            m_serverWorld->updateIslandActivation(m_lastKnownPlayerPosition);
         }
     }
 
@@ -280,9 +294,16 @@ void GameServer::processQueuedCommands()
     
     for (const auto& cmd : voxelChanges)
     {
-        if (m_gameState)
+        if (m_serverWorld)
         {
-            m_gameState->setVoxel(cmd.islandID, cmd.localPos, cmd.voxelType);
+            m_serverWorld->setVoxelAuthoritative(cmd.islandID, cmd.localPos, cmd.voxelType);
+            
+            // Trigger fluid activation if block is being removed near sleeping fluid
+            if (cmd.voxelType == 0 && m_fluidSystem) // Block removal
+            {
+                // Check for fluid activation with moderate disturbance force
+                m_fluidSystem->triggerFluidActivation(cmd.islandID, cmd.localPos, 2.0f);
+            }
         }
     }
 
@@ -317,7 +338,7 @@ void GameServer::updateTickRateStats(float actualDeltaTime)
 
 void GameServer::sendWorldStateToClient(ENetPeer* peer)
 {
-    if (!m_gameState || !m_networkManager)
+    if (!m_serverWorld || !m_networkManager)
     {
         std::cerr << "Cannot send world state: missing game state or network manager" << std::endl;
         return;
@@ -331,7 +352,7 @@ void GameServer::sendWorldStateToClient(ENetPeer* peer)
     }
 
     // Get island system from game state
-    auto* islandSystem = m_gameState->getIslandSystem();
+    auto* islandSystem = m_serverWorld->getIslandSystem();
     if (!islandSystem)
     {
         std::cerr << "No island system available" << std::endl;
@@ -343,7 +364,7 @@ void GameServer::sendWorldStateToClient(ENetPeer* peer)
     worldState.numIslands = 3;  // We know we have 3 islands from createDefaultWorld
 
     // Get actual island positions from the island system
-    const std::vector<uint32_t>& islandIDs = m_gameState->getAllIslandIDs();
+    const std::vector<uint32_t>& islandIDs = m_serverWorld->getIslandIDs();
     for (size_t i = 0; i < 3 && i < islandIDs.size(); i++)
     {
         Vec3 islandCenter = islandSystem->getIslandCenter(islandIDs[i]);
@@ -351,7 +372,7 @@ void GameServer::sendWorldStateToClient(ENetPeer* peer)
     }
 
     // Use the calculated spawn position from world generation
-    worldState.playerSpawnPosition = m_gameState->getPlayerSpawnPosition();
+    worldState.playerSpawnPosition = m_serverWorld->getPlayerSpawnPosition();
 
     // Send basic world state first
     server->sendWorldStateToClient(peer, worldState);
@@ -387,13 +408,13 @@ void GameServer::handleVoxelChangeRequest(ENetPeer* peer, const VoxelChangeReque
     (void)peer; // Peer info not needed for voxel changes currently
     // Removed verbose debug output
 
-    if (!m_gameState)
+    if (!m_serverWorld)
     {
         std::cerr << "Cannot handle voxel change: no game state!" << std::endl;
         return;
     }
 
-    auto* islandSystem = m_gameState->getIslandSystem();
+    auto* islandSystem = m_serverWorld->getIslandSystem();
     if (!islandSystem)
     {
         std::cerr << "Cannot handle voxel change: no island system!" << std::endl;
@@ -401,7 +422,9 @@ void GameServer::handleVoxelChangeRequest(ENetPeer* peer, const VoxelChangeReque
     }
 
     // Check if breaking this block would cause a split (only for block removal)
-    if (request.voxelType == 0)
+    // DISABLED: Island fragmentation system needs to ignore fluid blocks before re-enabling
+    bool islandSplittingDisabled = true;
+    if (request.voxelType == 0 && !islandSplittingDisabled)
     {
         FloatingIsland* island = islandSystem->getIsland(request.islandID);
         if (island)
@@ -413,14 +436,14 @@ void GameServer::handleVoxelChangeRequest(ENetPeer* peer, const VoxelChangeReque
                 {
                     std::cout << "🌊 Block break will cause island split! Extracting fragment..." << std::endl;
                     
-                    // Remove the block first - broadcast and apply to game state
-                    m_gameState->setVoxel(request.islandID, request.localPos, 0);
+                    // Remove the block first - SERVER-ONLY: Use data-only path (no mesh operations)
+                    islandSystem->setVoxelDataOnly(request.islandID, request.localPos, 0);
                     if (auto server = m_networkManager->getServer())
                     {
                         server->broadcastVoxelChange(request.islandID, request.localPos, 0, 0);
                     }
                     
-                    // Incremental updates already handled by setVoxel() - no need to regenerate mesh
+                    // No mesh regeneration on server - clients handle their own meshes
                     
                     // Extract the fragment to a new island
                     std::vector<Vec3> removedVoxels;
@@ -503,9 +526,10 @@ void GameServer::handleVoxelChangeRequest(ENetPeer* peer, const VoxelChangeReque
     }
 
     // Normal block change (no split detected)
-    m_gameState->setVoxel(request.islandID, request.localPos, request.voxelType);
+    // SERVER-ONLY: Use data-only path (no mesh operations)
+    islandSystem->setVoxelDataOnly(request.islandID, request.localPos, request.voxelType);
 
-    // Incremental updates already handled by setVoxel() - no need to regenerate mesh
+    // No mesh regeneration on server - clients handle their own meshes
 
     // Broadcast the change to all connected clients (including the sender for confirmation)
     if (auto server = m_networkManager->getServer())
@@ -518,13 +542,13 @@ void GameServer::handlePilotingInput(ENetPeer* peer, const PilotingInputMessage&
 {
     (void)peer; // Peer info not needed currently
 
-    if (!m_gameState)
+    if (!m_serverWorld)
     {
         std::cerr << "Cannot handle piloting input: no game state!" << std::endl;
         return;
     }
 
-    auto* islandSystem = m_gameState->getIslandSystem();
+    auto* islandSystem = m_serverWorld->getIslandSystem();
     if (!islandSystem)
     {
         std::cerr << "Cannot handle piloting input: no island system!" << std::endl;
@@ -571,7 +595,7 @@ void GameServer::handlePilotingInput(ENetPeer* peer, const PilotingInputMessage&
 
 void GameServer::broadcastIslandStates()
 {
-    if (!m_gameState || !m_networkManager)
+    if (!m_serverWorld || !m_networkManager)
     {
         return;
     }
@@ -582,7 +606,7 @@ void GameServer::broadcastIslandStates()
         return;
     }
 
-    auto* islandSystem = m_gameState->getIslandSystem();
+    auto* islandSystem = m_serverWorld->getIslandSystem();
     if (!islandSystem)
     {
         return;
@@ -590,7 +614,6 @@ void GameServer::broadcastIslandStates()
 
     // Broadcast state for all islands at a reasonable frequency (e.g., 10Hz for smooth movement)
     static float lastBroadcastTime = 0.0f;
-    static int broadcastCount = 0;
     float currentTime = m_timeManager ? m_timeManager->getRealTime() : 0.0f;
 
     if (currentTime - lastBroadcastTime < 0.1f)
@@ -598,7 +621,6 @@ void GameServer::broadcastIslandStates()
         return;
     }
     lastBroadcastTime = currentTime;
-    broadcastCount++;
 
     // Broadcast state for ALL islands (including dynamically created split islands)
     const auto& allIslands = islandSystem->getIslands();
@@ -624,5 +646,32 @@ void GameServer::broadcastIslandStates()
         // Broadcast to all connected clients
         server->broadcastEntityState(update);
     }
+    
+    // TODO: Fluid particle broadcasting disabled - needs ECS refactoring
+    /*
+    // Broadcast fluid particle states
+    auto fluidView = g_ecs.view<FluidParticleComponent, TransformComponent>();
+    for (auto entity : fluidView) {
+        auto* fluidComp = g_ecs.getComponent<FluidParticleComponent>(entity);
+        auto* transform = g_ecs.getComponent<TransformComponent>(entity);
+        
+        if (!fluidComp || !transform) continue;
+        
+        EntityStateUpdate update;
+        update.sequenceNumber = static_cast<uint32_t>(m_totalTicks);
+        update.entityID = static_cast<uint32_t>(entity);
+        update.entityType = 3;  // 3 = Fluid Particle
+        update.position = transform->position;
+        update.velocity = fluidComp->velocity;
+        update.acceleration = Vec3(0, 0, 0);  // Fluid uses simple physics
+        update.rotation = Vec3(0, 0, 0);
+        update.angularVelocity = Vec3(0, 0, 0);
+        update.serverTimestamp = serverTimestamp;
+        update.flags = 0;
+        
+        
+        server->broadcastEntityState(update);
+    }
+    */
 }
 

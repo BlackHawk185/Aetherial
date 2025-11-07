@@ -15,6 +15,13 @@
 #include "BlockType.h"
 #include "BiomeSystem.h"
 
+// Sleeping fluid voxel data for tug system
+struct SleepingFluidVoxel {
+    Vec3 islandRelativePos;
+    float tugStrength = 1.0f;
+    float volume = 1.0f;              // Amount of fluid in this voxel (for partial filling)
+};
+
 // An Island is a collection of chunks that move together as one physics body
 struct FloatingIsland
 {
@@ -28,6 +35,9 @@ struct FloatingIsland
     bool needsPhysicsUpdate = false;
     bool isPiloted = false;                                          // Is a player currently piloting this entity?
     uint32_t pilotPlayerID = 0;                                      // Which player is piloting (0 = none)
+    
+    // Fluid system: Water voxels that have been "noticed" by particles and can be tugged awake
+    std::unordered_map<uint64_t, SleepingFluidVoxel> sleepingFluidVoxels;  // Position hash -> voxel data
 
     // Helper functions for chunk coordinate conversion (operates on island-relative coordinates)
     static Vec3 islandPosToChunkCoord(const Vec3& islandRelativePos) {
@@ -166,6 +176,11 @@ class IslandChunkSystem
     uint8_t getVoxelFromIsland(uint32_t islandID, const Vec3& islandRelativePosition) const;
     // Set a specific voxel in an island using island-relative coordinates (for block placement and breaking)
     void setVoxelInIsland(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType);
+    
+    // **SERVER-ONLY VOXEL DATA MODIFICATION** (No mesh operations)
+    // Used by GameServer to modify voxel data without triggering any rendering/mesh code
+    // This directly modifies the voxel array and marks the chunk dirty, but never calls chunk->setVoxel()
+    void setVoxelDataOnly(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType);
     
     // **DYNAMIC VOXEL PLACEMENT** (Creates chunks as needed)
     // Uses island-relative coordinates - automatically creates chunks on grid-aligned boundaries

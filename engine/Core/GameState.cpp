@@ -10,6 +10,8 @@
 
 #include "../World/VoxelChunk.h"
 #include "../World/VoronoiIslandPlacer.h"
+#include "../World/FluidSystem.h"
+#include "../ECS/ECS.h"
 
 GameState::GameState()
 {
@@ -36,6 +38,16 @@ bool GameState::initialize(bool shouldCreateDefaultWorld)
     
     // Initialize physics system - Re-enabled with fixed BodyID handling
     m_physicsSystem = std::make_unique<PhysicsSystem>();
+    m_physicsSystem->setIslandSystem(&m_islandSystem);
+
+    // SERVER-ONLY: Initialize fluid system with sleeping particle architecture and physics integration
+    // Client will receive fluid particle updates via network, not simulate locally
+    if (isServerMode()) {
+        g_fluidSystem.initialize(&m_islandSystem, &g_ecs, m_physicsSystem.get());
+        std::cout << "[GAMESTATE] [SERVER] Fluid system initialized" << std::endl;
+    } else {
+        std::cout << "[GAMESTATE] [CLIENT] Fluid system disabled - will receive updates from server" << std::endl;
+    }
 
     // Real-time CSM/PCF shadows - no lightmap system needed
     std::cout << "💡 Using real-time CSM shadows (no lightmap system)" << std::endl;
@@ -80,6 +92,11 @@ void GameState::updateSimulation(float deltaTime)
 
     // Update player
     updatePlayer(deltaTime);
+
+    // SERVER-ONLY: Update fluid simulation (server simulates, clients receive entity updates)
+    if (isServerMode()) {
+        g_fluidSystem.update(deltaTime);
+    }
 
     // Update island physics
     m_islandSystem.updateIslandPhysics(deltaTime);
@@ -127,8 +144,46 @@ void GameState::setPrimaryPlayerPosition(const Vec3& position)
 
 bool GameState::setVoxel(uint32_t islandID, const Vec3& localPos, uint8_t voxelType)
 {
-    // Delegate to island system
-    m_islandSystem.setVoxelInIsland(islandID, localPos, voxelType);
+    std::cout << "[GAMESTATE] setVoxel called - island " << islandID << " pos (" 
+              << localPos.x << ", " << localPos.y << ", " << localPos.z 
+              << ") voxelType=" << (int)voxelType << std::endl;
+    
+    // Check if we're breaking a block (setting to air)
+    uint8_t oldVoxelType = m_islandSystem.getVoxelFromIsland(islandID, localPos);
+    
+    // Use different paths for server vs client
+    if (isServerMode()) {
+        // SERVER: Data-only path - no mesh operations
+        m_islandSystem.setVoxelDataOnly(islandID, localPos, voxelType);
+    } else {
+        // CLIENT: Full path with mesh updates
+        m_islandSystem.setVoxelInIsland(islandID, localPos, voxelType);
+    }
+    
+    // SERVER-ONLY: Convert nearby water voxels to particles when breaking ANY block
+    // Client will receive fluid particle entity updates from server
+    if (isServerMode() && oldVoxelType != BlockID::AIR && voxelType == BlockID::AIR) {
+        std::cout << "[GAMESTATE] [SERVER] Block broken, checking neighbors for water..." << std::endl;
+        // Check neighbors for water blocks and convert them to particles
+        std::vector<Vec3> neighborOffsets = {
+            Vec3(1, 0, 0), Vec3(-1, 0, 0),
+            Vec3(0, 1, 0), Vec3(0, -1, 0),
+            Vec3(0, 0, 1), Vec3(0, 0, -1)
+        };
+        
+        for (const Vec3& offset : neighborOffsets) {
+            Vec3 neighborPos = localPos + offset;
+            uint8_t neighborVoxel = m_islandSystem.getVoxelFromIsland(islandID, neighborPos);
+            
+            if (neighborVoxel == BlockID::WATER) {
+                std::cout << "[GAMESTATE] [SERVER] Found water neighbor at (" << neighborPos.x << ", " 
+                          << neighborPos.y << ", " << neighborPos.z << ") - waking it" << std::endl;
+                // Convert neighboring water voxel directly to particle
+                g_fluidSystem.wakeFluidVoxel(islandID, neighborPos);
+            }
+        }
+    }
+    
     return true;  // Error handling will be added when async operations are implemented
 }
 
@@ -157,7 +212,7 @@ void GameState::createDefaultWorld()
         // Island generation (density-based for infinite scaling)
         float islandDensity = 3.0f;          // Islands per 1000x1000 area (scales infinitely!)
         float minIslandRadius = 100.0f;       // Minimum island size
-        float maxIslandRadius = 1000.0f;      // Maximum island size
+        float maxIslandRadius = 100.0f;      // Maximum island size
         
         // Advanced Voronoi tuning
         float verticalSpread = 100.0f;       // Vertical Y-axis spread (±units)

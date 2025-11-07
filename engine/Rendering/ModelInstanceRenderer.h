@@ -69,11 +69,8 @@ public:
     void beginDepthPass(const glm::mat4& lightVP, int cascadeIndex = 0);
     void renderDepth();
     void endDepthPass(int screenWidth, int screenHeight);
-
-    // Batched rendering - render ALL chunks for ALL block types efficiently
-    void renderAll(const glm::mat4& view, const glm::mat4& proj);
     
-    // G-buffer rendering (deferred rendering)
+    // G-buffer rendering (deferred rendering - writes geometry data only)
     void renderToGBuffer(const glm::mat4& view, const glm::mat4& proj);
 
     // Update model matrix without rendering (stores pre-calculated chunk transform)

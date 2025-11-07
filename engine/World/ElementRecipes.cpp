@@ -85,8 +85,9 @@ void ElementRecipeSystem::initializeRecipes() {
     m_recipes.push_back(BlockRecipe::create({Element::Ca, Element::C, Element::O, Element::O, Element::O}, 
                                            BlockID::LIMESTONE, "Limestone", "CaCO3"));
     
-    // Ice - H₂O (frozen) - same counts as water but different block
-    m_recipes.push_back(BlockRecipe::create({Element::H, Element::H, Element::O}, BlockID::ICE, "Ice", "H2O(s)"));
+    // Ice - H₂O + Cold (different recipe to avoid collision with water)
+    // Using Helium as a "cold" element since it's the coldest element
+    m_recipes.push_back(BlockRecipe::create({Element::H, Element::H, Element::O, Element::He}, BlockID::ICE, "Ice", "H2O·He"));
     
     // Diamond - C₄ (4 carbon atoms in crystalline structure)
     m_recipes.push_back(BlockRecipe::create({Element::C, Element::C, Element::C, Element::C}, 

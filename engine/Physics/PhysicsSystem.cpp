@@ -390,3 +390,135 @@ GroundInfo PhysicsSystem::detectGroundCapsule(const Vec3& capsuleCenter, float r
     
     return info;
 }
+
+Vec3 PhysicsSystem::resolveCapsuleMovement(const Vec3& currentPos, Vec3& velocity, float deltaTime,
+                                            float radius, float height, float stepHeightRatio)
+{
+    PROFILE_FUNCTION();
+    
+    if (!m_islandSystem)
+    {
+        // No collision system - just apply velocity directly
+        return currentPos + velocity * deltaTime;
+    }
+    
+    // Calculate max step height based on entity height
+    // Taller entities can climb bigger obstacles
+    // Small entities (like water droplets) can barely climb anything
+    float maxStepHeight = height * stepHeightRatio;
+    
+    // Calculate intended movement
+    Vec3 intendedMovement = velocity * deltaTime;
+    Vec3 intendedPosition = currentPos + intendedMovement;
+    
+    Vec3 collisionNormal;
+    Vec3 finalPosition = currentPos;
+    
+    // Check if we're currently stuck (before any movement)
+    bool wasStuck = checkCapsuleCollision(currentPos, radius, height, collisionNormal, nullptr);
+    
+    // Calculate horizontal movement magnitude
+    float horizontalMovement = std::sqrt(intendedMovement.x * intendedMovement.x + 
+                                         intendedMovement.z * intendedMovement.z);
+    
+    // If stuck AND trying to move horizontally, aggressively unstuck first
+    if (wasStuck && horizontalMovement > 0.001f)
+    {
+        // Use smaller increments (0.2 * height) for gentle unstuck
+        float unstuckIncrement = height * 0.2f;
+        for (float unstuckHeight = unstuckIncrement; unstuckHeight <= maxStepHeight * 2.0f; unstuckHeight += unstuckIncrement)
+        {
+            Vec3 unstuckPos = currentPos + Vec3(0, unstuckHeight, 0);
+            if (!checkCapsuleCollision(unstuckPos, radius, height, collisionNormal, nullptr))
+            {
+                finalPosition = unstuckPos;
+                std::cout << "[PHYSICS] Unstuck entity (height=" << height << ") by pushing up " 
+                          << unstuckHeight << " units" << std::endl;
+                break;
+            }
+        }
+    }
+    
+    // Check if intended position is valid
+    if (!checkCapsuleCollision(intendedPosition, radius, height, collisionNormal, nullptr))
+    {
+        // No collision - move freely
+        return intendedPosition;
+    }
+    
+    // Collision detected - use axis-separated movement with step-up
+    
+    // ===== PHASE 1: Try vertical movement first =====
+    Vec3 testPos = finalPosition + Vec3(0, intendedMovement.y, 0);
+    if (!checkCapsuleCollision(testPos, radius, height, collisionNormal, nullptr))
+    {
+        finalPosition = testPos;
+    }
+    else
+    {
+        velocity.y = 0; // Stop vertical movement
+    }
+    
+    // ===== PHASE 2: Try horizontal X with step-up =====
+    testPos = finalPosition + Vec3(intendedMovement.x, 0, 0);
+    if (!checkCapsuleCollision(testPos, radius, height, collisionNormal, nullptr))
+    {
+        finalPosition = testPos;
+    }
+    else
+    {
+        // Blocked horizontally - try step-up based on entity height
+        bool stepped = false;
+        float stepIncrement = maxStepHeight * 0.25f; // Use 25% of max step as increment
+        for (float stepHeight = stepIncrement; stepHeight <= maxStepHeight; stepHeight += stepIncrement)
+        {
+            Vec3 stepUpPos = finalPosition + Vec3(intendedMovement.x, stepHeight, 0);
+            if (!checkCapsuleCollision(stepUpPos, radius, height, collisionNormal, nullptr))
+            {
+                // Success - apply horizontal movement and step up
+                finalPosition.x += intendedMovement.x;
+                finalPosition.y += stepHeight;
+                stepped = true;
+                break;
+            }
+        }
+        
+        if (!stepped)
+        {
+            velocity.x = 0; // Stop horizontal movement
+        }
+    }
+    
+    // ===== PHASE 3: Try horizontal Z with step-up =====
+    testPos = finalPosition + Vec3(0, 0, intendedMovement.z);
+    if (!checkCapsuleCollision(testPos, radius, height, collisionNormal, nullptr))
+    {
+        finalPosition = testPos;
+    }
+    else
+    {
+        // Blocked horizontally - try step-up based on entity height
+        bool stepped = false;
+        float stepIncrement = maxStepHeight * 0.25f; // Use 25% of max step as increment
+        for (float stepHeight = stepIncrement; stepHeight <= maxStepHeight; stepHeight += stepIncrement)
+        {
+            Vec3 stepUpPos = finalPosition + Vec3(0, stepHeight, intendedMovement.z);
+            if (!checkCapsuleCollision(stepUpPos, radius, height, collisionNormal, nullptr))
+            {
+                // Success - apply horizontal movement and step up
+                finalPosition.z += intendedMovement.z;
+                finalPosition.y += stepHeight;
+                stepped = true;
+                break;
+            }
+        }
+        
+        if (!stepped)
+        {
+            velocity.z = 0; // Stop horizontal movement
+        }
+    }
+    
+    return finalPosition;
+}
+

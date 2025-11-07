@@ -55,8 +55,10 @@ void ShadowMap::begin(int cascadeIndex)
     glViewport(0, 0, m_size, m_size);
     glClear(GL_DEPTH_BUFFER_BIT);
     glEnable(GL_DEPTH_TEST);
-    glEnable(GL_POLYGON_OFFSET_FILL);
-    glPolygonOffset(2.0f, 4.0f);
+    
+    // Polygon offset disabled - using slope-scale bias in shader instead for better quality
+    // glEnable(GL_POLYGON_OFFSET_FILL);
+    // glPolygonOffset(2.0f, 4.0f);
     
     // Disable face culling for shadow pass - render all geometry from light's POV
     // Ensures shadows are cast correctly regardless of triangle orientation

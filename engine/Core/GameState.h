@@ -99,6 +99,18 @@ public:
      */
     Vec3 getIslandCenter(uint32_t islandID) const;
     
+    // ================================
+    // SERVER/CLIENT MODE
+    // ================================
+    
+    /**
+     * Check if this GameState is running in server mode (authoritative simulation)
+     * Server mode: Uses data-only operations, no mesh generation
+     * Client mode: Uses full rendering pipeline with mesh updates
+     */
+    bool isServerMode() const { return !m_islandSystem.isClient(); }
+    bool isClientMode() const { return m_islandSystem.isClient(); }
+    
     /**
      * Get all islands for rendering/networking
      */
