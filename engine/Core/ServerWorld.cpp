@@ -116,7 +116,7 @@ bool ServerWorld::setVoxelAuthoritative(uint32_t islandID, const Vec3& localPos,
     uint8_t oldVoxelType = m_simulation.getIslandSystem()->getVoxelFromIsland(islandID, localPos);
     
     // SERVER-ONLY PATH: Direct data modification, NO mesh operations
-    m_simulation.getIslandSystem()->setVoxelDataOnly(islandID, localPos, voxelType);
+    m_simulation.getIslandSystem()->setVoxelServerOnly(islandID, localPos, voxelType);
     
     // SERVER-ONLY: Convert nearby water voxels to particles when breaking ANY block
     if (oldVoxelType != BlockID::AIR && voxelType == BlockID::AIR) {

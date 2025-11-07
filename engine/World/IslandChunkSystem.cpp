@@ -594,7 +594,7 @@ uint8_t IslandChunkSystem::getVoxelFromIsland(uint32_t islandID, const Vec3& isl
     return chunk->getVoxel(x, y, z);
 }
 
-void IslandChunkSystem::setVoxelInIsland(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType)
+void IslandChunkSystem::setVoxelWithMesh(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType)
 {
     // Acquire chunk pointer under lock, then perform heavy work without holding the map mutex
     VoxelChunk* chunk = nullptr;
@@ -634,7 +634,7 @@ void IslandChunkSystem::setVoxelInIsland(uint32_t islandID, const Vec3& islandRe
     // to allow batch updates and neighbor chunk updates
 }
 
-void IslandChunkSystem::setVoxelDataOnly(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType)
+void IslandChunkSystem::setVoxelServerOnly(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType)
 {
     // SERVER-ONLY: Modify voxel data WITHOUT triggering any mesh operations
     // This method directly modifies the voxel array and never calls chunk->setVoxel()

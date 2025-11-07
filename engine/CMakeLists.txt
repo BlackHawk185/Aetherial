@@ -4,7 +4,6 @@ add_library(engine STATIC
     Core/SimulationState.cpp
     Core/ServerWorld.cpp
     Core/ClientWorld.cpp
-    Core/GameState.cpp
     Core/GameServer.cpp
     Core/GameClient.cpp
     Core/Window.cpp

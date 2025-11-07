@@ -317,9 +317,9 @@ EntityID FluidSystem::wakeFluidVoxel(uint32_t islandID, const Vec3& islandRelati
         return 0;
     }
     
-    std::cout << "[FLUID] Calling setVoxelInIsland to remove water..." << std::endl;
+    std::cout << "[FLUID] Calling setVoxelWithMesh to remove water..." << std::endl;
     try {
-        m_islandSystem->setVoxelInIsland(islandID, islandRelativePos, 0);  // 0 = empty
+        m_islandSystem->setVoxelWithMesh(islandID, islandRelativePos, 0);  // 0 = empty
         std::cout << "[FLUID] Voxel removed successfully" << std::endl;
     } catch (...) {
         std::cerr << "[FLUID] EXCEPTION caught while setting voxel!" << std::endl;
@@ -447,7 +447,7 @@ void FluidSystem::sleepFluidParticle(EntityID particleEntity) {
     }
     
     // Place fluid voxel in island at the target grid position
-    m_islandSystem->setVoxelInIsland(targetIslandID, islandRelativePos, FLUID_VOXEL_TYPE);
+    m_islandSystem->setVoxelWithMesh(targetIslandID, islandRelativePos, FLUID_VOXEL_TYPE);
     
     // Add to sleeping voxels tracking
     addSleepingVoxel(targetIslandID, islandRelativePos, fluidComp->tugStrength);

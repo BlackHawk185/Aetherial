@@ -91,7 +91,7 @@ std::vector<uint32_t> ConnectivityAnalyzer::splitIslandByConnectivity(
             
             // Note: Would need to implement getVoxel from island-relative position
             // For now, this is a placeholder showing the approach
-            // system->setVoxelInIsland(newIslandID, voxelPos, voxelType);
+            // system->setVoxelWithMesh(newIslandID, voxelPos, voxelType);
         }
         
         // Inherit velocity from original island (with slight randomness for natural separation)
@@ -400,10 +400,10 @@ uint32_t ConnectivityAnalyzer::extractFragmentToNewIsland(IslandChunkSystem* sys
             // Place voxel in new island at position relative to fragment's center of mass
             // This makes the fragment centered at (0,0,0) in the new island's local space
             Vec3 newIslandRelativePos = voxelPos - centerOfMass;
-            system->setVoxelInIsland(newIslandID, newIslandRelativePos, voxelType);
+            system->setVoxelWithMesh(newIslandID, newIslandRelativePos, voxelType);
             
-            // Remove from main island using setVoxelInIsland to properly rebuild meshes
-            system->setVoxelInIsland(originalIslandID, voxelPos, 0);
+            // Remove from main island using setVoxelWithMesh to properly rebuild meshes
+            system->setVoxelWithMesh(originalIslandID, voxelPos, 0);
             
             // Track removed voxel for network broadcast
             if (outRemovedVoxels)

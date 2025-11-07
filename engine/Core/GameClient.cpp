@@ -1468,7 +1468,7 @@ void GameClient::handleVoxelChangeReceived(const VoxelChangeUpdate& update)
     else
     {
         // This is a change from another player or server-initiated - apply directly
-        m_clientWorld->getIslandSystem()->setVoxelInIsland(
+        m_clientWorld->getIslandSystem()->setVoxelWithMesh(
             update.islandID, update.localPos, update.voxelType);
     }
     // Incremental updates already handled by setVoxel() - no need to queue mesh generation!

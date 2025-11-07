@@ -73,7 +73,7 @@ uint32_t ClientWorld::applyPredictedVoxelChange(uint32_t islandID, const Vec3& l
     uint8_t previousType = m_simulation.getIslandSystem()->getVoxelFromIsland(islandID, localPos);
     
     // Apply prediction immediately (uses mesh generation for responsive feel)
-    m_simulation.getIslandSystem()->setVoxelInIsland(islandID, localPos, voxelType);
+    m_simulation.getIslandSystem()->setVoxelWithMesh(islandID, localPos, voxelType);
     
     // Track this prediction for reconciliation
     m_pendingVoxelChanges[sequenceNumber] = {
@@ -116,7 +116,7 @@ void ClientWorld::reconcileVoxelChange(uint32_t sequenceNumber, uint32_t islandI
             // Server rejected or modified our prediction - apply correction
             std::cout << "[CLIENT] Server corrected prediction (seq " << sequenceNumber 
                       << ") - applying server's version" << std::endl;
-            m_simulation.getIslandSystem()->setVoxelInIsland(islandID, localPos, voxelType);
+            m_simulation.getIslandSystem()->setVoxelWithMesh(islandID, localPos, voxelType);
         }
         
         // Remove from pending predictions
@@ -126,7 +126,7 @@ void ClientWorld::reconcileVoxelChange(uint32_t sequenceNumber, uint32_t islandI
     {
         // This is a change from another player or server-initiated - apply it
         std::cout << "[CLIENT] Applying non-predicted voxel change from server" << std::endl;
-        m_simulation.getIslandSystem()->setVoxelInIsland(islandID, localPos, voxelType);
+        m_simulation.getIslandSystem()->setVoxelWithMesh(islandID, localPos, voxelType);
     }
 }
 
@@ -138,7 +138,7 @@ void ClientWorld::applyServerVoxelChange(uint32_t islandID, const Vec3& localPos
     }
 
     // Direct server update (not a prediction reconciliation)
-    m_simulation.getIslandSystem()->setVoxelInIsland(islandID, localPos, voxelType);
+    m_simulation.getIslandSystem()->setVoxelWithMesh(islandID, localPos, voxelType);
     
     std::cout << "[CLIENT] Applied server voxel change: island " << islandID 
               << " pos (" << localPos.x << ", " << localPos.y << ", " << localPos.z 

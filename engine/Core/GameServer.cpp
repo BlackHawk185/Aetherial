@@ -437,7 +437,7 @@ void GameServer::handleVoxelChangeRequest(ENetPeer* peer, const VoxelChangeReque
                     std::cout << "🌊 Block break will cause island split! Extracting fragment..." << std::endl;
                     
                     // Remove the block first - SERVER-ONLY: Use data-only path (no mesh operations)
-                    islandSystem->setVoxelDataOnly(request.islandID, request.localPos, 0);
+                    islandSystem->setVoxelServerOnly(request.islandID, request.localPos, 0);
                     if (auto server = m_networkManager->getServer())
                     {
                         server->broadcastVoxelChange(request.islandID, request.localPos, 0, 0);
@@ -527,7 +527,7 @@ void GameServer::handleVoxelChangeRequest(ENetPeer* peer, const VoxelChangeReque
 
     // Normal block change (no split detected)
     // SERVER-ONLY: Use data-only path (no mesh operations)
-    islandSystem->setVoxelDataOnly(request.islandID, request.localPos, request.voxelType);
+    islandSystem->setVoxelServerOnly(request.islandID, request.localPos, request.voxelType);
 
     // No mesh regeneration on server - clients handle their own meshes
 

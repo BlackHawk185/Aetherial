@@ -174,13 +174,15 @@ class IslandChunkSystem
     // Uses world coordinates - automatically converts to chunk + local coordinates
     // Get a specific voxel from an island using island-relative coordinates (for raycasting and collision detection)
     uint8_t getVoxelFromIsland(uint32_t islandID, const Vec3& islandRelativePosition) const;
-    // Set a specific voxel in an island using island-relative coordinates (for block placement and breaking)
-    void setVoxelInIsland(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType);
+    
+    // **CLIENT-SIDE VOXEL MODIFICATION** (Triggers mesh generation)
+    // Used by GameClient to modify voxels and update rendering meshes
+    void setVoxelWithMesh(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType);
     
     // **SERVER-ONLY VOXEL DATA MODIFICATION** (No mesh operations)
     // Used by GameServer to modify voxel data without triggering any rendering/mesh code
     // This directly modifies the voxel array and marks the chunk dirty, but never calls chunk->setVoxel()
-    void setVoxelDataOnly(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType);
+    void setVoxelServerOnly(uint32_t islandID, const Vec3& islandRelativePosition, uint8_t voxelType);
     
     // **DYNAMIC VOXEL PLACEMENT** (Creates chunks as needed)
     // Uses island-relative coordinates - automatically creates chunks on grid-aligned boundaries
