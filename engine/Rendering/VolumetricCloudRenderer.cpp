@@ -51,8 +51,11 @@ out vec4 FragColor;
 const float CLOUD_BASE_MIN = )GLSL" + std::to_string(EngineParameters::Clouds::CLOUD_BASE_MIN_HEIGHT) + R"GLSL(;
 const float CLOUD_BASE_MAX = )GLSL" + std::to_string(EngineParameters::Clouds::CLOUD_BASE_MAX_HEIGHT) + R"GLSL(;
 
+// Cloud appearance parameters (injected from EngineParameters)
+const float CLOUD_SCALE = )GLSL" + std::to_string(EngineParameters::Clouds::CLOUD_SCALE) + R"GLSL(;
+
 // Raymarching parameters
-const int MAX_STEPS = 64;
+const int MAX_STEPS = )GLSL" + std::to_string(EngineParameters::Clouds::RAYMARCH_SAMPLES) + R"GLSL(;
 const float MAX_DISTANCE = 1000.0;
 
 // Reconstruct world position from depth
@@ -73,16 +76,25 @@ float sampleCloudDensity(vec3 position, float time) {
     
     // Apply wind offset (move clouds over time)
     vec3 windOffset = vec3(time * uCloudSpeed * 0.05, 0.0, time * uCloudSpeed * 0.03);
-    vec3 samplePos = (position + windOffset) * 0.001; // Scale for appropriate cloud size
+    vec3 samplePos = (position + windOffset) * CLOUD_SCALE;
     
-    // Multi-octave 3D noise sampling - Y-axis naturally creates varied height clouds
+    // Multi-octave 3D noise sampling with offset per octave to break tiling
     float noise = 0.0;
     float amplitude = 1.0;
     float frequency = 1.0;
     float maxValue = 0.0;
     
+    // Different offsets per octave to eliminate any tiling artifacts
+    vec3 octaveOffsets[4] = vec3[4](
+        vec3(0.0, 0.0, 0.0),
+        vec3(123.456, 789.012, 345.678),
+        vec3(901.234, 567.890, 123.456),
+        vec3(456.789, 234.567, 890.123)
+    );
+    
     for (int i = 0; i < 4; i++) {
-        noise += texture(uNoiseTexture, samplePos * frequency).r * amplitude;
+        vec3 offsetPos = samplePos * frequency + octaveOffsets[i];
+        noise += texture(uNoiseTexture, offsetPos).r * amplitude;
         maxValue += amplitude;
         amplitude *= 0.5;
         frequency *= 2.0;
@@ -364,9 +376,9 @@ bool VolumetricCloudRenderer::create3DNoiseTexture() {
     
     glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_MIRRORED_REPEAT);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_MIRRORED_REPEAT);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_MIRRORED_REPEAT);
     
     glBindTexture(GL_TEXTURE_3D, 0);
     
@@ -440,6 +452,14 @@ void VolumetricCloudRenderer::render(const glm::vec3& sunDirection, float sunInt
                                      const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix,
                                      GLuint depthTexture, float timeOfDay) {
     if (!EngineParameters::Clouds::ENABLE_CLOUDS) return;
+    
+    // Early out if camera is far outside cloud layer (optimization)
+    const float cloudLayerThickness = EngineParameters::Clouds::CLOUD_BASE_MAX_HEIGHT - EngineParameters::Clouds::CLOUD_BASE_MIN_HEIGHT;
+    const float cullDistance = cloudLayerThickness * 2.0f;  // 2x layer thickness
+    if (cameraPosition.y < EngineParameters::Clouds::CLOUD_BASE_MIN_HEIGHT - cullDistance ||
+        cameraPosition.y > EngineParameters::Clouds::CLOUD_BASE_MAX_HEIGHT + cullDistance) {
+        return;  // Clouds not visible from this altitude
+    }
     
     glUseProgram(m_shader);
     

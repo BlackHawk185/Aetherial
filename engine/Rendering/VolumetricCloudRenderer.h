@@ -1,6 +1,7 @@
 #pragma once
 
 #include <glm/glm.hpp>
+#include "Parameters.h"
 
 using GLuint = unsigned int;
 using GLint = int;
@@ -93,10 +94,10 @@ private:
     GLint m_uDepthTexture = -1;
     GLint m_uNoiseTexture = -1;
 
-    // Cloud parameters
-    float m_cloudCoverage = 0.5f;
-    float m_cloudDensity = 0.5f;
-    float m_cloudSpeed = 0.1f;
+    // Cloud parameters - default from EngineParameters
+    float m_cloudCoverage = EngineParameters::Clouds::CLOUD_COVERAGE;
+    float m_cloudDensity = EngineParameters::Clouds::CLOUD_DENSITY;
+    float m_cloudSpeed = EngineParameters::Clouds::CLOUD_SPEED;
 };
 
 // Global cloud renderer instance

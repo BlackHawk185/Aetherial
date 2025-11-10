@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
+#include <iomanip>
 #include <memory>
 #include <string>
 #include <chrono>
@@ -19,6 +20,7 @@
 #include "../Profiling/Profiler.h"
 #include "../Rendering/InstancedQuadRenderer.h"
 #include "../Rendering/ModelInstanceRenderer.h"
+#include "../Culling/Frustum.h"
 #include "../../libs/FastNoiseLite/FastNoiseLite.h"
 
 IslandChunkSystem g_islandSystem;
@@ -873,8 +875,86 @@ void IslandChunkSystem::getAllChunks(std::vector<VoxelChunk*>& outChunks)
 void IslandChunkSystem::getVisibleChunks(const Vec3& viewPosition,
                                          std::vector<VoxelChunk*>& outChunks)
 {
-    // Frustum culling will be added when we implement proper camera frustum
+    // Legacy distance-based culling fallback
     getAllChunks(outChunks);
+}
+
+void IslandChunkSystem::getVisibleChunksFrustum(const Frustum& frustum, std::vector<VoxelChunk*>& outChunks)
+{
+    PROFILE_SCOPE("FrustumCulling");
+    std::lock_guard<std::mutex> lock(m_islandsMutex);
+    
+    int totalChunks = 0;
+    int culledChunks = 0;
+    
+    for (auto& [islandID, island] : m_islands)
+    {
+        // Get island transform for world-space calculations
+        glm::mat4 islandTransform = island.getTransformMatrix();
+        
+        for (auto& [chunkCoord, chunk] : island.chunks)
+        {
+            if (!chunk) continue;
+            
+            totalChunks++;
+            
+            // Calculate chunk world-space AABB
+            // Chunk is SIZE x SIZE x SIZE at local position (chunkCoord * SIZE)
+            Vec3 localMin = chunkCoord * static_cast<float>(VoxelChunk::SIZE);
+            Vec3 localMax = localMin + Vec3(VoxelChunk::SIZE, VoxelChunk::SIZE, VoxelChunk::SIZE);
+            
+            // Transform local AABB corners to world space
+            glm::vec4 corners[8] = {
+                islandTransform * glm::vec4(localMin.x, localMin.y, localMin.z, 1.0f),
+                islandTransform * glm::vec4(localMax.x, localMin.y, localMin.z, 1.0f),
+                islandTransform * glm::vec4(localMin.x, localMax.y, localMin.z, 1.0f),
+                islandTransform * glm::vec4(localMax.x, localMax.y, localMin.z, 1.0f),
+                islandTransform * glm::vec4(localMin.x, localMin.y, localMax.z, 1.0f),
+                islandTransform * glm::vec4(localMax.x, localMin.y, localMax.z, 1.0f),
+                islandTransform * glm::vec4(localMin.x, localMax.y, localMax.z, 1.0f),
+                islandTransform * glm::vec4(localMax.x, localMax.y, localMax.z, 1.0f)
+            };
+            
+            // Compute axis-aligned bounding box of transformed chunk
+            Vec3 worldMin(corners[0].x, corners[0].y, corners[0].z);
+            Vec3 worldMax = worldMin;
+            
+            for (int i = 1; i < 8; ++i)
+            {
+                worldMin.x = std::min(worldMin.x, corners[i].x);
+                worldMin.y = std::min(worldMin.y, corners[i].y);
+                worldMin.z = std::min(worldMin.z, corners[i].z);
+                worldMax.x = std::max(worldMax.x, corners[i].x);
+                worldMax.y = std::max(worldMax.y, corners[i].y);
+                worldMax.z = std::max(worldMax.z, corners[i].z);
+            }
+            
+            // Test against frustum
+            if (frustum.intersectsAABB(worldMin, worldMax))
+            {
+                outChunks.push_back(chunk.get());
+            }
+            else
+            {
+                culledChunks++;
+            }
+        }
+    }
+    
+    // Log culling effectiveness (throttle to once per second)
+    static auto lastLogTime = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<float>(now - lastLogTime).count() > 1.0f)
+    {
+        if (totalChunks > 0)
+        {
+            float cullPercent = (culledChunks / (float)totalChunks) * 100.0f;
+            std::cout << "Frustum Culling: " << culledChunks << "/" << totalChunks 
+                      << " chunks (" << std::fixed << std::setprecision(1) << cullPercent 
+                      << "%) | Rendering: " << outChunks.size() << std::endl;
+        }
+        lastLogTime = now;
+    }
 }
 
 void IslandChunkSystem::updateIslandPhysics(float deltaTime)

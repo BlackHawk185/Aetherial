@@ -290,11 +290,22 @@ bool PhysicsSystem::checkCapsuleCollision(const Vec3& capsuleCenter, float radiu
     
     const auto& islands = m_islandSystem->getIslands();
     
+    // SPATIAL CULLING: Only check islands within reasonable distance
+    // Most islands are far away and can't possibly collide with player
+    const float maxIslandCheckDistance = 512.0f;  // Only check islands within 512 units
+    const float maxDistSq = maxIslandCheckDistance * maxIslandCheckDistance;
+    
     for (const auto& islandPair : islands)
     {
         const FloatingIsland* island = &islandPair.second;
         if (!island)
             continue;
+        
+        // OPTIMIZATION: Distance cull islands before expensive collision checks
+        Vec3 delta = island->physicsCenter - capsuleCenter;
+        float distSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+        if (distSq > maxDistSq)
+            continue;  // Island too far away to collide
         
         // Transform world-space capsule to island-local space (accounts for rotation!)
         Vec3 localPos = island->worldToLocal(capsuleCenter);
@@ -623,6 +634,10 @@ bool PhysicsSystem::checkSphereCollision(const Vec3& sphereCenter, float radius,
     if (!m_islandSystem)
         return false;
     
+    // SPATIAL CULLING: Only check islands within reasonable distance
+    const float maxIslandCheckDistance = 512.0f;
+    const float maxDistSq = maxIslandCheckDistance * maxIslandCheckDistance;
+    
     // Iterate through all islands
     const auto& islands = m_islandSystem->getIslands();
     for (const auto& islandPair : islands)
@@ -630,33 +645,59 @@ bool PhysicsSystem::checkSphereCollision(const Vec3& sphereCenter, float radius,
         const FloatingIsland* island = &islandPair.second;
         if (!island) continue;
         
+        // OPTIMIZATION: Distance cull islands before expensive collision checks
+        Vec3 delta = island->physicsCenter - sphereCenter;
+        float distSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+        if (distSq > maxDistSq)
+            continue;  // Island too far away to collide
+        
         // Transform sphere center to island-local space
         Vec3 localSphereCenter = island->worldToLocal(sphereCenter);
         
-        // Check each chunk in this island
-        for (const auto& chunkPair : island->chunks)
+        // SPATIAL CULLING: Calculate which chunks could possibly contain the sphere
+        float checkRadius = radius + VoxelChunk::SIZE;
+        int minChunkX = static_cast<int>(std::floor((localSphereCenter.x - checkRadius) / VoxelChunk::SIZE));
+        int maxChunkX = static_cast<int>(std::ceil((localSphereCenter.x + checkRadius) / VoxelChunk::SIZE));
+        int minChunkY = static_cast<int>(std::floor((localSphereCenter.y - checkRadius) / VoxelChunk::SIZE));
+        int maxChunkY = static_cast<int>(std::ceil((localSphereCenter.y + checkRadius) / VoxelChunk::SIZE));
+        int minChunkZ = static_cast<int>(std::floor((localSphereCenter.z - checkRadius) / VoxelChunk::SIZE));
+        int maxChunkZ = static_cast<int>(std::ceil((localSphereCenter.z + checkRadius) / VoxelChunk::SIZE));
+        
+        // Check only nearby chunks instead of ALL chunks
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; ++chunkX)
         {
-            const VoxelChunk* chunk = chunkPair.second.get();
-            if (!chunk) continue;
-            
-            // Transform to chunk-local space (chunk origin is at chunkPair.first * CHUNK_SIZE)
-            Vec3 chunkOrigin(
-                chunkPair.first.x * VoxelChunk::SIZE,
-                chunkPair.first.y * VoxelChunk::SIZE,
-                chunkPair.first.z * VoxelChunk::SIZE
-            );
-            Vec3 chunkLocalSphereCenter = localSphereCenter - chunkOrigin;
-            
-            // Check collision with this chunk
-            if (checkChunkSphereCollision(chunk, chunkLocalSphereCenter, chunkOrigin, outNormal, radius))
+            for (int chunkY = minChunkY; chunkY <= maxChunkY; ++chunkY)
             {
-                // Transform collision normal from island-local to world space
-                outNormal = island->localDirToWorld(outNormal);
-                
-                if (outIsland)
-                    *outIsland = island;
-                
-                return true;
+                for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ)
+                {
+                    Vec3 chunkCoord(chunkX, chunkY, chunkZ);
+                    auto chunkIt = island->chunks.find(chunkCoord);
+                    if (chunkIt == island->chunks.end() || !chunkIt->second)
+                        continue;
+                    
+                    const VoxelChunk* chunk = chunkIt->second.get();
+                    if (!chunk) continue;
+            
+                    // Transform to chunk-local space
+                    Vec3 chunkOrigin(
+                        chunkX * VoxelChunk::SIZE,
+                        chunkY * VoxelChunk::SIZE,
+                        chunkZ * VoxelChunk::SIZE
+                    );
+                    Vec3 chunkLocalSphereCenter = localSphereCenter - chunkOrigin;
+                    
+                    // Check collision with this chunk
+                    if (checkChunkSphereCollision(chunk, chunkLocalSphereCenter, chunkOrigin, outNormal, radius))
+                    {
+                        // Transform collision normal from island-local to world space
+                        outNormal = island->localDirToWorld(outNormal);
+                        
+                        if (outIsland)
+                            *outIsland = island;
+                        
+                        return true;
+                    }
+                }
             }
         }
     }

@@ -22,88 +22,7 @@ void main() {
 }
 )GLSL";
 
-    // Godray/volumetric lighting fragment shader - dynamically generated with parameters
-    std::string godrayFS = R"GLSL(
-#version 460 core
-in vec2 vUV;
-
-uniform sampler2D uInputTexture;    // HDR scene texture
-uniform sampler2D uDepthTexture;    // Scene depth buffer
-uniform vec3 uSunDirection;         // Direction TO the sun
-uniform vec3 uCameraPosition;       // Camera position
-uniform float uIntensity;           // Godray intensity
-uniform float uDecay;               // Light decay factor
-uniform float uDensity;             // Sampling density
-uniform float uWeight;              // Light weight
-uniform mat4 uViewProjectionMatrix; // For accurate sun screen position
-
-out vec4 FragColor;
-
-const int NUM_SAMPLES = )GLSL" + std::to_string(EngineParameters::PostProcessing::GODRAY_SAMPLES) + R"GLSL(;
-
-vec2 worldToScreen(vec3 worldPos) {
-    // Transform world position to clip space
-    vec4 clipPos = uViewProjectionMatrix * vec4(worldPos, 1.0);
-    
-    // Perspective divide to get NDC
-    vec3 ndc = clipPos.xyz / clipPos.w;
-    
-    // Convert NDC to screen UV coordinates (0 to 1)
-    return ndc.xy * 0.5 + 0.5;
-}
-
-void main() {
-    // Sample the original scene color
-    vec3 sceneColor = texture(uInputTexture, vUV).rgb;
-    float depth = texture(uDepthTexture, vUV).r;
-    
-    // Calculate sun position in screen space using proper projection
-    // Sun is at infinite distance - position independent of camera location
-    vec3 sunWorldPos = -uSunDirection * 100000.0;  // Very far away, no camera dependency
-    vec2 sunScreenPos = worldToScreen(sunWorldPos);
-    
-    // Vector from current pixel to sun
-    vec2 deltaTexCoord = (sunScreenPos - vUV);
-    deltaTexCoord *= 1.0 / float(NUM_SAMPLES) * uDensity;
-    
-    // Initial sample position
-    vec2 samplePos = vUV;
-    
-    // Accumulate light samples along ray toward sun
-    float illuminationDecay = 1.0;
-    vec3 godrayColor = vec3(0.0);
-    
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        samplePos += deltaTexCoord;
-        
-        // Sample depth at this position
-        float sampleDepth = texture(uDepthTexture, samplePos).r;
-        
-        // Smooth occlusion with gentler falloff
-        float occlusionFactor = smoothstep(0.9, 1.0, sampleDepth);
-        
-        // Generate smooth light contribution
-        vec3 sampleColor = vec3(1.0);
-        sampleColor *= illuminationDecay * uWeight * occlusionFactor;
-        
-        godrayColor += sampleColor;
-        illuminationDecay *= uDecay;
-    }
-    
-    // Sun is always the same color - like real life
-    vec3 sunColor = vec3(1.0, 0.95, 0.8);  // Consistent warm white
-    
-    // Apply sun color and intensity
-    godrayColor *= sunColor * uIntensity;
-    
-    // Combine with original scene
-    vec3 finalColor = sceneColor + godrayColor;
-    
-    FragColor = vec4(finalColor, 1.0);
-}
-)GLSL";
-
-    // Tone mapping fragment shader (based on existing postprocess.frag)
+    // Tone mapping fragment shader
     static const char* kToneMappingFS = R"GLSL(
 #version 460 core
 in vec2 vUV;
@@ -250,15 +169,6 @@ bool PostProcessingPipeline::resize(int width, int height) {
 }
 
 bool PostProcessingPipeline::createFramebuffers() {
-    // Create intermediate texture (HDR format for effects processing)
-    glGenTextures(1, &m_intermediateTexture);
-    glBindTexture(GL_TEXTURE_2D, m_intermediateTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, m_width, m_height, 0, GL_RGBA, GL_FLOAT, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
     // Create final texture (LDR format for output)
     glGenTextures(1, &m_finalTexture);
     glBindTexture(GL_TEXTURE_2D, m_finalTexture);
@@ -267,16 +177,6 @@ bool PostProcessingPipeline::createFramebuffers() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
-    // Create intermediate framebuffer
-    glGenFramebuffers(1, &m_intermediateFBO);
-    glBindFramebuffer(GL_FRAMEBUFFER, m_intermediateFBO);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_intermediateTexture, 0);
-    
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        std::cerr << "❌ Intermediate framebuffer not complete!" << std::endl;
-        return false;
-    }
     
     // Create final framebuffer
     glGenFramebuffers(1, &m_finalFBO);
@@ -293,31 +193,14 @@ bool PostProcessingPipeline::createFramebuffers() {
 }
 
 bool PostProcessingPipeline::createShaders() {
-    // Compile vertex shader (shared)
+    // Compile vertex shader
     GLuint vs = CompileShader(GL_VERTEX_SHADER, kQuadVS);
     if (!vs) return false;
-    
-    // Compile godray fragment shader
-    GLuint godrayFSShader = CompileShader(GL_FRAGMENT_SHADER, godrayFS.c_str());
-    if (!godrayFSShader) {
-        glDeleteShader(vs);
-        return false;
-    }
     
     // Compile tone mapping fragment shader
     GLuint toneMappingFS = CompileShader(GL_FRAGMENT_SHADER, kToneMappingFS);
     if (!toneMappingFS) {
         glDeleteShader(vs);
-        glDeleteShader(godrayFSShader);
-        return false;
-    }
-    
-    // Link godray shader
-    m_godrayShader = LinkProgram(vs, godrayFSShader);
-    if (!m_godrayShader) {
-        glDeleteShader(vs);
-        glDeleteShader(godrayFSShader);
-        glDeleteShader(toneMappingFS);
         return false;
     }
     
@@ -325,26 +208,13 @@ bool PostProcessingPipeline::createShaders() {
     m_toneMappingShader = LinkProgram(vs, toneMappingFS);
     if (!m_toneMappingShader) {
         glDeleteShader(vs);
-        glDeleteShader(godrayFSShader);
         glDeleteShader(toneMappingFS);
         return false;
     }
     
-    // Clean up fragment shaders
+    // Clean up shaders
     glDeleteShader(vs);
-    glDeleteShader(godrayFSShader);
     glDeleteShader(toneMappingFS);
-    
-    // Cache uniform locations for godray shader
-    m_godray_loc_inputTexture = glGetUniformLocation(m_godrayShader, "uInputTexture");
-    m_godray_loc_depthTexture = glGetUniformLocation(m_godrayShader, "uDepthTexture");
-    m_godray_loc_sunDirection = glGetUniformLocation(m_godrayShader, "uSunDirection");
-    m_godray_loc_cameraPosition = glGetUniformLocation(m_godrayShader, "uCameraPosition");
-    m_godray_loc_intensity = glGetUniformLocation(m_godrayShader, "uIntensity");
-    m_godray_loc_decay = glGetUniformLocation(m_godrayShader, "uDecay");
-    m_godray_loc_density = glGetUniformLocation(m_godrayShader, "uDensity");
-    m_godray_loc_weight = glGetUniformLocation(m_godrayShader, "uWeight");
-    m_godray_loc_viewProjectionMatrix = glGetUniformLocation(m_godrayShader, "uViewProjectionMatrix");
     
     // Cache uniform locations for tone mapping shader
     m_tone_loc_hdrTexture = glGetUniformLocation(m_toneMappingShader, "uHDRTexture");
@@ -395,19 +265,9 @@ bool PostProcessingPipeline::createGeometry() {
 }
 
 void PostProcessingPipeline::deleteFramebuffers() {
-    if (m_intermediateTexture) {
-        glDeleteTextures(1, &m_intermediateTexture);
-        m_intermediateTexture = 0;
-    }
-    
     if (m_finalTexture) {
         glDeleteTextures(1, &m_finalTexture);
         m_finalTexture = 0;
-    }
-    
-    if (m_intermediateFBO) {
-        glDeleteFramebuffers(1, &m_intermediateFBO);
-        m_intermediateFBO = 0;
     }
     
     if (m_finalFBO) {
@@ -417,11 +277,6 @@ void PostProcessingPipeline::deleteFramebuffers() {
 }
 
 void PostProcessingPipeline::deleteShaders() {
-    if (m_godrayShader) {
-        glDeleteProgram(m_godrayShader);
-        m_godrayShader = 0;
-    }
-    
     if (m_toneMappingShader) {
         glDeleteProgram(m_toneMappingShader);
         m_toneMappingShader = 0;
@@ -432,18 +287,19 @@ void PostProcessingPipeline::process(GLuint inputTexture, GLuint depthTexture, c
                                      const glm::vec3& cameraPosition, const glm::mat4& viewProjectionMatrix) {
     if (!m_initialized || !m_enabled) return;
     
-    // We should always have a valid HDR input texture now
+    // Unused parameters (kept for API compatibility)
+    (void)depthTexture;
+    (void)sunDirection;
+    (void)cameraPosition;
+    (void)viewProjectionMatrix;
+    
     if (inputTexture == 0) {
         std::cerr << "❌ PostProcessingPipeline: No input texture provided!" << std::endl;
         return;
     }
     
-    // 1. Skip godray pass (disabled - doesn't work properly)
-    // Just use input texture directly for tone mapping
-    
-    // 2. Tone mapping pass: inputTexture -> finalTexture (if enabled)
+    // Tone mapping: HDR -> LDR
     if (EngineParameters::PostProcessing::ENABLE_TONE_MAPPING) {
-        // Always use input texture directly (godrays disabled)
         renderToneMapping(inputTexture);
     } else {
         // Skip tone mapping - copy input directly to final
@@ -460,49 +316,6 @@ void PostProcessingPipeline::process(GLuint inputTexture, GLuint depthTexture, c
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glBlitFramebuffer(0, 0, m_width, m_height, 0, 0, m_width, m_height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-}
-
-void PostProcessingPipeline::renderGodrays(GLuint inputTexture, GLuint depthTexture, const glm::vec3& sunDirection, 
-                                          const glm::vec3& cameraPosition, const glm::mat4& viewProjectionMatrix) {
-    // Bind intermediate framebuffer
-    glBindFramebuffer(GL_FRAMEBUFFER, m_intermediateFBO);
-    glViewport(0, 0, m_width, m_height);
-    
-    // Use godray shader
-    glUseProgram(m_godrayShader);
-    
-    // Bind textures
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, inputTexture);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, depthTexture);
-    
-    // Set uniforms
-    if (m_godray_loc_inputTexture >= 0)
-        glUniform1i(m_godray_loc_inputTexture, 0);
-    if (m_godray_loc_depthTexture >= 0)
-        glUniform1i(m_godray_loc_depthTexture, 1);
-    if (m_godray_loc_sunDirection >= 0)
-        glUniform3fv(m_godray_loc_sunDirection, 1, &sunDirection[0]);
-    if (m_godray_loc_cameraPosition >= 0)
-        glUniform3fv(m_godray_loc_cameraPosition, 1, &cameraPosition[0]);
-    if (m_godray_loc_viewProjectionMatrix >= 0)
-        glUniformMatrix4fv(m_godray_loc_viewProjectionMatrix, 1, GL_FALSE, &viewProjectionMatrix[0][0]);
-    if (m_godray_loc_intensity >= 0)
-        glUniform1f(m_godray_loc_intensity, m_godrayIntensity);
-    if (m_godray_loc_decay >= 0)
-        glUniform1f(m_godray_loc_decay, m_godrayDecay);
-    if (m_godray_loc_density >= 0)
-        glUniform1f(m_godray_loc_density, m_godrayDensity);
-    if (m_godray_loc_weight >= 0)
-        glUniform1f(m_godray_loc_weight, m_godrayWeight);
-    
-    // Render fullscreen quad
-    glBindVertexArray(m_quadVAO);
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-    glBindVertexArray(0);
-    
-    glUseProgram(0);
 }
 
 void PostProcessingPipeline::renderToneMapping(GLuint inputTexture) {

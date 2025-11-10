@@ -1,6 +1,7 @@
 #include "ModelInstanceRenderer.h"
 #include "../Assets/GLBLoader.h"
 #include "CascadedShadowMap.h"
+#include "../Profiling/Profiler.h"
 #include <glad/gl.h>
 #include "TextureManager.h"
 #include <glm/gtc/matrix_transform.hpp>
@@ -8,6 +9,7 @@
 #include <iostream>
 #include <cmath>
 #include <cstdio>
+#include <unordered_set>
 #include <tiny_gltf.h>
 
 // Global instance
@@ -375,8 +377,72 @@ uniform vec3 uMoonDir;
 uniform float uSunIntensity;
 uniform float uMoonIntensity;
 uniform vec3 uCameraPos;
+uniform mat4 uView;
+uniform mat4 uProjection;
+
+// G-Buffer textures for SSR
+uniform sampler2D uGBufferPosition;
+uniform sampler2D uGBufferNormal;
+uniform sampler2D uGBufferAlbedo;
+
+// Lit HDR color buffer
+uniform sampler2D uSceneColor;
 
 out vec4 FragColor;
+
+// Screen-space raymarch for reflections
+bool traceScreenSpaceRay(vec3 rayOrigin, vec3 rayDir, out vec2 hitUV, out vec3 hitColor) {
+    const int MAX_STEPS = 48;
+    const float STEP_SIZE = 0.3;
+    const float HIT_THICKNESS = 0.5;
+    
+    vec3 rayPos = rayOrigin + rayDir * 0.1;  // Start slightly ahead to avoid self-intersection
+    
+    for (int i = 0; i < MAX_STEPS; i++) {
+        rayPos += rayDir * STEP_SIZE;
+        
+        // Project to screen space
+        vec4 projPos = uProjection * uView * vec4(rayPos, 1.0);
+        
+        // Behind camera
+        if (projPos.w <= 0.0) {
+            return false;
+        }
+        
+        projPos.xyz /= projPos.w;
+        
+        // Convert to UV [0,1]
+        vec2 screenUV = projPos.xy * 0.5 + 0.5;
+        
+        // Out of screen bounds
+        if (screenUV.x < 0.0 || screenUV.x > 1.0 || screenUV.y < 0.0 || screenUV.y > 1.0) {
+            return false;
+        }
+        
+        // Sample G-buffer position at this screen location
+        vec3 gbufferPos = texture(uGBufferPosition, screenUV).xyz;
+        
+        // Check if G-buffer has valid geometry (non-zero position means it hit something)
+        if (length(gbufferPos) < 0.1) {
+            continue;  // Sky or invalid, keep marching
+        }
+        
+        // Check if ray passed through the surface
+        vec3 toGBuffer = gbufferPos - uCameraPos;
+        vec3 toRay = rayPos - uCameraPos;
+        float gbufferDepth = length(toGBuffer);
+        float rayDepth = length(toRay);
+        
+        // Ray is behind the surface
+        if (rayDepth >= gbufferDepth && (rayDepth - gbufferDepth) < HIT_THICKNESS) {
+            hitUV = screenUV;
+            hitColor = texture(uSceneColor, screenUV).rgb;
+            return true;
+        }
+    }
+    
+    return false;
+}
 
 void main(){
     vec3 N = normalize(vNormalWS);
@@ -386,10 +452,20 @@ void main(){
     float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
     fresnel = mix(0.02, 0.95, fresnel);
     
-    // Sky reflection color (gradient based on reflected direction)
+    // Reflection ray
     vec3 R = reflect(-V, N);
+    
+    // Try screen-space reflection
+    vec2 hitUV;
+    vec3 ssrColor;
+    bool hasSSR = traceScreenSpaceRay(vWorldPos, R, hitUV, ssrColor);
+    
+    // Fallback: Sky reflection color (gradient based on reflected direction)
     float skyGradient = R.y * 0.5 + 0.5;
     vec3 skyColor = mix(vec3(0.4, 0.7, 1.0), vec3(0.1, 0.3, 0.6), skyGradient);
+    
+    // Use SSR if hit, otherwise use sky
+    vec3 reflectionColor = hasSSR ? ssrColor : skyColor;
     
     // Sun specular highlight
     vec3 L_sun = normalize(-uSunDir);
@@ -411,8 +487,8 @@ void main(){
     float ndotl_moon = max(dot(N, L_moon), 0.0);
     vec3 diffuse = waterColor * (ndotl_sun * uSunIntensity + ndotl_moon * uMoonIntensity * 0.15);
     
-    // Combine: water diffuse + sky reflection + specular
-    vec3 reflectionColor = skyColor * fresnel;
+    // Combine: water diffuse + reflection + specular
+    reflectionColor *= fresnel;
     vec3 finalColor = mix(diffuse, reflectionColor, 0.7) + sunSpecular + moonSpecular;
     
     // Much more transparent - alpha based on viewing angle
@@ -912,6 +988,136 @@ void ModelInstanceRenderer::renderToGBuffer(const glm::mat4& view, const glm::ma
     if (wasCull) glEnable(GL_CULL_FACE);
 }
 
+void ModelInstanceRenderer::renderToGBufferCulled(const glm::mat4& view, const glm::mat4& proj, const std::vector<VoxelChunk*>& visibleChunks) {
+    PROFILE_SCOPE("ModelRenderer_GBuffer");
+    if (visibleChunks.empty()) return;
+    
+    // Build set of visible chunks for fast lookup
+    std::unordered_set<VoxelChunk*> visibleSet(visibleChunks.begin(), visibleChunks.end());
+    
+    // Disable culling for foliage rendering
+    GLboolean wasCull = glIsEnabled(GL_CULL_FACE);
+    if (wasCull) glDisable(GL_CULL_FACE);
+    
+    // Extract camera position for distance culling
+    glm::mat4 invView = glm::inverse(view);
+    glm::vec3 cameraPos = glm::vec3(invView[3]);
+    const float maxRenderDistance = 512.0f;
+    const float maxRenderDistanceSq = maxRenderDistance * maxRenderDistance;
+    
+    // Iterate through each block type
+    for (const auto& [blockID, model] : m_models) {
+        if (!model.valid) continue;
+        
+        // Skip water - it's rendered in the transparent forward pass
+        if (blockID == 45) continue;  // BlockID::WATER
+        
+        // Get or compile G-buffer shader for this block type
+        GLuint shader = 0;
+        auto shaderIt = m_gbufferShaders.find(blockID);
+        if (shaderIt == m_gbufferShaders.end()) {
+            // Get block-specific vertex shader (water, wind, or static)
+            const char* vertexShader = kVS_Static;
+            if (blockID == 45) {  // BlockID::WATER
+                vertexShader = kVS_Water;
+            } else if (blockID == 102) {  // BlockID::DECOR_GRASS
+                vertexShader = kVS_Wind;
+            }
+            
+            GLuint vsShader = Compile(GL_VERTEX_SHADER, vertexShader);
+            GLuint fsShader = Compile(GL_FRAGMENT_SHADER, kGBuffer_FS);
+            if (vsShader && fsShader) {
+                shader = Link(vsShader, fsShader);
+                glDeleteShader(vsShader);
+                glDeleteShader(fsShader);
+                m_gbufferShaders[blockID] = shader;
+            } else {
+                continue;
+            }
+        } else {
+            shader = shaderIt->second;
+        }
+        
+        if (!shader) continue;
+        
+        // Bind shader
+        glUseProgram(shader);
+        
+        // Set uniforms
+        int loc_View = glGetUniformLocation(shader, "uView");
+        int loc_Proj = glGetUniformLocation(shader, "uProjection");
+        int loc_Model = glGetUniformLocation(shader, "uModel");
+        int loc_Time = glGetUniformLocation(shader, "uTime");
+        int loc_Texture = glGetUniformLocation(shader, "uGrassTexture");
+        int loc_MaterialType = glGetUniformLocation(shader, "uMaterialType");
+        
+        glUniformMatrix4fv(loc_View, 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(loc_Proj, 1, GL_FALSE, &proj[0][0]);
+        glUniform1f(loc_Time, m_time);
+        
+        // Set material type: 0=textured, 1=water
+        int materialType = (blockID == 45) ? 1 : 0;  // BlockID::WATER = 45
+        if (loc_MaterialType != -1) {
+            glUniform1i(loc_MaterialType, materialType);
+        }
+        
+        // Bind texture
+        GLuint tex = 0;
+        if (blockID == 102 && m_engineGrassTex) {
+            tex = m_engineGrassTex;
+        } else {
+            auto texIt = m_albedoTextures.find(blockID);
+            if (texIt != m_albedoTextures.end()) {
+                tex = texIt->second;
+            }
+        }
+        
+        // Fallback: If no texture found, use a default texture
+        if (!tex) {
+            static GLuint fallbackTex = 0;
+            if (!fallbackTex) {
+                if (!g_textureManager) g_textureManager = new TextureManager();
+                fallbackTex = g_textureManager->getTexture("iron_block.png");
+            }
+            tex = fallbackTex;
+        }
+        
+        if (tex && loc_Texture >= 0) {
+            glActiveTexture(GL_TEXTURE5);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glUniform1i(loc_Texture, 5);
+        }
+        
+        // Render only chunks in visible set
+        for (auto& [key, buf] : m_chunkInstances) {
+            if (key.second != blockID) continue;
+            if (buf.count == 0 || !buf.isUploaded) continue;
+            
+            // FRUSTUM CULLING: Skip chunks not in visible set
+            if (visibleSet.find(key.first) == visibleSet.end()) continue;
+            
+            // Distance culling
+            glm::vec3 chunkPos = glm::vec3(buf.modelMatrix[3]);
+            glm::vec3 delta = cameraPos - chunkPos;
+            float distanceSq = glm::dot(delta, delta);
+            if (distanceSq > maxRenderDistanceSq) continue;
+            
+            // Set model matrix
+            glUniformMatrix4fv(loc_Model, 1, GL_FALSE, &buf.modelMatrix[0][0]);
+            
+            // Render instances
+            for (size_t i = 0; i < buf.vaos.size() && i < model.primitives.size(); ++i) {
+                glBindVertexArray(buf.vaos[i]);
+                glDrawElementsInstanced(GL_TRIANGLES, model.primitives[i].indexCount, GL_UNSIGNED_INT, 0, buf.count);
+            }
+        }
+    }
+    
+    // Cleanup
+    glBindVertexArray(0);
+    if (wasCull) glEnable(GL_CULL_FACE);
+}
+
 // ========== SHADOW PASS METHODS ==========
 
 void ModelInstanceRenderer::beginDepthPass(const glm::mat4& lightVP, int cascadeIndex)
@@ -991,7 +1197,9 @@ void ModelInstanceRenderer::endDepthPass(int screenWidth, int screenHeight)
 void ModelInstanceRenderer::renderWaterTransparent(const glm::mat4& view, const glm::mat4& proj,
                                                   const glm::vec3& sunDir, float sunIntensity,
                                                   const glm::vec3& moonDir, float moonIntensity,
-                                                  const glm::vec3& cameraPos)
+                                                  const glm::vec3& cameraPos,
+                                                  GLuint gbufferPositionTex, GLuint gbufferNormalTex, 
+                                                  GLuint gbufferAlbedoTex, GLuint sceneColorTex)
 {
     // Compile water shader if needed
     if (m_waterTransparentShader == 0) {
@@ -1011,7 +1219,30 @@ void ModelInstanceRenderer::renderWaterTransparent(const glm::mat4& view, const 
     auto modelIt = m_models.find(waterBlockID);
     if (modelIt == m_models.end() || !modelIt->second.valid) return;
     
+    // Enable face culling for water to fix underwater visibility
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    
     glUseProgram(m_waterTransparentShader);
+    
+    // Bind G-buffer and scene color textures for SSR
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, gbufferPositionTex);
+    glUniform1i(glGetUniformLocation(m_waterTransparentShader, "uGBufferPosition"), 5);
+    
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D, gbufferNormalTex);
+    glUniform1i(glGetUniformLocation(m_waterTransparentShader, "uGBufferNormal"), 6);
+    
+    glActiveTexture(GL_TEXTURE7);
+    glBindTexture(GL_TEXTURE_2D, gbufferAlbedoTex);
+    glUniform1i(glGetUniformLocation(m_waterTransparentShader, "uGBufferAlbedo"), 7);
+    
+    glActiveTexture(GL_TEXTURE8);
+    glBindTexture(GL_TEXTURE_2D, sceneColorTex);
+    glUniform1i(glGetUniformLocation(m_waterTransparentShader, "uSceneColor"), 8);
+    
+    glActiveTexture(GL_TEXTURE0);  // Reset to default
     
     // Set uniforms
     int loc_View = glGetUniformLocation(m_waterTransparentShader, "uView");
@@ -1051,5 +1282,8 @@ void ModelInstanceRenderer::renderWaterTransparent(const glm::mat4& view, const 
             glBindVertexArray(0);
         }
     }
+    
+    // Restore culling state
+    glDisable(GL_CULL_FACE);
 }
 

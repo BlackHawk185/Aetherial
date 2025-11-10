@@ -12,7 +12,7 @@ DayNightController* g_dayNightController = nullptr;
 
 DayNightController::DayNightController()
     : m_currentTime(12.0f)     // Start at noon for nice lighting
-    , m_timeSpeed(600.0f)       // 600x speed = 1 minute day cycle
+    , m_timeSpeed(600.0f)        // 60x speed = 24 minute day cycle (1440 real minutes / 24 = 60x)
     , m_paused(false)
     , m_moonPhase(14.765f)      // Start moon ~180 degrees from sun (half lunar cycle)
     , m_moonOrbitSpeed(1.0f / 29.53f)  // Moon takes 29.53 days to orbit (relative to sun's 1-day cycle)

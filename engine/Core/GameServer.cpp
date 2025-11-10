@@ -220,17 +220,9 @@ void GameServer::serverLoop()
         }
 
         // Update tick rate statistics
-        {
-            PROFILE_SCOPE("updateTickRateStats");
-            updateTickRateStats(deltaTime);
-        }
+        updateTickRateStats(deltaTime);
 
-        // Update profiler (will auto-report every second)
-        g_profiler.updateAndReport();
-
-        // Sleep to avoid consuming 100% CPU
-        // Target is to wake up several times per fixed timestep for responsiveness
-        std::this_thread::sleep_for(std::chrono::microseconds(1000));  // 1ms
+        std::this_thread::sleep_for(std::chrono::microseconds(1000));
     }
 
     // Removed verbose debug output
@@ -241,36 +233,29 @@ void GameServer::processTick(float deltaTime)
     PROFILE_SCOPE("GameServer::processTick");
     
     // Process queued commands first
-    {
-        PROFILE_SCOPE("processQueuedCommands");
-        processQueuedCommands();
-    }
+    processQueuedCommands();
 
     // Update networking
     if (m_networkingEnabled && m_networkManager)
     {
-        PROFILE_SCOPE("NetworkManager::update");
         m_networkManager->update();
     }
 
     // Update time manager
     if (m_timeManager)
     {
-        PROFILE_SCOPE("TimeManager::update");
         m_timeManager->update(deltaTime);
     }
 
     // Update game simulation
     if (m_serverWorld)
     {
-        PROFILE_SCOPE("GameState::updateSimulation");
         m_serverWorld->updatePhysics(deltaTime, &m_serverPhysics);
         m_serverWorld->updateSimulation(deltaTime);
         
         // Update fluid system
         if (m_fluidSystem)
         {
-            PROFILE_SCOPE("FluidSystem::update");
             m_fluidSystem->update(deltaTime);
         }
         
@@ -284,7 +269,6 @@ void GameServer::processTick(float deltaTime)
     // Broadcast island state updates to clients
     if (m_networkingEnabled && m_networkManager)
     {
-        PROFILE_SCOPE("broadcastIslandStates");
         broadcastIslandStates();
     }
 }

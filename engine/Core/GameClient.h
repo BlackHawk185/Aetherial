@@ -4,13 +4,13 @@
 
 #include "../Math/Vec3.h"
 #include "../Input/PlayerController.h"
-#include "../Culling/FrustumCuller.h"
 #include "../World/VoxelRaycaster.h"
 #include "../World/ElementRecipes.h"  // NEW: Element-based crafting system
 #include "../Network/NetworkManager.h"  // Re-enabled with ENet integration working
 #include "../Time/DayNightController.h"  // NEW: Simplified day/night cycle
 #include <memory>
 #include <string>
+#include <array>
 #include <unordered_map>
 
 // Forward declarations
@@ -18,6 +18,7 @@ class ClientWorld;
 class BlockHighlightRenderer;
 class HUD;
 class PeriodicTableUI;
+class VoxelChunk;
 struct GLFWwindow;
 struct VoxelChangeUpdate;
 struct WorldStateMessage;
@@ -136,7 +137,6 @@ private:
     
     // Player control system (unified input, physics, and camera)
     PlayerController m_playerController;
-    FrustumCuller m_frustumCuller;
     std::unique_ptr<BlockHighlightRenderer> m_blockHighlighter;
     std::unique_ptr<HUD> m_hud;
     std::unique_ptr<PeriodicTableUI> m_periodicTableUI;
@@ -205,7 +205,7 @@ private:
     /**
      * Render shadow depth pass for cascaded shadow mapping
      */
-    void renderShadowPass();
+    void renderShadowPass(const std::vector<VoxelChunk*>& visibleChunks);
     
     /**
      * Handle received world state from server

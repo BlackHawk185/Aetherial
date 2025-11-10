@@ -72,12 +72,15 @@ public:
     
     // G-buffer rendering (deferred rendering - writes geometry data only)
     void renderToGBuffer(const glm::mat4& view, const glm::mat4& proj);
+    void renderToGBufferCulled(const glm::mat4& view, const glm::mat4& proj, const std::vector<VoxelChunk*>& visibleChunks);
     
     // Forward transparent water rendering (after deferred lighting)
     void renderWaterTransparent(const glm::mat4& view, const glm::mat4& proj,
                                const glm::vec3& sunDir, float sunIntensity,
                                const glm::vec3& moonDir, float moonIntensity,
-                               const glm::vec3& cameraPos);
+                               const glm::vec3& cameraPos,
+                               GLuint gbufferPositionTex, GLuint gbufferNormalTex, 
+                               GLuint gbufferAlbedoTex, GLuint sceneColorTex);
 
     // Update model matrix without rendering (stores pre-calculated chunk transform)
     void updateModelMatrix(uint8_t blockID, VoxelChunk* chunk, const glm::mat4& chunkTransform);

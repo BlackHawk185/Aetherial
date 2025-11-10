@@ -160,36 +160,76 @@ float sampleCascade(int cascadeIndex, vec3 worldPos, float bias) {
 }
 
 // Sample light for sun (cascades 0 and 1)
-float sampleSunLight(vec3 worldPos, float bias) {
+float sampleSunLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
     float lightNear = sampleCascade(0, worldPos, bias);
     float lightFar = sampleCascade(1, worldPos, bias);
     
     bool nearValid = (lightNear >= 0.0);
     bool farValid = (lightFar >= 0.0);
     
-    if (nearValid) {
+    // Blend cascades in transition zone
+    if (nearValid && farValid) {
+        // Both cascades valid - blend based on distance to near cascade edge
+        vec4 lightSpacePos = uCascadeVP[0] * vec4(worldPos, 1.0);
+        vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
+        proj = proj * 0.5 + 0.5;
+        
+        // Calculate distance to edge (0.0 = center, 1.0 = edge)
+        vec2 distToEdge = abs(proj.xy - 0.5) * 2.0;
+        float maxDist = max(distToEdge.x, distToEdge.y);
+        
+        // Blend in outer 20% of cascade
+        float blendStart = 0.80;
+        float blendFactor = smoothstep(blendStart, 1.0, maxDist);
+        
+        return mix(lightNear, lightFar, blendFactor);
+    } else if (nearValid) {
         return lightNear;
     } else if (farValid) {
         return lightFar;
     } else {
-        return 0.0;  // Dark by default
+        // Ultra far cascade - no shadow map, just face normal check
+        // lightDir points FROM sun, so negate to get direction TO sun
+        vec3 L = normalize(-lightDir);
+        float ndotl = dot(normal, L);
+        return (ndotl > 0.0) ? 1.0 : 0.0;
     }
 }
 
 // Sample light for moon (cascades 2 and 3)
-float sampleMoonLight(vec3 worldPos, float bias) {
+float sampleMoonLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
     float lightNear = sampleCascade(2, worldPos, bias);
     float lightFar = sampleCascade(3, worldPos, bias);
     
     bool nearValid = (lightNear >= 0.0);
     bool farValid = (lightFar >= 0.0);
     
-    if (nearValid) {
+    // Blend cascades in transition zone
+    if (nearValid && farValid) {
+        // Both cascades valid - blend based on distance to near cascade edge
+        vec4 lightSpacePos = uCascadeVP[2] * vec4(worldPos, 1.0);
+        vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
+        proj = proj * 0.5 + 0.5;
+        
+        // Calculate distance to edge (0.0 = center, 1.0 = edge)
+        vec2 distToEdge = abs(proj.xy - 0.5) * 2.0;
+        float maxDist = max(distToEdge.x, distToEdge.y);
+        
+        // Blend in outer 20% of cascade
+        float blendStart = 0.80;
+        float blendFactor = smoothstep(blendStart, 1.0, maxDist);
+        
+        return mix(lightNear, lightFar, blendFactor);
+    } else if (nearValid) {
         return lightNear;
     } else if (farValid) {
         return lightFar;
     } else {
-        return 0.0;  // Dark by default
+        // Ultra far cascade - no shadow map, just face normal check
+        // lightDir points FROM moon, so negate to get direction TO moon
+        vec3 L = normalize(-lightDir);
+        float ndotl = dot(normal, L);
+        return (ndotl > 0.0) ? 1.0 : 0.0;
     }
 }
 
@@ -214,7 +254,7 @@ void main() {
     vec3 L_sun = normalize(-uSunDir);
     float ndotl_sun = max(dot(N, L_sun), 0.0);
     float bias_sun = max(0.0005, 0.001 * (1.0 - ndotl_sun));
-    float sunLightFactor = sampleSunLight(worldPos, bias_sun);
+    float sunLightFactor = sampleSunLight(worldPos, bias_sun, N, uSunDir);
     
     // Apply cloud shadows to sun light
     float cloudShadow = sampleCloudShadow(worldPos, uTimeOfDay);
@@ -224,7 +264,7 @@ void main() {
     vec3 L_moon = normalize(-uMoonDir);
     float ndotl_moon = max(dot(N, L_moon), 0.0);
     float bias_moon = max(0.0005, 0.001 * (1.0 - ndotl_moon));
-    float moonLightFactor = sampleMoonLight(worldPos, bias_moon);
+    float moonLightFactor = sampleMoonLight(worldPos, bias_moon, N, uMoonDir);
     
     vec3 finalColor;
     

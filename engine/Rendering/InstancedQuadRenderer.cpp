@@ -4,6 +4,7 @@
 #include "TextureManager.h"
 #include "CascadedShadowMap.h"
 #include "../Time/DayNightController.h"
+#include "../Profiling/Profiler.h"
 
 #include <iostream>
 #include <glm/gtc/type_ptr.hpp>
@@ -816,6 +817,93 @@ void InstancedQuadRenderer::renderToGBuffer(const glm::mat4& viewProjection, con
     glBindVertexArray(0);
 }
 
+void InstancedQuadRenderer::renderToGBufferCulled(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks)
+{
+    PROFILE_SCOPE("QuadRenderer_GBuffer");
+    (void)view;  // Not needed for G-buffer pass
+    
+    if (m_chunks.empty() || visibleChunks.empty())
+        return;
+    
+    // Enable face culling
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    
+    glUseProgram(m_gbufferProgram);
+    glUniformMatrix4fv(m_gbuffer_uViewProjection, 1, GL_FALSE, glm::value_ptr(viewProjection));
+    
+    // Bind texture array
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_blockTextureArray);
+    glUniform1i(m_gbuffer_uBlockTextures, 0);
+    
+    // Rebuild MDI buffers if dirty
+    if (m_mdiDirty) {
+        rebuildMDIBuffers();
+    }
+    
+    // Build list of visible chunk entries and transforms
+    std::vector<const ChunkEntry*> visibleEntries;
+    std::vector<glm::mat4> transforms;
+    visibleEntries.reserve(visibleChunks.size());
+    transforms.reserve(visibleChunks.size());
+    
+    {
+        PROFILE_SCOPE("FindVisibleChunks");
+        for (VoxelChunk* chunk : visibleChunks) {
+            // Find chunk in our registered list
+            for (const auto& entry : m_chunks) {
+                if (entry.chunk == chunk && entry.instanceCount > 0) {
+                    visibleEntries.push_back(&entry);
+                    transforms.push_back(entry.transform);
+                    break;
+                }
+            }
+        }
+    }
+    
+    if (visibleEntries.empty()) return;
+    
+    // Build draw commands for visible chunks
+    std::vector<DrawElementsIndirectCommand> commands;
+    commands.reserve(visibleEntries.size());
+    
+    {
+        PROFILE_SCOPE("UploadGPUData");
+        // Upload transforms for visible chunks
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, transforms.size() * sizeof(glm::mat4), transforms.data());
+        
+        for (size_t i = 0; i < visibleEntries.size(); ++i) {
+            const ChunkEntry* entry = visibleEntries[i];
+            commands.push_back({
+                6,                                    // count (6 indices per quad)
+                static_cast<uint32_t>(entry->instanceCount),  // instanceCount
+                0,                                    // firstIndex
+                0,                                    // baseVertex
+                static_cast<uint32_t>(entry->baseInstance)    // baseInstance
+            });
+        }
+        
+        // Upload culled draw commands
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
+        glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0, commands.size() * sizeof(DrawElementsIndirectCommand), commands.data());
+    }
+    
+    {
+        PROFILE_SCOPE("ActualGPUDraw");
+        // Bind global VAO and transform SSBO
+        glBindVertexArray(m_globalVAO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_transformSSBO);
+        
+        // SINGLE MDI CALL with only visible chunks
+        glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
+                                    static_cast<GLsizei>(commands.size()), 0);
+    }
+    
+    glBindVertexArray(0);
+}
+
 void InstancedQuadRenderer::clear()
 {
     // No per-chunk VAOs/VBOs to delete - just clear the list
@@ -926,6 +1014,68 @@ void InstancedQuadRenderer::renderDepth()
     // SINGLE MDI CALL FOR ALL CHUNKS! (shadows)
     glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
                                 static_cast<GLsizei>(drawCount), 0);
+    
+    glBindVertexArray(0);
+}
+
+void InstancedQuadRenderer::renderDepthCulled(const std::vector<VoxelChunk*>& visibleChunks)
+{
+    if (m_depthProgram == 0 || m_chunks.empty() || visibleChunks.empty()) return;
+    
+    // Rebuild MDI buffers if dirty
+    if (m_mdiDirty) {
+        rebuildMDIBuffers();
+    }
+    
+    // Build list of visible chunk entries and transforms
+    std::vector<const ChunkEntry*> visibleEntries;
+    std::vector<glm::mat4> transforms;
+    visibleEntries.reserve(visibleChunks.size());
+    transforms.reserve(visibleChunks.size());
+    
+    for (VoxelChunk* chunk : visibleChunks) {
+        // Find chunk in our registered list
+        for (const auto& entry : m_chunks) {
+            if (entry.chunk == chunk && entry.instanceCount > 0) {
+                visibleEntries.push_back(&entry);
+                transforms.push_back(entry.transform);
+                break;
+            }
+        }
+    }
+    
+    if (visibleEntries.empty()) return;
+    
+    // Upload transforms for visible chunks
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, transforms.size() * sizeof(glm::mat4), transforms.data());
+    
+    // Build draw commands for visible chunks only
+    std::vector<DrawElementsIndirectCommand> commands;
+    commands.reserve(visibleEntries.size());
+    
+    for (size_t i = 0; i < visibleEntries.size(); ++i) {
+        const ChunkEntry* entry = visibleEntries[i];
+        commands.push_back({
+            6,                                    // count (6 indices per quad)
+            static_cast<uint32_t>(entry->instanceCount),  // instanceCount
+            0,                                    // firstIndex
+            0,                                    // baseVertex
+            static_cast<uint32_t>(entry->baseInstance)    // baseInstance
+        });
+    }
+    
+    // Upload culled draw commands
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
+    glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0, commands.size() * sizeof(DrawElementsIndirectCommand), commands.data());
+    
+    // Bind and draw
+    glBindVertexArray(m_globalVAO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_transformSSBO);
+    
+    // MDI call with only visible chunks
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
+                                static_cast<GLsizei>(commands.size()), 0);
     
     glBindVertexArray(0);
 }

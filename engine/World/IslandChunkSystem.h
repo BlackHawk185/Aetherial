@@ -205,6 +205,7 @@ class IslandChunkSystem
     // Rendering interface
     void getAllChunks(std::vector<VoxelChunk*>& outChunks);
     void getVisibleChunks(const Vec3& viewPosition, std::vector<VoxelChunk*>& outChunks);
+    void getVisibleChunksFrustum(const class Frustum& frustum, std::vector<VoxelChunk*>& outChunks);
 
     // **ORGANIC ISLAND GENERATION** (Creates chunks dynamically based on island shape)
     // This is now the primary and only island generation method

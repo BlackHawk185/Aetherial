@@ -6,6 +6,7 @@
 #include "../World/VoxelChunk.h"
 #include <iostream>
 #include <random>
+#include <future>
 
 SimulationState::SimulationState()
 {
@@ -127,9 +128,9 @@ void SimulationState::createDefaultWorld()
     // World generation config
     struct WorldGenConfig {
         uint32_t worldSeed;
-        float regionSize = 2500.0f;
-        float voronoiCellSizeMin = 600.0f;   // Min Voronoi cell size (determines spacing & island size)
-        float voronoiCellSizeMax = 1000.0f;  // Max Voronoi cell size (variation in spacing & size)
+        float regionSize = 4000.0f;
+        float voronoiCellSizeMin = 1000.0f;   // Min Voronoi cell size (determines spacing & island size)
+        float voronoiCellSizeMax = 2500.0f;  // Max Voronoi cell size (variation in spacing & size)
         float islandToVoronoiCellRatio = 0.5f;  // Island radius = 35% of cell size (30-40% with noise)
     } config;
     config.worldSeed = randomSeed;
@@ -149,7 +150,10 @@ void SimulationState::createDefaultWorld()
 
     std::cout << "✅ Generated " << islandDefs.size() << " island definitions" << std::endl;
 
-    // Create islands from definitions
+    // Create islands from definitions using std::async for parallel generation
+    std::vector<std::future<void>> futures;
+    futures.reserve(islandDefs.size());
+
     for (size_t i = 0; i < islandDefs.size(); i++)
     {
         const auto& def = islandDefs[i];
@@ -160,8 +164,15 @@ void SimulationState::createDefaultWorld()
                   << " @ (" << def.position.x << ", " << def.position.y << ", " << def.position.z << ")"
                   << " radius=" << def.radius << std::endl;
 
-        // Generate voxel terrain for this island
-        m_islandSystem.generateFloatingIslandOrganic(islandID, def.seed, def.radius, def.biome);
+        // Launch async task for voxel terrain generation
+        futures.push_back(std::async(std::launch::async, [this, islandID, seed = def.seed, radius = def.radius, biome = def.biome]() {
+            m_islandSystem.generateFloatingIslandOrganic(islandID, seed, radius, biome);
+        }));
+    }
+
+    // Wait for all island generation tasks to complete
+    for (auto& future : futures) {
+        future.get();
     }
 
     // Set spawn position to first island

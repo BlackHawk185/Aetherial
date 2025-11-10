@@ -61,7 +61,6 @@ int main(int argc, char* argv[])
     RunMode runMode = RunMode::INTEGRATED;  // Default to working integrated mode
     std::string serverAddress = "localhost";
     uint16_t serverPort = 12346;    // Changed from 7777 to a higher port number
-    bool enableNetworking = false;  // Allow external connections in integrated mode
     bool enableDebug = false;       // Enable OpenGL debug output
 
     for (int i = 1; i < argc; i++)
@@ -69,10 +68,6 @@ int main(int argc, char* argv[])
         if (strcmp(argv[i], "--server") == 0 || strcmp(argv[i], "SERVER_ONLY") == 0)
         {
             runMode = RunMode::SERVER_ONLY;
-        }
-        else if (strcmp(argv[i], "--enable-networking") == 0)
-        {
-            enableNetworking = true;  // Allow external connections to integrated mode
         }
         else if (strcmp(argv[i], "--debug") == 0)
         {
@@ -98,8 +93,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Enable profiler to diagnose performance bottlenecks
-    g_profiler.setEnabled(false);  // Disabled - profiling complete
+    g_profiler.setEnabled(true);
 
     g_timeManager = new TimeManager();
     g_timeEffects = new TimeEffects();
@@ -236,9 +230,8 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Disable profiler early in teardown to avoid any late-use
+    g_profiler.printShutdownReport();
     g_profiler.setEnabled(false);
-    g_profiler.clearAll();
 
     delete g_timeEffects;
     delete g_timeManager;

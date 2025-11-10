@@ -212,21 +212,18 @@ bool GameClient::update(float deltaTime)
     // Update networking if remote client
     if (m_isRemoteClient && m_networkManager)
     {
-        PROFILE_SCOPE("NetworkManager::update");
         m_networkManager->update();
     }
 
     // Process completed async mesh generations (fast - just swaps data)
     if (g_asyncMeshGenerator)
     {
-        PROFILE_SCOPE("processCompletedMeshes");
         g_asyncMeshGenerator->processCompletedMeshes();
     }
 
     // Update client-side physics for smooth island movement
     if (m_clientWorld)
     {
-        PROFILE_SCOPE("updateIslandPhysics");
         auto* islandSystem = m_clientWorld->getIslandSystem();
         if (islandSystem)
         {
@@ -239,7 +236,6 @@ bool GameClient::update(float deltaTime)
     // Update day/night cycle for dynamic sun/lighting
     if (m_dayNightController)
     {
-        PROFILE_SCOPE("DayNightController::update");
         m_dayNightController->update(deltaTime);
     }
 
@@ -266,9 +262,6 @@ bool GameClient::update(float deltaTime)
         PROFILE_SCOPE("Window::update");
         if (m_window) m_window->update();
     }
-
-    // Update profiler (will auto-report every second)
-    g_profiler.updateAndReport();
 
     return true;
 }
@@ -371,17 +364,6 @@ void GameClient::render()
     
     // Clear depth buffer only (gradient sky will be rendered by deferred lighting shader)
     glClear(GL_DEPTH_BUFFER_BIT);
-
-    // Set up 3D projection
-    {
-        PROFILE_SCOPE("Setup 3D projection");
-        
-        float aspect = (float) m_windowWidth / (float) m_windowHeight;
-        float fov = 45.0f;
-        
-        // Update frustum culling
-        m_frustumCuller.updateFromCamera(m_playerController.getCamera(), aspect, fov);
-    }
 
     // Render world (only if we have local game state)
     if (m_clientWorld)
@@ -893,21 +875,36 @@ void GameClient::renderWorld()
     }
     
     // Sync island physics to chunk transforms (updates GLB instances)
-    {
-        PROFILE_SCOPE("syncPhysicsToChunks");
-        syncPhysicsToChunks();
-    }
+    syncPhysicsToChunks();
 
     // Get camera matrices once
     float aspect = (float)m_windowWidth / (float)m_windowHeight;
     glm::mat4 projectionMatrix = m_playerController.getCamera().getProjectionMatrix(aspect);
     glm::mat4 viewMatrix = m_playerController.getCamera().getViewMatrix();
+    
+    // Update and get frustum for culling
+    m_playerController.getCamera().updateFrustum(aspect);
+    const Frustum& frustum = m_playerController.getCamera().getFrustum();
+    
+    // Get visible chunks using frustum culling
+    std::vector<VoxelChunk*> visibleChunks;
+    {
+        PROFILE_SCOPE("FrustumCull");
+        m_clientWorld->getIslandSystem()->getVisibleChunksFrustum(frustum, visibleChunks);
+    }
+    
+    // Log visible chunk count
+    static int frameCounter = 0;
+    if (++frameCounter % 60 == 0)
+    {
+        std::cout << "Visible chunks: " << visibleChunks.size() << std::endl;
+    }
 
     // Light depth pass (throttled - only update every Nth frame for performance)
     m_frameCounter++;
     if (m_frameCounter % m_shadowUpdateInterval == 0)
     {
-        renderShadowPass();
+        renderShadowPass(visibleChunks);
     }
 
     // === DEFERRED RENDERING PIPELINE ===
@@ -920,16 +917,16 @@ void GameClient::renderWorld()
         
         glm::mat4 viewProjection = projectionMatrix * viewMatrix;
         
-        // Render voxel quads to G-buffer
+        // Render voxel quads to G-buffer (frustum culled)
         if (g_instancedQuadRenderer)
         {
-            g_instancedQuadRenderer->renderToGBuffer(viewProjection, viewMatrix);
+            g_instancedQuadRenderer->renderToGBufferCulled(viewProjection, viewMatrix, visibleChunks);
         }
         
-        // Render GLB models to G-buffer
+        // Render GLB models to G-buffer (frustum culled)
         if (g_modelRenderer)
         {
-            g_modelRenderer->renderToGBuffer(viewMatrix, projectionMatrix);
+            g_modelRenderer->renderToGBufferCulled(viewMatrix, projectionMatrix, visibleChunks);
         }
         
         g_gBuffer.unbind();
@@ -1001,12 +998,16 @@ void GameClient::renderWorld()
         glEnable(GL_DEPTH_TEST);     // Read depth buffer
         glDepthMask(GL_FALSE);       // Don't write to depth buffer
         
-        // Render water blocks with transparency
+        // Render water blocks with transparency and SSR
         if (g_modelRenderer) {
             g_modelRenderer->renderWaterTransparent(viewMatrix, projectionMatrix, 
                                                    sunDirGLM, sunIntensity, 
                                                    moonDirGLM, moonIntensity, 
-                                                   cameraPosGLM);
+                                                   cameraPosGLM,
+                                                   g_gBuffer.getPositionTexture(),
+                                                   g_gBuffer.getNormalTexture(),
+                                                   g_gBuffer.getAlbedoTexture(),
+                                                   g_hdrFramebuffer.getColorTexture());
         }
         
         // Restore state
@@ -1054,7 +1055,7 @@ void GameClient::renderWorld()
     }
 }
 
-void GameClient::renderShadowPass()
+void GameClient::renderShadowPass(const std::vector<VoxelChunk*>& visibleChunks)
 {
     PROFILE_SCOPE("GameClient::renderLightPass");
     
@@ -1082,21 +1083,29 @@ void GameClient::renderShadowPass()
         bool isNear = (cascadeIdx % 2 == 0);
         float splitDistance = isNear ? cascade0Split : cascade1Split;
         float orthoSize = isNear ? nearOrthoSize : farOrthoSize;
-        float nearPlane = 1.0f;
-        float farPlane = splitDistance + 50.0f;
+        
+        // Depth range must cover ALL shadow casters visible from camera
+        // At sunset/sunrise (horizontal sun), shadow casters can be very far along light direction
+        // Use a very large depth range to ensure we capture everything
+        float depthRange = (orthoSize + splitDistance) * 4.0f;  // 4x safety margin for low sun angles
+        float nearPlane = 0.1f;
+        float farPlane = depthRange;
         
         // Build light view matrix centered on camera
+        // Position light far back along light direction to capture shadow casters behind camera
         glm::vec3 lightTarget = camPos;
-        glm::vec3 lightPos = camPos - lightDir * (farPlane * 0.5f);
+        glm::vec3 lightPos = camPos - lightDir * (depthRange * 0.5f);
         glm::mat4 lightView = glm::lookAt(lightPos, lightTarget, glm::vec3(0,1,0));
         
         // Build light projection with texel snapping for stability
         glm::mat4 lightProj = glm::ortho(-orthoSize, orthoSize, -orthoSize, orthoSize, nearPlane, farPlane);
         
         // Snap to texel grid to prevent light map shimmering
+        // IMPORTANT: Use far cascade's texel size for all cascades so they snap to the same grid
+        // This prevents cascade transition artifacts
         glm::vec4 centerLS = lightView * glm::vec4(lightTarget, 1.0f);
         int smWidth = g_shadowMap.getSize();
-        float texelSize = (2.0f * orthoSize) / float(smWidth);
+        float texelSize = (2.0f * farOrthoSize) / float(smWidth);  // Use far cascade size for consistent snapping
         glm::vec2 snapped = glm::floor(glm::vec2(centerLS.x, centerLS.y) / texelSize) * texelSize;
         glm::vec2 delta = snapped - glm::vec2(centerLS.x, centerLS.y);
         glm::mat4 snapMat = glm::translate(glm::mat4(1.0f), glm::vec3(-delta.x, -delta.y, 0.0f));
@@ -1115,11 +1124,11 @@ void GameClient::renderShadowPass()
             // Begin light map rendering (clears depth buffer, sets up FBO)
             g_shadowMap.begin(cascadeIdx);
             
-            // Render voxels into light map (they block light!)
+            // Render voxels into light map (they block light!) - use frustum culled chunks
             if (g_instancedQuadRenderer)
             {
                 g_instancedQuadRenderer->beginDepthPass(lightVP, cascadeIdx);
-                g_instancedQuadRenderer->renderDepth();
+                g_instancedQuadRenderer->renderDepthCulled(visibleChunks);
                 g_instancedQuadRenderer->endDepthPass(m_windowWidth, m_windowHeight);
             }
             
@@ -1312,9 +1321,6 @@ void GameClient::syncPhysicsToChunks()
     {
         // Skip islands that haven't moved (need const_cast because getIslands() returns const ref)
         if (!island.needsPhysicsUpdate) continue;
-        
-        // Calculate island transform once (includes rotation + translation)
-        glm::mat4 islandTransform = island.getTransformMatrix();
         
         // Update transforms for all chunks in this island
         for (auto& [chunkCoord, chunk] : island.chunks)

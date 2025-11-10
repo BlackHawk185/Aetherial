@@ -26,10 +26,12 @@ public:
     
     // Render to G-buffer (deferred rendering - geometry only, lighting applied later)
     void renderToGBuffer(const glm::mat4& viewProjection, const glm::mat4& view);
+    void renderToGBufferCulled(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks);
     
     // Shadow depth pass (for casting shadows)
     void beginDepthPass(const glm::mat4& lightVP, int cascadeIndex);
     void renderDepth();
+    void renderDepthCulled(const std::vector<VoxelChunk*>& visibleChunks);
     void endDepthPass(int screenWidth, int screenHeight);
     
     // Clear all registered chunks

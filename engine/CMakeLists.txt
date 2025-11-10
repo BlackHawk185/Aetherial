@@ -23,6 +23,9 @@ add_library(engine STATIC
     World/TreeGenerator.cpp
     World/FluidSystem.cpp
     
+    # Culling systems
+    Culling/Frustum.cpp
+    
     # Rendering systems
     Rendering/InstancedQuadRenderer.cpp  # GPU instanced quad renderer with shared unit quad
     Rendering/TextureManager.cpp
@@ -56,9 +59,6 @@ add_library(engine STATIC
     
     # Physics systems
     Physics/PhysicsSystem.cpp
-    
-    # Culling systems
-    Culling/FrustumCuller.cpp
     
     # Time systems
     Time/TimeManager.cpp

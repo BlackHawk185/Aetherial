@@ -205,14 +205,17 @@ GLuint TextureManager::createTexture(const unsigned char* data, int width, int h
     // Upload texture data
     glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, width, height, 0, format, GL_UNSIGNED_BYTE, data);
     
+    // Generate mipmaps for distant LOD
+    glGenerateMipmap(GL_TEXTURE_2D);
+    
     // Set texture parameters
     if (pixelArt) {
-        // Crisp pixel art settings (like Minecraft)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        // Crisp pixel art with mipmap blending
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     } else {
-        // Smooth filtering
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        // Smooth filtering with mipmaps
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     }
     

@@ -16,16 +16,12 @@ Profiler& g_profiler = *GetProfilerSingleton();
 
 Profiler::Profiler()
 {
-    m_lastReportTime = std::chrono::high_resolution_clock::now();
+    m_startTime = std::chrono::high_resolution_clock::now();
 }
 
 Profiler::~Profiler()
 {
-    // Disable profiler immediately to prevent any race conditions during shutdown
     m_enabled = false;
-    
-    // Skip final report during global destruction to avoid iterator issues
-    // The profiler will have already reported during normal operation
 }
 
 void Profiler::recordTime(const std::string& name, double timeMs)
@@ -46,44 +42,6 @@ void Profiler::recordTime(const std::string& name, double timeMs)
         data.maxTime = timeMs;
 }
 
-void Profiler::updateAndReport()
-{
-    if (!m_enabled)
-        return;
-
-    double timeSinceReport = getTimeSinceLastReport();
-    if (timeSinceReport >= m_reportInterval)
-    {
-        reportToConsole();
-        
-        // Reset for next interval
-        std::lock_guard<std::mutex> lock(m_profileMutex);
-        for (auto& pair : m_profiles)
-        {
-            pair.second.reset();
-        }
-        
-        m_lastReportTime = std::chrono::high_resolution_clock::now();
-    }
-}
-
-void Profiler::forceReport()
-{
-    if (!m_enabled)
-        return;
-
-    reportToConsole();
-    
-    // Reset profiles
-    std::lock_guard<std::mutex> lock(m_profileMutex);
-    for (auto& pair : m_profiles)
-    {
-        pair.second.reset();
-    }
-    
-    m_lastReportTime = std::chrono::high_resolution_clock::now();
-}
-
 const Profiler::ProfileData* Profiler::getProfileData(const std::string& name) const
 {
     std::lock_guard<std::mutex> lock(m_profileMutex);
@@ -91,41 +49,20 @@ const Profiler::ProfileData* Profiler::getProfileData(const std::string& name) c
     return (it != m_profiles.end()) ? &it->second : nullptr;
 }
 
-void Profiler::clearAll()
+void Profiler::printShutdownReport()
 {
-    std::lock_guard<std::mutex> lock(m_profileMutex);
-    m_profiles.clear();
-}
-
-void Profiler::reportToConsole()
-{
-    // Early exit if profiler is disabled (e.g., during shutdown)
-    if (!m_enabled)
-        return;
-        
     std::lock_guard<std::mutex> lock(m_profileMutex);
     
     if (m_profiles.empty())
         return;
 
-    // Sort profiles by total time (descending)
     std::vector<std::pair<std::string, ProfileData*>> sortedProfiles;
-    
-    // Use try-catch to handle potential iterator issues during shutdown
-    try
+    for (auto& pair : m_profiles)
     {
-        for (auto& pair : m_profiles)
+        if (pair.second.sampleCount > 0)
         {
-            if (pair.second.sampleCount > 0)
-            {
-                sortedProfiles.push_back({pair.first, &pair.second});
-            }
+            sortedProfiles.push_back({pair.first, &pair.second});
         }
-    }
-    catch (...)
-    {
-        // If we get an iterator exception (e.g., during shutdown), just return
-        return;
     }
     
     std::sort(sortedProfiles.begin(), sortedProfiles.end(),
@@ -133,43 +70,66 @@ void Profiler::reportToConsole()
             return a.second->totalTime > b.second->totalTime;
         });
 
-    // Report header
-    double reportTime = getTimeSinceLastReport();
-    std::cout << "\n=== PROFILER REPORT (" << std::fixed << std::setprecision(1) 
-              << reportTime << "s) ===" << std::endl;
-    std::cout << std::left << std::setw(25) << "Function"
-              << std::right << std::setw(8) << "Samples"
-              << std::setw(10) << "Total(ms)"
-              << std::setw(10) << "Avg(ms)"
-              << std::setw(10) << "Min(ms)"
-              << std::setw(10) << "Max(ms)"
-              << std::setw(8) << "FPS*" << std::endl;
-    std::cout << std::string(81, '-') << std::endl;
-
-    // Report each profile
+    double sessionTime = getElapsedTime();
+    std::cout << "\n=== PROFILER SESSION REPORT (Runtime: " << std::fixed << std::setprecision(1) 
+              << sessionTime << "s) ===" << std::endl;
+    
+    // Filter out insignificant entries (< 1ms total or < 0.01ms avg)
+    std::vector<std::pair<std::string, ProfileData*>> significantProfiles;
     for (const auto& entry : sortedProfiles)
     {
         const ProfileData& data = *entry.second;
-        double fps = data.getAverageTime() > 0.0 ? 1000.0 / data.getAverageTime() : 0.0;
+        if (data.totalTime >= 1.0 && data.getAverageTime() >= 0.01)
+        {
+            significantProfiles.push_back(entry);
+        }
+    }
+    
+    if (significantProfiles.empty())
+    {
+        std::cout << "No significant profiles recorded." << std::endl;
+        return;
+    }
+    
+    // Calculate percentage of total time
+    double totalRecordedTime = 0.0;
+    for (const auto& entry : significantProfiles)
+    {
+        totalRecordedTime += entry.second->totalTime;
+    }
+    
+    std::cout << std::left << std::setw(35) << "Function"
+              << std::right << std::setw(10) << "Total(ms)"
+              << std::setw(10) << "Avg(ms)"
+              << std::setw(10) << "Max(ms)"
+              << std::setw(8) << "% Time"
+              << std::setw(10) << "Calls" << std::endl;
+    std::cout << std::string(83, '-') << std::endl;
+
+    // Report significant profiles only
+    for (const auto& entry : significantProfiles)
+    {
+        const ProfileData& data = *entry.second;
+        double percentOfTotal = (data.totalTime / totalRecordedTime) * 100.0;
         
-        std::cout << std::left << std::setw(25) << data.name.substr(0, 24)
-                  << std::right << std::setw(8) << data.sampleCount
-                  << std::setw(10) << std::fixed << std::setprecision(2) << data.totalTime
+        std::cout << std::left << std::setw(35) << data.name.substr(0, 34)
+                  << std::right << std::setw(10) << std::fixed << std::setprecision(2) << data.totalTime
                   << std::setw(10) << std::fixed << std::setprecision(2) << data.getAverageTime()
-                  << std::setw(10) << std::fixed << std::setprecision(2) << data.minTime
                   << std::setw(10) << std::fixed << std::setprecision(2) << data.maxTime
-                  << std::setw(8) << std::fixed << std::setprecision(0) << fps
+                  << std::setw(7) << std::fixed << std::setprecision(1) << percentOfTotal << "%"
+                  << std::setw(10) << data.sampleCount
                   << std::endl;
     }
     
-    std::cout << "* FPS calculated from average frame time" << std::endl;
+    std::cout << "\nFiltered out " << (sortedProfiles.size() - significantProfiles.size()) 
+              << " insignificant entries (< 1ms total)" << std::endl;
     std::cout << std::endl;
 }
 
-double Profiler::getTimeSinceLastReport() const
+double Profiler::getElapsedTime() const
 {
     auto currentTime = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration<double>(currentTime - m_lastReportTime);
+    auto duration = std::chrono::duration<double>(currentTime - m_startTime);
     return duration.count();
 }
 
