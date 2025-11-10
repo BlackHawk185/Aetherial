@@ -30,10 +30,11 @@ add_library(engine STATIC
     Rendering/CascadedShadowMap.cpp
     Rendering/ModelInstanceRenderer.cpp
     Rendering/BlockHighlightRenderer.cpp
-    Rendering/FluidParticleRenderer.cpp  # Fluid particle visualization
+
     Rendering/GBuffer.cpp               # Deferred rendering G-buffer
     Rendering/HDRFramebuffer.cpp        # HDR framebuffer for proper lighting pipeline
     Rendering/SkyRenderer.cpp           # Sky gradient and sun disc rendering
+    Rendering/VolumetricCloudRenderer.cpp  # Volumetric cloud rendering with raymarching
     Rendering/DeferredLightingPass.cpp  # Deferred lighting shader
     Rendering/ShadowBlur.cpp            # Bilateral blur for smooth shadows
     Rendering/PostProcessingPipeline.cpp  # Post-processing effects (godrays, tone mapping)

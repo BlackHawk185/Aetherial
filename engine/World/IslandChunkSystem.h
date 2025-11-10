@@ -210,6 +210,10 @@ class IslandChunkSystem
     // This is now the primary and only island generation method
     void generateFloatingIslandOrganic(uint32_t islandID, uint32_t seed, float radius = 48.0f, BiomeType biome = BiomeType::GRASSLAND);
 
+    // Water basin generation (called during island generation)
+    void placeWaterBasins(uint32_t islandID, const BiomePalette& palette, uint32_t seed);
+    void cullExposedWater(uint32_t islandID);
+
     // Island queries
     Vec3 getIslandCenter(uint32_t islandID) const;    // Get current physics center of island
     Vec3 getIslandVelocity(uint32_t islandID) const;  // Get current velocity of island

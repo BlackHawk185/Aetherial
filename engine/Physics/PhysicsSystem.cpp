@@ -522,3 +522,283 @@ Vec3 PhysicsSystem::resolveCapsuleMovement(const Vec3& currentPos, Vec3& velocit
     return finalPosition;
 }
 
+// ============================================================================
+// SPHERE COLLISION SYSTEM - SIMPLER THAN CAPSULE
+// ============================================================================
+// Sphere is perfect for small objects like fluid particles
+// Much simpler than capsule - just one center point and radius
+
+bool PhysicsSystem::checkChunkSphereCollision(const VoxelChunk* chunk, const Vec3& sphereCenter,
+                                              const Vec3& /*chunkWorldPos*/, Vec3& outNormal, float radius)
+{
+    // Calculate AABB of sphere in chunk-local voxel coordinates
+    int minX = static_cast<int>(std::floor(sphereCenter.x - radius));
+    int maxX = static_cast<int>(std::ceil(sphereCenter.x + radius));
+    int minY = static_cast<int>(std::floor(sphereCenter.y - radius));
+    int maxY = static_cast<int>(std::ceil(sphereCenter.y + radius));
+    int minZ = static_cast<int>(std::floor(sphereCenter.z - radius));
+    int maxZ = static_cast<int>(std::ceil(sphereCenter.z + radius));
+    
+    // Clamp to chunk bounds
+    minX = std::max(0, minX);
+    maxX = std::min(VoxelChunk::SIZE - 1, maxX);
+    minY = std::max(0, minY);
+    maxY = std::min(VoxelChunk::SIZE - 1, maxY);
+    minZ = std::max(0, minZ);
+    maxZ = std::min(VoxelChunk::SIZE - 1, maxZ);
+    
+    // Check voxels within sphere AABB
+    for (int x = minX; x <= maxX; ++x)
+    {
+        for (int y = minY; y <= maxY; ++y)
+        {
+            for (int z = minZ; z <= maxZ; ++z)
+            {
+                // Skip air blocks
+                uint8_t blockType = chunk->getVoxel(x, y, z);
+                if (blockType == 0)
+                    continue;
+                
+                // Skip OBJ/model blocks (decorative only)
+                auto& registry = BlockTypeRegistry::getInstance();
+                const BlockTypeInfo* blockInfo = registry.getBlockType(blockType);
+                if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
+                    continue;
+                }
+                
+                // Found solid voxel - do sphere-to-AABB collision
+                Vec3 voxelMin(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+                Vec3 voxelMax = voxelMin + Vec3(1.0f, 1.0f, 1.0f);
+                
+                // Find closest point on AABB to sphere center
+                Vec3 closestPoint(
+                    std::max(voxelMin.x, std::min(sphereCenter.x, voxelMax.x)),
+                    std::max(voxelMin.y, std::min(sphereCenter.y, voxelMax.y)),
+                    std::max(voxelMin.z, std::min(sphereCenter.z, voxelMax.z))
+                );
+                
+                // Check if closest point is within sphere radius
+                Vec3 delta = sphereCenter - closestPoint;
+                float distSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+                
+                if (distSq <= radius * radius)
+                {
+                    // Collision detected - calculate penetration normal
+                    float dist = std::sqrt(distSq);
+                    
+                    if (dist > 0.0001f)
+                    {
+                        // Normal points from collision point toward sphere center (push-out direction)
+                        outNormal = Vec3(delta.x / dist, delta.y / dist, delta.z / dist);
+                    }
+                    else
+                    {
+                        // Sphere center exactly on AABB surface - use voxel center direction
+                        Vec3 voxelCenter = voxelMin + Vec3(0.5f, 0.5f, 0.5f);
+                        Vec3 centerDelta = sphereCenter - voxelCenter;
+                        
+                        float absX = std::abs(centerDelta.x);
+                        float absY = std::abs(centerDelta.y);
+                        float absZ = std::abs(centerDelta.z);
+                        
+                        if (absX > absY && absX > absZ)
+                            outNormal = Vec3(centerDelta.x > 0 ? 1.0f : -1.0f, 0, 0);
+                        else if (absY > absZ)
+                            outNormal = Vec3(0, centerDelta.y > 0 ? 1.0f : -1.0f, 0);
+                        else
+                            outNormal = Vec3(0, 0, centerDelta.z > 0 ? 1.0f : -1.0f);
+                    }
+                    
+                    return true;
+                }
+            }
+        }
+    }
+    
+    return false;
+}
+
+bool PhysicsSystem::checkSphereCollision(const Vec3& sphereCenter, float radius, Vec3& outNormal, const FloatingIsland** outIsland)
+{
+    if (!m_islandSystem)
+        return false;
+    
+    // Iterate through all islands
+    const auto& islands = m_islandSystem->getIslands();
+    for (const auto& islandPair : islands)
+    {
+        const FloatingIsland* island = &islandPair.second;
+        if (!island) continue;
+        
+        // Transform sphere center to island-local space
+        Vec3 localSphereCenter = island->worldToLocal(sphereCenter);
+        
+        // Check each chunk in this island
+        for (const auto& chunkPair : island->chunks)
+        {
+            const VoxelChunk* chunk = chunkPair.second.get();
+            if (!chunk) continue;
+            
+            // Transform to chunk-local space (chunk origin is at chunkPair.first * CHUNK_SIZE)
+            Vec3 chunkOrigin(
+                chunkPair.first.x * VoxelChunk::SIZE,
+                chunkPair.first.y * VoxelChunk::SIZE,
+                chunkPair.first.z * VoxelChunk::SIZE
+            );
+            Vec3 chunkLocalSphereCenter = localSphereCenter - chunkOrigin;
+            
+            // Check collision with this chunk
+            if (checkChunkSphereCollision(chunk, chunkLocalSphereCenter, chunkOrigin, outNormal, radius))
+            {
+                // Transform collision normal from island-local to world space
+                outNormal = island->localDirToWorld(outNormal);
+                
+                if (outIsland)
+                    *outIsland = island;
+                
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+GroundInfo PhysicsSystem::detectGroundSphere(const Vec3& sphereCenter, float radius, float rayMargin)
+{
+    GroundInfo result;
+    result.isGrounded = false;
+    
+    if (!m_islandSystem)
+        return result;
+    
+    // Cast ray downward from sphere bottom
+    Vec3 rayStart = sphereCenter - Vec3(0, radius, 0);
+    Vec3 rayEnd = rayStart - Vec3(0, rayMargin, 0);
+    
+    // Iterate through islands to find ground
+    const auto& islands = m_islandSystem->getIslands();
+    for (const auto& islandPair : islands)
+    {
+        const FloatingIsland* island = &islandPair.second;
+        if (!island) continue;
+        
+        // Transform ray to island-local space
+        Vec3 localRayStart = island->worldToLocal(rayStart);
+        Vec3 localRayEnd = island->worldToLocal(rayEnd);
+        
+        // Check voxel at ray end position
+        int voxelX = static_cast<int>(std::floor(localRayEnd.x));
+        int voxelY = static_cast<int>(std::floor(localRayEnd.y));
+        int voxelZ = static_cast<int>(std::floor(localRayEnd.z));
+        
+        uint8_t voxelType = m_islandSystem->getVoxelFromIsland(islandPair.first, Vec3(voxelX, voxelY, voxelZ));
+        
+        if (voxelType != 0)  // Not air
+        {
+            result.isGrounded = true;
+            result.groundNormal = Vec3(0, 1, 0);  // Assume flat ground
+            result.distanceToGround = rayMargin;
+            return result;
+        }
+    }
+    
+    return result;
+}
+
+Vec3 PhysicsSystem::resolveSphereMovement(const Vec3& currentPos, Vec3& velocity, float deltaTime,
+                                          float radius, float stepHeightRatio)
+{
+    PROFILE_FUNCTION();
+    
+    if (!m_islandSystem)
+    {
+        // No collision system - just apply velocity directly
+        return currentPos + velocity * deltaTime;
+    }
+    
+    // Calculate max step height (spheres use diameter as "height")
+    float diameter = radius * 2.0f;
+    float maxStepHeight = diameter * stepHeightRatio;
+    
+    // Calculate intended movement
+    Vec3 intendedMovement = velocity * deltaTime;
+    Vec3 intendedPosition = currentPos + intendedMovement;
+    
+    Vec3 collisionNormal;
+    Vec3 finalPosition = currentPos;
+    
+    // Check if we're currently stuck
+    bool wasStuck = checkSphereCollision(currentPos, radius, collisionNormal, nullptr);
+    
+    // If stuck, try to unstuck by pushing up
+    if (wasStuck)
+    {
+        float unstuckIncrement = diameter * 0.2f;
+        for (float unstuckHeight = unstuckIncrement; unstuckHeight <= maxStepHeight * 2.0f; unstuckHeight += unstuckIncrement)
+        {
+            Vec3 unstuckPos = currentPos + Vec3(0, unstuckHeight, 0);
+            if (!checkSphereCollision(unstuckPos, radius, collisionNormal, nullptr))
+            {
+                finalPosition = unstuckPos;
+                break;
+            }
+        }
+    }
+    
+    // Check if intended position is valid
+    if (!checkSphereCollision(intendedPosition, radius, collisionNormal, nullptr))
+    {
+        return intendedPosition;
+    }
+    
+    // Collision detected - use axis-separated movement with step-up
+    
+    // Try vertical movement first
+    Vec3 testPos = finalPosition + Vec3(0, intendedMovement.y, 0);
+    if (!checkSphereCollision(testPos, radius, collisionNormal, nullptr))
+    {
+        finalPosition = testPos;
+    }
+    else
+    {
+        velocity.y = 0;
+    }
+    
+    // Try X movement with step-up
+    float stepIncrement = maxStepHeight * 0.25f;
+    for (float stepHeight = stepIncrement; stepHeight <= maxStepHeight; stepHeight += stepIncrement)
+    {
+        Vec3 stepUpPos = finalPosition + Vec3(intendedMovement.x, stepHeight, 0);
+        if (!checkSphereCollision(stepUpPos, radius, collisionNormal, nullptr))
+        {
+            finalPosition.x += intendedMovement.x;
+            finalPosition.y += stepHeight;
+            break;
+        }
+    }
+    
+    // Try Z movement with step-up
+    for (float stepHeight = stepIncrement; stepHeight <= maxStepHeight; stepHeight += stepIncrement)
+    {
+        Vec3 stepUpPos = finalPosition + Vec3(0, stepHeight, intendedMovement.z);
+        if (!checkSphereCollision(stepUpPos, radius, collisionNormal, nullptr))
+        {
+            finalPosition.z += intendedMovement.z;
+            finalPosition.y += stepHeight;
+            break;
+        }
+    }
+    
+    return finalPosition;
+}
+
+Vec3 PhysicsSystem::resolveFluidMovement(const Vec3& currentPos, Vec3& velocity, float deltaTime, float radius)
+{
+    PROFILE_FUNCTION();
+    
+    // NO COLLISION - pure noclip movement for testing
+    // Just apply velocity directly
+    return currentPos + velocity * deltaTime;
+}
+

@@ -86,6 +86,7 @@ class ECSWorld
 {
    public:
     EntityID createEntity();
+    EntityID createEntityWithID(EntityID id);  // Create entity with specific ID (for network sync)
     void destroyEntity(EntityID entity);
 
     template <typename T>

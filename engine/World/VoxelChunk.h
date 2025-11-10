@@ -110,7 +110,7 @@ class VoxelChunk
     
     // Incremental quad manipulation (for direct block modifications)
     void addBlockQuads(int x, int y, int z, uint8_t blockType);
-    void removeBlockQuads(int x, int y, int z);
+    void removeBlockQuads(int x, int y, int z, uint8_t oldBlockType);
     void updateNeighborQuads(int x, int y, int z, bool blockWasAdded);
     
     // Control incremental updates (disable during world generation)
@@ -134,6 +134,7 @@ class VoxelChunk
     
     std::shared_ptr<VoxelMesh> getRenderMesh() const { return renderMesh; }
     void setRenderMesh(std::shared_ptr<VoxelMesh> newMesh) { renderMesh = newMesh; }
+    bool isMeshDirty() const { return meshDirty; }
     
     // Lazy mesh generation - generates mesh on first access if dirty
     std::shared_ptr<VoxelMesh> getRenderMeshLazy()

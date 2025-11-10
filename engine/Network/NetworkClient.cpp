@@ -313,6 +313,34 @@ void NetworkClient::processServerMessage(ENetPacket* packet)
             break;
         }
 
+        case NetworkMessageType::FLUID_PARTICLE_SPAWN:
+        {
+            if (packet->dataLength >= sizeof(FluidParticleSpawnMessage))
+            {
+                FluidParticleSpawnMessage msg = *(FluidParticleSpawnMessage*) packet->data;
+
+                if (onFluidParticleSpawn)
+                {
+                    onFluidParticleSpawn(msg);
+                }
+            }
+            break;
+        }
+
+        case NetworkMessageType::FLUID_PARTICLE_DESPAWN:
+        {
+            if (packet->dataLength >= sizeof(FluidParticleDespawnMessage))
+            {
+                FluidParticleDespawnMessage msg = *(FluidParticleDespawnMessage*) packet->data;
+
+                if (onFluidParticleDespawn)
+                {
+                    onFluidParticleDespawn(msg);
+                }
+            }
+            break;
+        }
+
         default:
             std::cout << "Unknown message type from server: " << (int) messageType << std::endl;
             break;

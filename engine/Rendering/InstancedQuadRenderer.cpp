@@ -498,8 +498,8 @@ void InstancedQuadRenderer::uploadChunkInstances(ChunkEntry& entry)
         return;
     }
     
-    // Lazy mesh generation - generates mesh on first access if needed
-    auto mesh = entry.chunk->getRenderMeshLazy();
+    // Get existing mesh - don't generate synchronously (async system handles it)
+    auto mesh = entry.chunk->getRenderMesh();
     if (!mesh)
     {
         entry.instanceCount = 0;
@@ -553,8 +553,8 @@ void InstancedQuadRenderer::rebuildMDIBuffers()
     
     for (auto& entry : m_chunks) {
         if (entry.chunk) {
-            // Lazy mesh generation - generates mesh on first access if needed
-            auto mesh = entry.chunk->getRenderMeshLazy();
+            // Get existing mesh - don't generate synchronously (async system handles it)
+            auto mesh = entry.chunk->getRenderMesh();
             if (mesh) {
                 entry.instanceCount = mesh->quads.size();
                 entry.allocatedSlots = calculateChunkSlots(entry.instanceCount);
@@ -691,11 +691,15 @@ void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
     
     auto t_start = std::chrono::high_resolution_clock::now();
     
-    // DON'T use getRenderMeshLazy() - it triggers synchronous mesh generation!
-    // The mesh should already be generated (either async or by caller)
+    // Get mesh - use lazy generation only if incremental updates aren't enabled yet
+    // This handles the case where a block is modified before async mesh gen completes
     auto mesh = entry.chunk->getRenderMesh();
+    if (!mesh || entry.chunk->isMeshDirty()) {
+        // Mesh not ready or needs regeneration - use lazy generation as fallback
+        mesh = entry.chunk->getRenderMeshLazy();
+    }
     if (!mesh) {
-        return;  // Mesh not ready yet - skip this update
+        return;  // Mesh still not available - skip this update
     }
     
     size_t newQuadCount = mesh->quads.size();

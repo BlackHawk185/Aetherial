@@ -176,7 +176,7 @@ void BlockTypeRegistry::initializeDefaultBlocks() {
     // Water: Essential liquid
     BlockProperties waterProps = BlockProperties::Transparent(0.1f);
     waterProps.isTransparent = true;
-    registerBlockType(BlockID::WATER, "water", BlockRenderType::VOXEL, "", waterProps);
+    registerBlockType(BlockID::WATER, "water", BlockRenderType::OBJ, "assets/models/water.glb", waterProps);
     
     std::cout << "BlockTypeRegistry initialized with " << m_blockTypes.size() << " block types" << std::endl;
 }

@@ -46,6 +46,18 @@ class PhysicsSystem
     Vec3 resolveCapsuleMovement(const Vec3& currentPos, Vec3& velocity, float deltaTime, 
                                  float radius, float height, float stepHeightRatio = 0.4f);
     
+    // Sphere collision detection (for simple objects like particles)
+    // Sphere is defined by center position and radius
+    bool checkSphereCollision(const Vec3& sphereCenter, float radius, Vec3& outNormal, const FloatingIsland** outIsland = nullptr);
+    GroundInfo detectGroundSphere(const Vec3& sphereCenter, float radius, float rayMargin = 0.1f);
+    
+    // Sphere movement resolver (simpler than capsule, better for small particles)
+    Vec3 resolveSphereMovement(const Vec3& currentPos, Vec3& velocity, float deltaTime, 
+                               float radius, float stepHeightRatio = 0.4f);
+    
+    // Fluid-specific movement - allows phasing through terrain toward target (no blocking)
+    Vec3 resolveFluidMovement(const Vec3& currentPos, Vec3& velocity, float deltaTime, float radius);
+    
     // NOTE: For raycasting, use VoxelRaycaster::raycast() directly - it's faster and already handles rotated islands
     
     // Island system integration
@@ -61,6 +73,10 @@ class PhysicsSystem
     // Helper methods for capsule collision
     bool checkChunkCapsuleCollision(const VoxelChunk* chunk, const Vec3& capsuleCenter, const Vec3& chunkWorldPos,
                                    Vec3& outNormal, float radius, float height);
+    
+    // Helper methods for sphere collision
+    bool checkChunkSphereCollision(const VoxelChunk* chunk, const Vec3& sphereCenter, const Vec3& chunkWorldPos,
+                                  Vec3& outNormal, float radius);
 };
 
 // Global g_physics removed - GameClient and GameServer now have separate physics instances

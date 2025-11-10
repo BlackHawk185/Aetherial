@@ -17,8 +17,11 @@ void BiomeSystem::initializePalettes()
         BlockID::DIRT,           // subsurfaceBlock
         BlockID::STONE,          // deepBlock
         BlockID::COAL,           // oreBlock
-        0.6f,                    // vegetationDensity
-        0.3f                     // oreSpawnChance
+        0.08f,                   // vegetationDensity (ultra-sparse trees - true open grassland)
+        0.3f,                    // oreSpawnChance
+        BlockID::WATER,          // waterBlock
+        2,                       // minWaterDepth
+        6                        // maxWaterDepth
     };
     
     // FOREST - Dense forested biome with moss and rich soil
@@ -28,7 +31,10 @@ void BiomeSystem::initializePalettes()
         BlockID::GRANITE,        // deepBlock (hard bedrock)
         BlockID::EMERALD_BLOCK,  // oreBlock (rare emeralds in ancient forests)
         0.95f,                   // vegetationDensity (very high - dense forest)
-        0.2f                     // oreSpawnChance (less ore, more nature)
+        0.2f,                    // oreSpawnChance (less ore, more nature)
+        BlockID::WATER,          // waterBlock
+        3,                       // minWaterDepth
+        8                        // maxWaterDepth
     };
     
     // DESERT - Sandy and dry with sandstone layers
@@ -38,7 +44,10 @@ void BiomeSystem::initializePalettes()
         BlockID::LIMESTONE,      // deepBlock
         BlockID::GOLD_BLOCK,     // oreBlock (desert gold deposits)
         0.1f,                    // vegetationDensity (sparse)
-        0.4f                     // oreSpawnChance (gold in deserts)
+        0.4f,                    // oreSpawnChance (gold in deserts)
+        BlockID::WATER,          // waterBlock
+        1,                       // minWaterDepth (oases)
+        3                        // maxWaterDepth (small pools)
     };
     
     // SNOW - Frozen tundra with packed ice
@@ -48,7 +57,10 @@ void BiomeSystem::initializePalettes()
         BlockID::MARBLE,         // deepBlock (metamorphic rock)
         BlockID::SAPPHIRE_BLOCK, // oreBlock (icy blue gems)
         0.2f,                    // vegetationDensity
-        0.35f                    // oreSpawnChance
+        0.35f,                   // oreSpawnChance
+        BlockID::ICE,            // waterBlock (frozen water)
+        2,                       // minWaterDepth
+        5                        // maxWaterDepth
     };
     
     // VOLCANIC - Dark basalt with glowing magma
@@ -58,7 +70,10 @@ void BiomeSystem::initializePalettes()
         BlockID::OBSIDIAN,       // deepBlock (volcanic glass)
         BlockID::RUBY_BLOCK,     // oreBlock (fire gems)
         0.05f,                   // vegetationDensity (almost none)
-        0.7f                     // oreSpawnChance (very rich in minerals)
+        0.7f,                    // oreSpawnChance (very rich in minerals)
+        BlockID::LAVA,           // waterBlock (lava pools)
+        1,                       // minWaterDepth
+        4                        // maxWaterDepth
     };
     
     // CRYSTAL - Magical rare biome with crystal formations
@@ -68,7 +83,10 @@ void BiomeSystem::initializePalettes()
         BlockID::AMETHYST,       // deepBlock
         BlockID::DIAMOND_BLOCK,  // oreBlock
         0.3f,                    // vegetationDensity
-        0.9f                     // oreSpawnChance (extremely valuable)
+        0.9f,                    // oreSpawnChance (extremely valuable)
+        BlockID::WATER,          // waterBlock (crystal-clear water)
+        3,                       // minWaterDepth
+        10                       // maxWaterDepth (deep pools)
     };
     
     // TROPICAL - Beach paradise with coral and sand
@@ -78,7 +96,10 @@ void BiomeSystem::initializePalettes()
         BlockID::CORAL,          // deepBlock (coral reef base)
         BlockID::COPPER_BLOCK,   // oreBlock
         0.8f,                    // vegetationDensity (lush palm trees)
-        0.25f                    // oreSpawnChance
+        0.25f,                   // oreSpawnChance
+        BlockID::WATER,          // waterBlock
+        3,                       // minWaterDepth
+        12                       // maxWaterDepth (lagoons)
     };
     
     // BARREN - Rocky wasteland with gravel
@@ -88,64 +109,34 @@ void BiomeSystem::initializePalettes()
         BlockID::GRANITE,        // deepBlock (hard granite bedrock)
         BlockID::IRON_BLOCK,     // oreBlock
         0.0f,                    // vegetationDensity (none)
-        0.5f                     // oreSpawnChance (decent ore)
+        0.5f,                    // oreSpawnChance (decent ore)
+        BlockID::WATER,          // waterBlock
+        1,                       // minWaterDepth
+        3                        // maxWaterDepth (shallow puddles)
     };
 }
 
 BiomeType BiomeSystem::getBiomeForPosition(const Vec3& worldPosition, uint32_t worldSeed) const
 {
-    // Use two layers of noise for interesting biome distribution
-    FastNoiseLite biomeNoise;
-    biomeNoise.SetNoiseType(FastNoiseLite::NoiseType_Perlin);
-    biomeNoise.SetSeed(worldSeed + 5000);  // Offset seed for biome layer
-    biomeNoise.SetFrequency(0.001f);  // Very low frequency for large biome regions
+    // Generate pseudo-random biome based on position and seed
+    uint32_t hash = worldSeed;
+    hash ^= static_cast<uint32_t>(worldPosition.x * 374761393.0f);
+    hash ^= static_cast<uint32_t>(worldPosition.z * 668265263.0f);
+    hash ^= hash >> 13;
+    hash *= 1103515245u;
+    hash ^= hash >> 16;
     
-    FastNoiseLite temperatureNoise;
-    temperatureNoise.SetNoiseType(FastNoiseLite::NoiseType_Perlin);
-    temperatureNoise.SetSeed(worldSeed + 6000);
-    temperatureNoise.SetFrequency(0.0015f);
+    float randValue = (hash & 0xFFFF) / 65535.0f;  // 0.0 to 1.0
     
-    // Sample noise at island position (using X-Z plane, ignore Y)
-    float biomeValue = biomeNoise.GetNoise(worldPosition.x, worldPosition.z);
-    float temperature = temperatureNoise.GetNoise(worldPosition.x, worldPosition.z);
-    
-    // Use altitude (Y position) as a factor - higher islands are colder
-    float altitudeFactor = worldPosition.y / 200.0f;  // -1.0 to 1.0 range
-    temperature -= altitudeFactor * 0.5f;  // Higher = colder
-    
-    // Map noise values to biomes
-    // Crystal biomes are extremely rare (only at specific noise intersections)
-    if (std::abs(biomeValue) > 0.85f && std::abs(temperature) > 0.85f)
-    {
-        return BiomeType::CRYSTAL;  // Very rare
-    }
-    
-    // Temperature-based biomes
-    if (temperature < -0.5f)
-    {
-        return BiomeType::SNOW;  // Cold regions
-    }
-    else if (temperature > 0.6f)
-    {
-        // Hot regions - desert or volcanic
-        return (biomeValue > 0.3f) ? BiomeType::VOLCANIC : BiomeType::DESERT;
-    }
-    else if (temperature > 0.2f && biomeValue < -0.2f)
-    {
-        return BiomeType::TROPICAL;  // Warm and humid
-    }
-    else if (biomeValue > 0.7f)
-    {
-        return BiomeType::BARREN;  // Rocky regions
-    }
-    else if (biomeValue < -0.4f && temperature > -0.2f && temperature < 0.4f)
-    {
-        return BiomeType::FOREST;  // Dense forested temperate regions
-    }
-    else
-    {
-        return BiomeType::GRASSLAND;  // Default temperate biome
-    }
+    // Weighted random biome distribution
+    if (randValue < 0.05f) return BiomeType::CRYSTAL;      // 5%
+    if (randValue < 0.15f) return BiomeType::VOLCANIC;     // 10%
+    if (randValue < 0.25f) return BiomeType::SNOW;         // 10%
+    if (randValue < 0.35f) return BiomeType::DESERT;       // 10%
+    if (randValue < 0.50f) return BiomeType::TROPICAL;     // 15%
+    if (randValue < 0.60f) return BiomeType::BARREN;       // 10%
+    if (randValue < 0.80f) return BiomeType::FOREST;       // 20%
+    return BiomeType::GRASSLAND;                            // 20%
 }
 
 BiomePalette BiomeSystem::getPalette(BiomeType biome) const

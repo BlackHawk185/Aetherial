@@ -52,6 +52,9 @@ bool GameServer::initialize(float targetTickRate, bool enableNetworking, uint16_
     
     // Connect to the already-initialized fluid system
     m_fluidSystem = &g_fluidSystem;
+    
+    // Setup fluid system callbacks for network broadcasting
+    setupFluidSystemCallbacks();
 
     // Initialize networking if requested
     if (m_networkingEnabled)
@@ -436,8 +439,8 @@ void GameServer::handleVoxelChangeRequest(ENetPeer* peer, const VoxelChangeReque
                 {
                     std::cout << "🌊 Block break will cause island split! Extracting fragment..." << std::endl;
                     
-                    // Remove the block first - SERVER-ONLY: Use data-only path (no mesh operations)
-                    islandSystem->setVoxelServerOnly(request.islandID, request.localPos, 0);
+                    // Remove the block first using authoritative method (includes water activation)
+                    m_serverWorld->setVoxelAuthoritative(request.islandID, request.localPos, 0);
                     if (auto server = m_networkManager->getServer())
                     {
                         server->broadcastVoxelChange(request.islandID, request.localPos, 0, 0);
@@ -526,10 +529,8 @@ void GameServer::handleVoxelChangeRequest(ENetPeer* peer, const VoxelChangeReque
     }
 
     // Normal block change (no split detected)
-    // SERVER-ONLY: Use data-only path (no mesh operations)
-    islandSystem->setVoxelServerOnly(request.islandID, request.localPos, request.voxelType);
-
-    // No mesh regeneration on server - clients handle their own meshes
+    // Use authoritative voxel change which includes water activation logic
+    m_serverWorld->setVoxelAuthoritative(request.islandID, request.localPos, request.voxelType);
 
     // Broadcast the change to all connected clients (including the sender for confirmation)
     if (auto server = m_networkManager->getServer())
@@ -673,5 +674,96 @@ void GameServer::broadcastIslandStates()
         server->broadcastEntityState(update);
     }
     */
+}
+
+void GameServer::setupFluidSystemCallbacks()
+{
+    if (!m_fluidSystem)
+    {
+        return;
+    }
+
+    // Setup callback for fluid particle spawn
+    m_fluidSystem->setParticleSpawnCallback(
+        [this](EntityID entityID, uint32_t islandID, const Vec3& worldPos, 
+               const Vec3& velocity, const Vec3& originalVoxelPos)
+        {
+            broadcastFluidParticleSpawn(entityID, islandID, worldPos, velocity, originalVoxelPos);
+        }
+    );
+
+    // Setup callback for fluid particle despawn
+    m_fluidSystem->setParticleDespawnCallback(
+        [this](EntityID entityID, uint32_t islandID, const Vec3& settledVoxelPos, bool shouldCreateVoxel)
+        {
+            broadcastFluidParticleDespawn(entityID, islandID, settledVoxelPos, shouldCreateVoxel);
+        }
+    );
+    
+    // Setup callback for voxel changes from fluid system
+    m_fluidSystem->setVoxelChangeCallback(
+        [this](uint32_t islandID, const Vec3& position, uint8_t voxelType)
+        {
+            // Broadcast voxel change to all clients
+            if (m_networkingEnabled && m_networkManager)
+            {
+                if (auto server = m_networkManager->getServer())
+                {
+                    server->broadcastVoxelChange(islandID, position, voxelType, 0);
+                }
+            }
+        }
+    );
+}
+
+void GameServer::broadcastFluidParticleSpawn(EntityID entityID, uint32_t islandID, const Vec3& worldPos, 
+                                             const Vec3& velocity, const Vec3& originalVoxelPos)
+{
+    if (!m_networkingEnabled || !m_networkManager)
+    {
+        return;
+    }
+
+    auto server = m_networkManager->getServer();
+    if (!server)
+    {
+        return;
+    }
+
+    // Create spawn message
+    FluidParticleSpawnMessage msg;
+    msg.entityID = entityID;
+    msg.islandID = islandID;
+    msg.worldPosition = worldPos;
+    msg.velocity = velocity;
+    msg.originalVoxelPos = originalVoxelPos;
+
+    // Broadcast to all clients
+    server->broadcastToAllClients(&msg, sizeof(msg));
+}
+
+void GameServer::broadcastFluidParticleDespawn(EntityID entityID, uint32_t islandID, const Vec3& settledVoxelPos, 
+                                               bool shouldCreateVoxel)
+{
+    if (!m_networkingEnabled || !m_networkManager)
+    {
+        return;
+    }
+
+    auto server = m_networkManager->getServer();
+    if (!server)
+    {
+        return;
+    }
+
+    // Create despawn message
+    FluidParticleDespawnMessage msg;
+    msg.entityID = entityID;
+    msg.islandID = islandID;
+    msg.settledVoxelPos = settledVoxelPos;
+    msg.shouldCreateVoxel = shouldCreateVoxel ? 1 : 0;
+
+    // Broadcast to all clients
+    server->broadcastToAllClients(&msg, sizeof(msg));
 }
 

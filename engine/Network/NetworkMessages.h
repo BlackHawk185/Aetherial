@@ -24,7 +24,10 @@ enum NetworkMessageType : uint8_t {
     VOXEL_CHANGE_REQUEST = 8,          // Updated numbering
     VOXEL_CHANGE_UPDATE = 9,
     ENTITY_STATE_UPDATE = 10,
-    PILOTING_INPUT = 11
+    PILOTING_INPUT = 11,
+    FLUID_PARTICLE_SPAWN = 12,         // Server->Client: Spawn fluid particle
+    FLUID_PARTICLE_UPDATE = 13,        // Server->Client: Bulk fluid particle state
+    FLUID_PARTICLE_DESPAWN = 14        // Server->Client: Remove fluid particle
 };
 
 // Simple hello world message
@@ -137,6 +140,42 @@ struct PACKED PilotingInputMessage {
     float rotationYaw;          // Yaw rotation input (-1.0 to 1.0)
     float rotationRoll;         // Roll rotation input (-1.0 to 1.0)
 };
+
+// Fluid particle spawn notification from server to client
+struct PACKED FluidParticleSpawnMessage {
+    uint8_t type = FLUID_PARTICLE_SPAWN;
+    uint32_t entityID;          // ECS entity ID for the particle
+    uint32_t islandID;          // Source island
+    Vec3 worldPosition;         // World-space position
+    Vec3 velocity;              // Initial velocity
+    Vec3 originalVoxelPos;      // Island-relative sleeping position
+};
+
+// Bulk fluid particle update (for many particles)
+struct PACKED FluidParticleUpdateHeader {
+    uint8_t type = FLUID_PARTICLE_UPDATE;
+    uint32_t particleCount;     // Number of particles in this update
+    // Followed by particleCount * FluidParticleState structs
+};
+
+struct PACKED FluidParticleState {
+    uint32_t entityID;          // ECS entity ID
+    Vec3 worldPosition;         // Current position
+    Vec3 velocity;              // Current velocity
+    uint8_t state;              // FluidState enum value (0=SLEEPING, 1=ACTIVE, 2=SETTLING)
+};
+
+// Fluid particle despawn (particle went back to sleep or was destroyed)
+struct PACKED FluidParticleDespawnMessage {
+    uint8_t type = FLUID_PARTICLE_DESPAWN;
+    uint32_t entityID;          // ECS entity ID to remove
+    uint32_t islandID;          // Island where it settled (if applicable)
+    Vec3 settledVoxelPos;       // Final voxel position (if settled, otherwise 0,0,0)
+    uint8_t shouldCreateVoxel;  // 1 if client should place water voxel, 0 otherwise
+};
+
+// Maximum particles per update message
+constexpr uint32_t MAX_FLUID_PARTICLES_PER_UPDATE = 64;
 
 // Restore packing
 #ifdef _MSC_VER

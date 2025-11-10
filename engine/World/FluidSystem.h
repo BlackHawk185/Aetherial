@@ -1,126 +1,118 @@
-// FluidSystem.h - Sleeping particle fluid simulation system
+// FluidSystem.h
+// Noclip pathfinding-based water flow system
+// Water particles follow BFS-generated paths to lowest reachable air blocks
+// Server-authoritative: all simulation runs server-side, clients only render
 #pragma once
 
 #include "../Math/Vec3.h"
 #include "../ECS/ECS.h"
 #include "IslandChunkSystem.h"
 #include "BlockType.h"
-#include "FluidComponents.h"  // Shared component definitions
+#include "FluidComponents.h"
 
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
 #include <mutex>
+#include <functional>
 
-// Forward declarations
 class PhysicsSystem;
 
-// Use existing water block type for sleeping fluid voxels
+// Network callbacks for client synchronization
+using FluidParticleSpawnCallback = std::function<void(EntityID, uint32_t islandID, const Vec3& worldPos, const Vec3& velocity, const Vec3& originalVoxelPos)>;
+using FluidParticleDespawnCallback = std::function<void(EntityID, uint32_t islandID, const Vec3& settledVoxelPos, bool shouldCreateVoxel)>;
+using FluidVoxelChangeCallback = std::function<void(uint32_t islandID, const Vec3& position, uint8_t voxelType)>;
+
 constexpr uint8_t FLUID_VOXEL_TYPE = BlockID::WATER;
 
-// Fluid system settings
 struct FluidSettings {
-    // Physics constants
-    float gravity = -9.81f;
-    float viscosity = 0.1f;
-    float surfaceTension = 0.05f;
+    float gravity = -9.81f;           // Unused (noclip mode)
+    float viscosity = 0.05f;          // Unused (noclip mode)
+    float surfaceTension = 0.05f;     // Unused (noclip mode)
+    float gridAttractionStrength = 2.0f;  // Unused (noclip mode)
+    float gridSnapDistance = 0.1f;    // Unused (noclip mode)
     
-    // Grid alignment forces
-    float gridAttractionStrength = 2.0f;
-    float gridSnapDistance = 0.1f;
+    // Tug system: cascade activation when particle flows away from source
+    float tugRadius = 1.0f;           // Search radius for face-adjacent water neighbors
+    float tugDistance = 3.0f;         // Activate neighbor when particle moves >3 blocks away
+    int maxTugChainDepth = 10;        // Cascade iteration limit
     
-    // Tug system
-    float tugRadius = 1.0f;           // How far to search for neighboring water voxels (1.0 = immediate neighbors only)
-    float tugDistance = 0.5f;         // Distance threshold - activate water if particle moves this far away
-    int maxTugChainDepth = 10;        // Prevent infinite tug chains
-    
-    // Performance limits
     int maxActiveParticles = 1000;
-    int maxParticlesPerFrame = 50;    // Max particles to wake per frame
-    float particleRadius = 0.4f;     // For collision detection
+    int maxParticlesPerFrame = 50;    // Limit activations per frame
+    float particleRadius = 0.2f;      // Visual size (0.4 diameter)
 };
-
-// Main fluid simulation system
 class FluidSystem {
 public:
     FluidSystem();
     ~FluidSystem();
     
-    // Initialize with reference to island system, ECS world, and physics system
     void initialize(IslandChunkSystem* islandSystem, ECSWorld* ecsWorld, PhysicsSystem* physics = nullptr);
-    
-    // Main update loop
     void update(float deltaTime);
     
-    // Trigger fluid activation (e.g., when breaking blocks near water)
+    // Activation API
     void triggerFluidActivation(uint32_t islandID, const Vec3& islandRelativePos, float disturbanceForce);
-    
-    // Convert sleeping voxel to active particle
-    EntityID wakeFluidVoxel(uint32_t islandID, const Vec3& islandRelativePos);
-    
-    // Convert any water voxel (tracked or untracked) to active particle
+    EntityID wakeFluidVoxel(uint32_t islandID, const Vec3& islandRelativePos);  // Voxel → particle
     EntityID convertWaterVoxelToParticle(uint32_t islandID, const Vec3& islandRelativePos);
+    void sleepFluidParticle(EntityID particleEntity);  // Particle → voxel
     
-    // Convert active particle back to sleeping voxel
-    void sleepFluidParticle(EntityID particleEntity);
-    
-    // Query functions
+    // Queries
     bool isFluidVoxel(uint32_t islandID, const Vec3& islandRelativePos) const;
     int getActiveParticleCount() const;
     int getSleepingVoxelCount() const;
     
-    // Manual fluid voxel management (for world generation)
+    // World generation
     void addSleepingVoxel(uint32_t islandID, const Vec3& islandRelativePos, float tugStrength = 1.0f);
     void removeSleepingVoxel(uint32_t islandID, const Vec3& islandRelativePos);
     
-    // Settings access
     FluidSettings& getSettings() { return m_settings; }
     const FluidSettings& getSettings() const { return m_settings; }
+    
+    // Network callbacks (server broadcasts to clients)
+    void setParticleSpawnCallback(FluidParticleSpawnCallback callback) { m_onParticleSpawn = callback; }
+    void setParticleDespawnCallback(FluidParticleDespawnCallback callback) { m_onParticleDespawn = callback; }
+    void setVoxelChangeCallback(FluidVoxelChangeCallback callback) { m_onVoxelChange = callback; }
 
 private:
-    // Core systems
     IslandChunkSystem* m_islandSystem = nullptr;
     ECSWorld* m_ecsWorld = nullptr;
     PhysicsSystem* m_physics = nullptr;
     FluidSettings m_settings;
     
-    // Active particle management
     std::vector<EntityID> m_activeParticles;
-    std::vector<EntityID> m_particlesToSleep;     // Particles ready to sleep
-    std::vector<EntityID> m_particlesToDestroy;   // Particles to clean up
+    std::vector<EntityID> m_particlesToSleep;
+    std::vector<EntityID> m_particlesToDestroy;
     
-    // Performance tracking
+    struct WaterToWake { uint32_t islandID; Vec3 position; };
+    std::vector<WaterToWake> m_waterToWake;  // Deferred activation queue
     int m_particlesWokenThisFrame = 0;
     
-    // Internal update functions
+    FluidParticleSpawnCallback m_onParticleSpawn;
+    FluidParticleDespawnCallback m_onParticleDespawn;
+    FluidVoxelChangeCallback m_onVoxelChange;
+    
+    // Per-frame update stages
     void updateActiveParticles(float deltaTime);
-    void updateParticlePhysics(EntityID particle, FluidParticleComponent* fluidComp, 
-                              TransformComponent* transform, float deltaTime);
-    void updateParticleSettling(EntityID particle, FluidParticleComponent* fluidComp, 
-                               TransformComponent* transform, float deltaTime);
-    void updateParticleTugSystem(EntityID particle, FluidParticleComponent* fluidComp,
-                                TransformComponent* transform);
+    void updateParticlePhysics(EntityID, FluidParticleComponent*, TransformComponent*, float deltaTime);
+    void updateParticleSettling(EntityID, FluidParticleComponent*, TransformComponent*, float deltaTime);
+    void updateParticleTugSystem(EntityID, FluidParticleComponent*, TransformComponent*);
     void processParticleTransitions();
     void cleanupDestroyedParticles();
+    void processDeferredWaterActivation();
     
-    // Tug system - distance based
-    void registerNearbyWaterVoxels(FluidParticleComponent* fluidComp, const Vec3& worldPosition);
-    void propagateTugForce(uint32_t islandID, const Vec3& islandRelativePos, 
-                          float tugForce, int chainDepth = 0);
+    // Tug cascade system
+    void registerNearbyWaterVoxels(FluidParticleComponent*, const Vec3& worldPosition);
+    void propagateTugForce(uint32_t islandID, const Vec3& islandRelativePos, float tugForce, int chainDepth = 0);
     std::vector<Vec3> getNeighborPositions(const Vec3& center);
     
-    // Grid alignment helpers
-    Vec3 calculateGridAlignmentForce(const Vec3& position, const Vec3& velocity);
-    Vec3 calculatePathfindingForce(const Vec3& worldPosition, uint32_t islandID, FluidParticleComponent* fluidComp);
-    Vec3 findNearestValidGridPosition(const Vec3& worldPosition);
+    // Pathfinding (floodfill BFS)
+    Vec3 calculateGridAlignmentForce(const Vec3& position, const Vec3& velocity);  // Unused
+    Vec3 calculatePathfindingForce(const Vec3& worldPosition, uint32_t islandID, FluidParticleComponent*, bool recalculateTarget);
+    Vec3 findNearestValidGridPosition(const Vec3& worldPosition);  // Unused
     
-    // Utility functions
     uint64_t hashPosition(uint32_t islandID, const Vec3& islandRelativePos) const;
-    
-    // Collision detection
-    bool checkParticleCollision(const Vec3& position, float radius);
-    Vec3 calculateCollisionResponse(const Vec3& position, const Vec3& velocity);
+    bool checkParticleCollision(const Vec3& position, float radius);  // Unused (noclip)
+    Vec3 calculateCollisionResponse(const Vec3& position, const Vec3& velocity);  // Unused (noclip)
 };
 
 // Global fluid system instance

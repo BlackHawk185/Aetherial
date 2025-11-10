@@ -47,6 +47,10 @@ public:
     std::function<void(const VoxelChangeUpdate&)> onVoxelChangeReceived;
     std::function<void(const EntityStateUpdate&)> onEntityStateUpdate;
     
+    // Fluid particle callbacks
+    std::function<void(const FluidParticleSpawnMessage&)> onFluidParticleSpawn;
+    std::function<void(const FluidParticleDespawnMessage&)> onFluidParticleDespawn;
+    
 private:
     void handleServerEvent(const ENetEvent& event);
     void processServerMessage(ENetPacket* packet);

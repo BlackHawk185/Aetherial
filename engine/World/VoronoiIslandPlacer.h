@@ -25,14 +25,17 @@ public:
     // Generate island placements using Voronoi/Cellular noise
     // worldSeed: Master seed for reproducible world generation
     // regionSize: Size of the world region to fill with islands
-    // islandDensity: Islands per 1000x1000 unit area (scales infinitely)
-    // minRadius/maxRadius: Range for island sizes
+    // minCellSize/maxCellSize: Voronoi cell size range (determines both spacing AND island size)
+    //   - Cell size directly controls island spacing (cells are evenly distributed)
+    //   - Island radius is proportional to cell size (larger cells = larger islands)
+    //   - Typical values: 800-1200 for medium density, 1500-2000 for sparse, 400-600 for dense
+    // islandToVoronoiRatio: Island radius as ratio of cell size (default 0.35 = 35% of cell size)
     std::vector<IslandDefinition> generateIslands(
         uint32_t worldSeed,
         float regionSize,
-        float islandDensity,
-        float minRadius,
-        float maxRadius
+        float minCellSize,
+        float maxCellSize,
+        float islandToVoronoiRatio = 0.35f
     );
     
 private:

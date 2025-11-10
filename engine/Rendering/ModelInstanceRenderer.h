@@ -72,6 +72,12 @@ public:
     
     // G-buffer rendering (deferred rendering - writes geometry data only)
     void renderToGBuffer(const glm::mat4& view, const glm::mat4& proj);
+    
+    // Forward transparent water rendering (after deferred lighting)
+    void renderWaterTransparent(const glm::mat4& view, const glm::mat4& proj,
+                               const glm::vec3& sunDir, float sunIntensity,
+                               const glm::vec3& moonDir, float moonIntensity,
+                               const glm::vec3& cameraPos);
 
     // Update model matrix without rendering (stores pre-calculated chunk transform)
     void updateModelMatrix(uint8_t blockID, VoxelChunk* chunk, const glm::mat4& chunkTransform);
@@ -80,14 +86,14 @@ private:
     bool ensureChunkInstancesUploaded(uint8_t blockID, VoxelChunk* chunk);
     bool ensureShaders();
     bool buildGPUFromModel(uint8_t blockID);
-    GLuint compileShaderForBlock(uint8_t blockID);  // NEW: Per-model shader compilation
+    GLuint compileShaderForBlock(uint8_t blockID);  // Per-block shader compilation (currently unused)
 
     // Internal GL helpers
-    // Per-model shaders (wind vs static)
-    std::unordered_map<uint8_t, GLuint> m_shaders;
-    
-    // G-buffer shaders (deferred rendering)
+    // G-buffer shaders (deferred rendering - one per block type)
     std::unordered_map<uint8_t, GLuint> m_gbufferShaders;
+    
+    // Forward transparent water shader
+    GLuint m_waterTransparentShader = 0;
     
     // Depth pass shader (for shadow map rendering)
     GLuint m_depthProgram = 0;

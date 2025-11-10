@@ -1,0 +1,808 @@
+// FluidDepthRenderer.cpp
+#include "FluidDepthRenderer.h"
+#include "../World/IslandChunkSystem.h"
+#include "../World/FluidComponents.h"
+#include "../World/BlockType.h"
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <GLFW/glfw3.h>
+#include <iostream>
+
+std::unique_ptr<FluidDepthRenderer> g_fluidDepthRenderer = nullptr;
+
+namespace {
+    // Only top face of water block (Y+ facing quad)
+    // This prevents shading the sides/bottom of water blocks
+    const float waterTopFaceVertices[] = {
+        // Top face (Y = 0.5)
+        -0.5f,  0.5f, -0.5f,  // Back-left
+        -0.5f,  0.5f,  0.5f,  // Front-left
+         0.5f,  0.5f,  0.5f,  // Front-right
+         0.5f,  0.5f, -0.5f   // Back-right
+    };
+    
+    const unsigned int waterTopFaceIndices[] = {
+        0, 1, 2,  // First triangle
+        0, 2, 3   // Second triangle
+    };
+    
+    // Fullscreen quad
+    const float quadVertices[] = {
+        -1.0f,  1.0f,  0.0f, 1.0f,
+        -1.0f, -1.0f,  0.0f, 0.0f,
+         1.0f, -1.0f,  1.0f, 0.0f,
+        -1.0f,  1.0f,  0.0f, 1.0f,
+         1.0f, -1.0f,  1.0f, 0.0f,
+         1.0f,  1.0f,  1.0f, 1.0f
+    };
+}
+
+FluidDepthRenderer::FluidDepthRenderer() {}
+FluidDepthRenderer::~FluidDepthRenderer() { shutdown(); }
+
+bool FluidDepthRenderer::initialize(int width, int height) {
+    if (m_initialized) return true;
+    
+    m_width = width;
+    m_height = height;
+    
+    if (!createFramebuffers()) {
+        std::cerr << "FluidDepthRenderer: Failed to create framebuffers" << std::endl;
+        return false;
+    }
+    
+    if (!createShaders()) {
+        std::cerr << "FluidDepthRenderer: Failed to create shaders" << std::endl;
+        return false;
+    }
+    
+    createGeometry();
+    
+    m_initialized = true;
+    std::cout << "FluidDepthRenderer initialized (" << width << "x" << height << ")" << std::endl;
+    return true;
+}
+
+void FluidDepthRenderer::resize(int width, int height) {
+    if (width == m_width && height == m_height) return;
+    
+    m_width = width;
+    m_height = height;
+    
+    // Recreate framebuffers with new size
+    if (m_fluidDepthTex) glDeleteTextures(1, &m_fluidDepthTex);
+    if (m_smoothDepthTex) glDeleteTextures(1, &m_smoothDepthTex);
+    if (m_depthFBO) glDeleteFramebuffers(1, &m_depthFBO);
+    if (m_blurFBO) glDeleteFramebuffers(1, &m_blurFBO);
+    
+    createFramebuffers();
+}
+
+void FluidDepthRenderer::shutdown() {
+    destroyResources();
+    m_initialized = false;
+}
+
+bool FluidDepthRenderer::createFramebuffers() {
+    // Fluid depth texture (single-channel depth)
+    glGenTextures(1, &m_fluidDepthTex);
+    glBindTexture(GL_TEXTURE_2D, m_fluidDepthTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, m_width, m_height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    
+    // Smoothed depth texture (after blur)
+    glGenTextures(1, &m_smoothDepthTex);
+    glBindTexture(GL_TEXTURE_2D, m_smoothDepthTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, m_width, m_height, 0, GL_RED, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    
+    // Depth FBO
+    glGenFramebuffers(1, &m_depthFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_depthFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, m_fluidDepthTex, 0);
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+    
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "Fluid depth FBO incomplete!" << std::endl;
+        return false;
+    }
+    
+    // Blur FBO
+    glGenFramebuffers(1, &m_blurFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_blurFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_smoothDepthTex, 0);
+    
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "Fluid blur FBO incomplete!" << std::endl;
+        return false;
+    }
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    return true;
+}
+
+bool FluidDepthRenderer::createShaders() {
+    // Water depth shader (render water GLB cubes to depth buffer with wave displacement)
+    const char* waterDepthVS = R"(
+        #version 330 core
+        layout(location = 0) in vec3 aPos;
+        
+        uniform mat4 model;
+        uniform mat4 view;
+        uniform mat4 projection;
+        uniform float time;
+        
+        // Smooth 2D noise function for waves
+        float hash(vec2 p) {
+            return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+        }
+        
+        float noise(vec2 p) {
+            vec2 i = floor(p);
+            vec2 f = fract(p);
+            // Quintic interpolation for smoother results
+            f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+            
+            float a = hash(i);
+            float b = hash(i + vec2(1.0, 0.0));
+            float c = hash(i + vec2(0.0, 1.0));
+            float d = hash(i + vec2(1.0, 1.0));
+            
+            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        }
+        
+        float fbm(vec2 p) {
+            float value = 0.0;
+            float amplitude = 0.5;
+            float frequency = 1.0;
+            
+            for (int i = 0; i < 4; i++) {
+                value += amplitude * noise(p * frequency);
+                frequency *= 2.0;
+                amplitude *= 0.5;
+            }
+            return value;
+        }
+        
+        void main() {
+            vec4 worldPos = model * vec4(aPos, 1.0);
+            
+            // Only displace top face (y component of vertex normal is 1.0)
+            // Top face vertices have y = 0.5
+            if (aPos.y > 0.4) {
+                // Large, slow-moving waves - much lower frequency for visible undulation
+                vec2 waveCoord = worldPos.xz * 0.05;  // Very low frequency = large waves
+                float wave = fbm(waveCoord + vec2(time * 0.15, time * 0.1));
+                
+                // Large wave height displacement - very visible height changes
+                worldPos.y += (wave - 0.5) * 0.8;  // Up to 80cm variation
+            }
+            
+            gl_Position = projection * view * worldPos;
+        }
+    )";
+    
+    const char* waterDepthFS = R"(
+        #version 330 core
+        void main() {
+            // Depth written automatically
+        }
+    )";
+    
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &waterDepthVS, nullptr);
+    glCompileShader(vs);
+    
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &waterDepthFS, nullptr);
+    glCompileShader(fs);
+    
+    m_waterDepthShader = glCreateProgram();
+    glAttachShader(m_waterDepthShader, vs);
+    glAttachShader(m_waterDepthShader, fs);
+    glLinkProgram(m_waterDepthShader);
+    
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    
+    // Particle depth shader (point sprites)
+    const char* particleDepthVS = R"(
+        #version 330 core
+        layout(location = 0) in vec3 aPos;
+        
+        uniform mat4 view;
+        uniform mat4 projection;
+        uniform float particleRadius;
+        
+        void main() {
+            gl_Position = projection * view * vec4(aPos, 1.0);
+            gl_PointSize = particleRadius * 100.0 / gl_Position.w;  // Perspective size
+        }
+    )";
+    
+    const char* particleDepthFS = R"(
+        #version 330 core
+        void main() {
+            // Render as sphere (distance from center)
+            vec2 coord = gl_PointCoord * 2.0 - 1.0;
+            float dist = length(coord);
+            if (dist > 1.0) discard;  // Outside sphere
+            
+            // Depth offset for spherical shape
+            float depthOffset = sqrt(1.0 - dist * dist);
+            gl_FragDepth = gl_FragCoord.z - depthOffset * 0.01;
+        }
+    )";
+    
+    vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &particleDepthVS, nullptr);
+    glCompileShader(vs);
+    
+    fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &particleDepthFS, nullptr);
+    glCompileShader(fs);
+    
+    m_particleDepthShader = glCreateProgram();
+    glAttachShader(m_particleDepthShader, vs);
+    glAttachShader(m_particleDepthShader, fs);
+    glLinkProgram(m_particleDepthShader);
+    
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    
+    // Bilateral blur shader
+    const char* blurVS = R"(
+        #version 330 core
+        layout(location = 0) in vec2 aPos;
+        layout(location = 1) in vec2 aTexCoord;
+        out vec2 TexCoord;
+        void main() {
+            TexCoord = aTexCoord;
+            gl_Position = vec4(aPos, 0.0, 1.0);
+        }
+    )";
+    
+    const char* blurFS = R"(
+        #version 330 core
+        in vec2 TexCoord;
+        out float FragDepth;
+        
+        uniform sampler2D depthTexture;
+        uniform vec2 texelSize;
+        uniform float blurRadius;
+        uniform float depthThreshold;
+        
+        void main() {
+            float centerDepth = texture(depthTexture, TexCoord).r;
+            
+            // Skip background (far plane)
+            if (centerDepth >= 0.9999) {
+                FragDepth = centerDepth;
+                return;
+            }
+            
+            // Very aggressive blur to fill all gaps and create smooth surface
+            float totalWeight = 0.0;
+            float blurredDepth = 0.0;
+            int kernelRadius = 12;  // Much larger kernel
+            
+            for (int x = -kernelRadius; x <= kernelRadius; x++) {
+                for (int y = -kernelRadius; y <= kernelRadius; y++) {
+                    vec2 offset = vec2(x, y) * texelSize * blurRadius;
+                    float sampleDepth = texture(depthTexture, TexCoord + offset).r;
+                    
+                    if (sampleDepth >= 0.9999) continue;  // Skip background
+                    
+                    // Much more lenient spatial weight
+                    float spatialWeight = exp(-float(x*x + y*y) / (8.0 * 8.0));
+                    
+                    // Very lenient depth weight - blend across large depth differences
+                    float depthDiff = abs(sampleDepth - centerDepth);
+                    float depthWeight = exp(-depthDiff / (depthThreshold * 10.0));
+                    
+                    float weight = spatialWeight * depthWeight;
+                    blurredDepth += sampleDepth * weight;
+                    totalWeight += weight;
+                }
+            }
+            
+            // If we have valid samples, use blurred result, otherwise pull from neighbors
+            if (totalWeight > 0.0) {
+                FragDepth = blurredDepth / totalWeight;
+            } else {
+                // No valid center depth - aggressively sample wider area
+                FragDepth = centerDepth;
+                for (int r = 1; r <= 20; r++) {
+                    for (int i = 0; i < 8; i++) {
+                        float angle = float(i) * 3.14159 / 4.0;
+                        vec2 offset = vec2(cos(angle), sin(angle)) * float(r) * texelSize * blurRadius;
+                        float sampleDepth = texture(depthTexture, TexCoord + offset).r;
+                        if (sampleDepth < 0.9999) {
+                            FragDepth = sampleDepth;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    )";
+    
+    vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &blurVS, nullptr);
+    glCompileShader(vs);
+    
+    fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &blurFS, nullptr);
+    glCompileShader(fs);
+    
+    m_bilateralBlurShader = glCreateProgram();
+    glAttachShader(m_bilateralBlurShader, vs);
+    glAttachShader(m_bilateralBlurShader, fs);
+    glLinkProgram(m_bilateralBlurShader);
+    
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    
+    // Water surface shader (final rendering)
+    const char* surfaceVS = R"(
+        #version 330 core
+        layout(location = 0) in vec2 aPos;
+        layout(location = 1) in vec2 aTexCoord;
+        out vec2 TexCoord;
+        void main() {
+            TexCoord = aTexCoord;
+            gl_Position = vec4(aPos, 0.0, 1.0);
+        }
+    )";
+    
+    const char* surfaceFS = R"(
+        #version 330 core
+        in vec2 TexCoord;
+        out vec4 FragColor;
+        
+        uniform sampler2D smoothDepthTexture;
+        uniform sampler2D sceneDepthTexture;
+        uniform sampler2D sceneColorTexture;
+        uniform vec2 texelSize;
+        uniform float time;
+        uniform mat4 invProjection;
+        uniform mat4 invView;
+        uniform mat4 view;
+        uniform mat4 projection;
+        
+        // Generate procedural wave normals (not from depth buffer)
+        float hash(vec2 p) {
+            return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+        }
+        
+        float noise(vec2 p) {
+            vec2 i = floor(p);
+            vec2 f = fract(p);
+            // Quintic interpolation for smoother results (reduces checkerboard)
+            f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+            
+            float a = hash(i);
+            float b = hash(i + vec2(1.0, 0.0));
+            float c = hash(i + vec2(0.0, 1.0));
+            float d = hash(i + vec2(1.0, 1.0));
+            
+            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        }
+        
+        // Smoother multi-octave noise
+        float fbm(vec2 p) {
+            float value = 0.0;
+            float amplitude = 0.5;
+            float frequency = 1.0;
+            
+            for (int i = 0; i < 4; i++) {
+                value += amplitude * noise(p * frequency);
+                frequency *= 2.0;
+                amplitude *= 0.5;
+            }
+            return value;
+        }
+        
+        vec3 generateWaveNormal(vec2 worldPos, float time) {
+            vec2 waveCoord = worldPos * 0.05;  // Match vertex shader frequency
+            
+            // Sample noise at offset positions to get gradients
+            float h = 0.1;
+            
+            // Use smoother FBM with same parameters as vertex shader
+            float heightC = fbm(waveCoord + vec2(time * 0.15, time * 0.1));
+            float heightR = fbm(waveCoord + vec2(h, 0.0) + vec2(time * 0.15, time * 0.1));
+            float heightU = fbm(waveCoord + vec2(0.0, h) + vec2(time * 0.15, time * 0.1));
+            
+            // Calculate normal from height differences - larger amplitude
+            vec3 tangentX = vec3(h, (heightR - heightC) * 0.8, 0.0);
+            vec3 tangentZ = vec3(0.0, (heightU - heightC) * 0.8, h);
+            
+            return normalize(cross(tangentZ, tangentX));
+        }
+        
+        vec3 reconstructNormal(vec2 uv, float depth) {
+            float depthL = texture(smoothDepthTexture, uv - vec2(texelSize.x, 0.0)).r;
+            float depthR = texture(smoothDepthTexture, uv + vec2(texelSize.x, 0.0)).r;
+            float depthD = texture(smoothDepthTexture, uv - vec2(0.0, texelSize.y)).r;
+            float depthU = texture(smoothDepthTexture, uv + vec2(0.0, texelSize.y)).r;
+            
+            vec3 dx = vec3(texelSize.x * 2.0, 0.0, depthR - depthL);
+            vec3 dy = vec3(0.0, texelSize.y * 2.0, depthU - depthD);
+            
+            return normalize(cross(dy, dx));
+        }
+        
+        // Animated caustics pattern
+        float causticPattern(vec2 uv, float time) {
+            vec2 p = uv * 4.0;
+            float c = 0.0;
+            
+            // Two layers of moving patterns
+            p += vec2(sin(time * 0.5), cos(time * 0.3));
+            c += sin(p.x * 3.0 + time) * sin(p.y * 3.0 + time * 0.7);
+            
+            p = uv * 5.0;
+            p += vec2(cos(time * 0.4), sin(time * 0.6));
+            c += sin(p.x * 4.0 - time * 1.5) * sin(p.y * 4.0 - time * 1.2);
+            
+            return clamp(c * 0.5 + 0.5, 0.0, 1.0);
+        }
+        
+        vec3 worldPosFromDepth(vec2 uv, float depth) {
+            // Convert to NDC
+            vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+            
+            // To view space
+            vec4 viewPos = invProjection * ndc;
+            viewPos /= viewPos.w;
+            
+            // To world space
+            vec4 worldPos = invView * viewPos;
+            return worldPos.xyz;
+        }
+        
+        void main() {
+            float waterDepth = texture(smoothDepthTexture, TexCoord).r;
+            float sceneDepth = texture(sceneDepthTexture, TexCoord).r;
+            
+            // No water here
+            if (waterDepth >= 0.9999) {
+                discard;
+            }
+            
+            // Don't render water if there's ANY geometry in front of it (underwater view)
+            // Also prevents rendering water under water
+            if (sceneDepth < waterDepth - 0.0001) {
+                discard;
+            }
+            
+            // Reconstruct world position from depth
+            vec3 worldPos3D = worldPosFromDepth(TexCoord, waterDepth);
+            vec2 worldPos = worldPos3D.xz; // Use XZ plane for waves
+            
+            // Calculate wave height displacement using smooth FBM - match vertex shader exactly
+            vec2 waveCoord = worldPos * 0.05;  // Same low frequency as vertex shader
+            float wave = fbm(waveCoord + vec2(time * 0.15, time * 0.1));
+            float waveHeight = (wave - 0.5) * 0.8;  // Same large amplitude as vertex shader
+            
+            // Offset world position by wave height
+            worldPos3D.y += waveHeight;
+            
+            // Generate procedural wave normal from actual world position
+            vec3 normal = generateWaveNormal(worldPos, time);
+            
+            // Water color (blue-tinted, Minecraft-style)
+            vec3 deepWaterColor = vec3(0.02, 0.1, 0.25);
+            vec3 shallowWaterColor = vec3(0.15, 0.45, 0.65);
+            
+            // Fresnel effect (more reflective at grazing angles)
+            float fresnel = pow(1.0 - abs(normal.z), 3.0);
+            
+            // Water thickness (distance through water)
+            float depthDiff = sceneDepth - waterDepth;
+            float waterThickness = clamp(depthDiff * 20.0, 0.0, 1.0);
+            
+            // Sample scene color behind water (with strong wave-based refraction)
+            vec2 refractCoord = clamp(TexCoord + normal.xy * 0.08, 0.0, 1.0);
+            vec3 sceneColor = texture(sceneColorTexture, refractCoord).rgb;
+            
+            // Add caustics to underwater surfaces
+            float caustics = causticPattern(worldPos * 0.5, time);
+            caustics = pow(caustics, 2.0) * 2.0; // Sharpen and brighten
+            
+            // Apply caustics only to surfaces behind water
+            if (depthDiff > 0.001) {
+                sceneColor += vec3(0.3, 0.4, 0.5) * caustics * 0.3 * (1.0 - waterThickness * 0.5);
+            }
+            
+            // Mix shallow and deep water based on thickness
+            vec3 waterColor = mix(shallowWaterColor, deepWaterColor, waterThickness);
+            
+            // Blend water with scene based on transparency
+            float waterAlpha = clamp(0.35 + waterThickness * 0.55, 0.35, 0.9);
+            vec3 finalColor = mix(sceneColor, waterColor, waterAlpha);
+            
+            // Add specular highlights and sky reflection
+            vec3 skyColor = vec3(0.5, 0.7, 0.9);
+            finalColor = mix(finalColor, skyColor, fresnel * 0.35);
+            
+            // Subtle surface sparkle
+            float sparkle = pow(max(0.0, normal.z), 32.0);
+            finalColor += vec3(0.8, 0.9, 1.0) * sparkle * 0.3;
+            
+            // Project displaced world position back to clip space for depth
+            vec4 viewPos = view * vec4(worldPos3D, 1.0);
+            vec4 clipPos = projection * viewPos;
+            float displacedDepth = (clipPos.z / clipPos.w) * 0.5 + 0.5;
+            
+            FragColor = vec4(finalColor, 1.0);
+            gl_FragDepth = displacedDepth;
+        }
+    )";
+    
+    vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &surfaceVS, nullptr);
+    glCompileShader(vs);
+    
+    fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &surfaceFS, nullptr);
+    glCompileShader(fs);
+    
+    m_waterSurfaceShader = glCreateProgram();
+    glAttachShader(m_waterSurfaceShader, vs);
+    glAttachShader(m_waterSurfaceShader, fs);
+    glLinkProgram(m_waterSurfaceShader);
+    
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    
+    return true;
+}
+
+void FluidDepthRenderer::createGeometry() {
+    // Top face only for water blocks
+    glGenVertexArrays(1, &m_cubeVAO);
+    glGenBuffers(1, &m_cubeVBO);
+    glGenBuffers(1, &m_cubeEBO);
+    
+    glBindVertexArray(m_cubeVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_cubeVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(waterTopFaceVertices), waterTopFaceVertices, GL_STATIC_DRAW);
+    
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_cubeEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(waterTopFaceIndices), waterTopFaceIndices, GL_STATIC_DRAW);
+    
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    
+    // Fullscreen quad
+    glGenVertexArrays(1, &m_quadVAO);
+    glGenBuffers(1, &m_quadVBO);
+    
+    glBindVertexArray(m_quadVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_quadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+    
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    glBindVertexArray(0);
+}
+
+void FluidDepthRenderer::render(const glm::mat4& view, const glm::mat4& proj, 
+                                 ECSWorld* ecsWorld, IslandChunkSystem* islandSystem,
+                                 GLuint sceneDepthTexture, GLuint sceneColorTexture) {
+    if (!m_initialized) return;
+    
+    renderDepthPass(view, proj, ecsWorld, islandSystem);
+    renderBlurPass();
+    renderSurfacePass(view, proj, sceneDepthTexture, sceneColorTexture);
+}
+
+void FluidDepthRenderer::renderDepthPass(const glm::mat4& view, const glm::mat4& proj, 
+                                          ECSWorld* ecsWorld, IslandChunkSystem* islandSystem) {
+    glBindFramebuffer(GL_FRAMEBUFFER, m_depthFBO);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    
+    // Render water GLBs
+    renderWaterGLBs(view, proj, islandSystem);
+    
+    // Render fluid particles
+    renderFluidParticles(view, proj, ecsWorld, islandSystem);
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void FluidDepthRenderer::renderWaterGLBs(const glm::mat4& view, const glm::mat4& proj, 
+                                          IslandChunkSystem* islandSystem) {
+    if (!islandSystem) return;
+    
+    glUseProgram(m_waterDepthShader);
+    glBindVertexArray(m_cubeVAO);
+    
+    GLint viewLoc = glGetUniformLocation(m_waterDepthShader, "view");
+    GLint projLoc = glGetUniformLocation(m_waterDepthShader, "projection");
+    GLint modelLoc = glGetUniformLocation(m_waterDepthShader, "model");
+    GLint timeLoc = glGetUniformLocation(m_waterDepthShader, "time");
+    
+    glUniformMatrix4fv(viewLoc, 1, GL_FALSE, glm::value_ptr(view));
+    glUniformMatrix4fv(projLoc, 1, GL_FALSE, glm::value_ptr(proj));
+    glUniform1f(timeLoc, static_cast<float>(glfwGetTime()));
+    
+    // Iterate through all islands
+    auto& islands = islandSystem->getIslands();
+    for (auto& [islandID, island] : islands) {
+        glm::mat4 islandTransform = island.getTransformMatrix();
+        
+        // Iterate through chunks
+        for (auto& [chunkCoord, chunk] : island.chunks) {
+            if (!chunk) continue;
+            
+            glm::mat4 chunkTransform = island.getChunkTransform(chunkCoord);
+            
+            // Get water block instances
+            const auto& waterInstances = chunk->getModelInstances(BlockID::WATER);
+            
+            // Render each water block (top face only)
+            for (const Vec3& pos : waterInstances) {
+                glm::mat4 model = chunkTransform * glm::translate(glm::mat4(1.0f), glm::vec3(pos.x, pos.y, pos.z));
+                glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);  // 6 indices for 2 triangles (1 quad)
+            }
+        }
+    }
+    
+    glBindVertexArray(0);
+}
+
+void FluidDepthRenderer::renderFluidParticles(const glm::mat4& view, const glm::mat4& proj, 
+                                               ECSWorld* ecsWorld, IslandChunkSystem* islandSystem) {
+    if (!ecsWorld) return;
+    
+    auto* fluidStorage = ecsWorld->getStorage<FluidParticleComponent>();
+    auto* transformStorage = ecsWorld->getStorage<TransformComponent>();
+    
+    if (!fluidStorage || !transformStorage || fluidStorage->entities.empty()) return;
+    
+    glUseProgram(m_particleDepthShader);
+    glEnable(GL_PROGRAM_POINT_SIZE);
+    
+    GLint viewLoc = glGetUniformLocation(m_particleDepthShader, "view");
+    GLint projLoc = glGetUniformLocation(m_particleDepthShader, "projection");
+    GLint radiusLoc = glGetUniformLocation(m_particleDepthShader, "particleRadius");
+    
+    glUniformMatrix4fv(viewLoc, 1, GL_FALSE, glm::value_ptr(view));
+    glUniformMatrix4fv(projLoc, 1, GL_FALSE, glm::value_ptr(proj));
+    glUniform1f(radiusLoc, 0.4f);  // Match particle radius
+    
+    // Collect particle positions
+    std::vector<glm::vec3> positions;
+    for (size_t i = 0; i < fluidStorage->entities.size(); ++i) {
+        EntityID entity = fluidStorage->entities[i];
+        TransformComponent* transform = transformStorage->getComponent(entity);
+        if (transform) {
+            positions.push_back(glm::vec3(transform->position.x, transform->position.y, transform->position.z));
+        }
+    }
+    
+    if (positions.empty()) return;
+    
+    // Upload and render as points
+    GLuint particleVBO;
+    glGenBuffers(1, &particleVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
+    glBufferData(GL_ARRAY_BUFFER, positions.size() * sizeof(glm::vec3), positions.data(), GL_STREAM_DRAW);
+    
+    GLuint particleVAO;
+    glGenVertexArrays(1, &particleVAO);
+    glBindVertexArray(particleVAO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
+    glEnableVertexAttribArray(0);
+    
+    glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(positions.size()));
+    
+    glDeleteVertexArrays(1, &particleVAO);
+    glDeleteBuffers(1, &particleVBO);
+    
+    glDisable(GL_PROGRAM_POINT_SIZE);
+}
+
+void FluidDepthRenderer::renderBlurPass() {
+    glBindFramebuffer(GL_FRAMEBUFFER, m_blurFBO);
+    glDisable(GL_DEPTH_TEST);
+    glClear(GL_COLOR_BUFFER_BIT);
+    
+    glUseProgram(m_bilateralBlurShader);
+    glBindVertexArray(m_quadVAO);
+    
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_fluidDepthTex);
+    
+    glUniform1i(glGetUniformLocation(m_bilateralBlurShader, "depthTexture"), 0);
+    glUniform2f(glGetUniformLocation(m_bilateralBlurShader, "texelSize"), 1.0f / m_width, 1.0f / m_height);
+    glUniform1f(glGetUniformLocation(m_bilateralBlurShader, "blurRadius"), 8.0f);  // Much more aggressive
+    glUniform1f(glGetUniformLocation(m_bilateralBlurShader, "depthThreshold"), 0.5f);  // Very lenient
+    
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void FluidDepthRenderer::renderSurfacePass(const glm::mat4& view, const glm::mat4& proj,
+                                            GLuint sceneDepthTexture, GLuint sceneColorTexture) {
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);  // Allow surface to write at smoothed depth
+    glDepthMask(GL_TRUE);    // Write depth
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    glUseProgram(m_waterSurfaceShader);
+    glBindVertexArray(m_quadVAO);
+    
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_smoothDepthTex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, sceneDepthTexture);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, sceneColorTexture);
+    
+    // Pass matrices for world position reconstruction and projection
+    glm::mat4 invProj = glm::inverse(proj);
+    glm::mat4 invView = glm::inverse(view);
+    
+    glUniform1i(glGetUniformLocation(m_waterSurfaceShader, "smoothDepthTexture"), 0);
+    glUniform1i(glGetUniformLocation(m_waterSurfaceShader, "sceneDepthTexture"), 1);
+    glUniform1i(glGetUniformLocation(m_waterSurfaceShader, "sceneColorTexture"), 2);
+    glUniform2f(glGetUniformLocation(m_waterSurfaceShader, "texelSize"), 1.0f / m_width, 1.0f / m_height);
+    glUniform1f(glGetUniformLocation(m_waterSurfaceShader, "time"), static_cast<float>(glfwGetTime()));
+    glUniformMatrix4fv(glGetUniformLocation(m_waterSurfaceShader, "invProjection"), 1, GL_FALSE, glm::value_ptr(invProj));
+    glUniformMatrix4fv(glGetUniformLocation(m_waterSurfaceShader, "invView"), 1, GL_FALSE, glm::value_ptr(invView));
+    glUniformMatrix4fv(glGetUniformLocation(m_waterSurfaceShader, "view"), 1, GL_FALSE, glm::value_ptr(view));
+    glUniformMatrix4fv(glGetUniformLocation(m_waterSurfaceShader, "projection"), 1, GL_FALSE, glm::value_ptr(proj));
+    
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    
+    glDisable(GL_BLEND);
+}
+
+void FluidDepthRenderer::renderDebugView(int x, int y, int width, int height) {
+    // Simple debug visualization - render smoothed depth as grayscale
+    glDisable(GL_DEPTH_TEST);
+    glViewport(x, y, width, height);
+    
+    // TODO: Add simple debug shader to visualize depth buffer
+    
+    glEnable(GL_DEPTH_TEST);
+}
+
+void FluidDepthRenderer::destroyResources() {
+    if (m_fluidDepthTex) glDeleteTextures(1, &m_fluidDepthTex);
+    if (m_smoothDepthTex) glDeleteTextures(1, &m_smoothDepthTex);
+    if (m_depthFBO) glDeleteFramebuffers(1, &m_depthFBO);
+    if (m_blurFBO) glDeleteFramebuffers(1, &m_blurFBO);
+    if (m_waterDepthShader) glDeleteProgram(m_waterDepthShader);
+    if (m_particleDepthShader) glDeleteProgram(m_particleDepthShader);
+    if (m_bilateralBlurShader) glDeleteProgram(m_bilateralBlurShader);
+    if (m_waterSurfaceShader) glDeleteProgram(m_waterSurfaceShader);
+    if (m_cubeVAO) glDeleteVertexArrays(1, &m_cubeVAO);
+    if (m_cubeVBO) glDeleteBuffers(1, &m_cubeVBO);
+    if (m_cubeEBO) glDeleteBuffers(1, &m_cubeEBO);
+    if (m_quadVAO) glDeleteVertexArrays(1, &m_quadVAO);
+    if (m_quadVBO) glDeleteBuffers(1, &m_quadVBO);
+    
+    m_fluidDepthTex = m_smoothDepthTex = 0;
+    m_depthFBO = m_blurFBO = 0;
+    m_waterDepthShader = m_particleDepthShader = m_bilateralBlurShader = m_waterSurfaceShader = 0;
+    m_cubeVAO = m_cubeVBO = m_cubeEBO = m_quadVAO = m_quadVBO = 0;
+}

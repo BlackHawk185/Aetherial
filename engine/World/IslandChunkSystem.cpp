@@ -434,6 +434,141 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
               << surfaceBlocksPlaced << " surface, " 
               << subsurfaceBlocksPlaced << " subsurface)" << std::endl;
     
+    // **WATER BASIN PASS**
+    auto waterStart = std::chrono::high_resolution_clock::now();
+    
+    // Step 1: Fill ground-level basins
+    placeWaterBasins(islandID, palette, seed);
+    
+    // Step 2: Cull exposed water (fast on small dataset)
+    cullExposedWater(islandID);
+    
+    // Step 3: Iteratively add layers upward with flood-fill + cull
+    int layersAdded = 0;
+    int maxLayers = std::max(palette.minWaterDepth, palette.maxWaterDepth);
+    
+    for (int layer = 0; layer < maxLayers; ++layer)
+    {
+        // Find all water surface positions (water with air above)
+        std::vector<Vec3> waterSurfaces;
+        for (auto& [chunkCoord, chunk] : island->chunks)
+        {
+            if (!chunk) continue;
+            
+            for (int lz = 0; lz < VoxelChunk::SIZE; ++lz)
+            {
+                for (int ly = 0; ly < VoxelChunk::SIZE; ++ly)
+                {
+                    for (int lx = 0; lx < VoxelChunk::SIZE; ++lx)
+                    {
+                        uint8_t blockID = chunk->getVoxel(lx, ly, lz);
+                        
+                        // Check if this is water
+                        if (blockID != BlockID::WATER && blockID != BlockID::ICE && blockID != BlockID::LAVA)
+                            continue;
+                        
+                        Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(lx, ly, lz);
+                        Vec3 abovePos = worldPos + Vec3(0, 1, 0);
+                        
+                        // Check if air above
+                        uint8_t blockAbove = getBlockIDInIsland(islandID, abovePos);
+                        if (blockAbove == BlockID::AIR)
+                        {
+                            waterSurfaces.push_back(worldPos);
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (waterSurfaces.empty()) break; // No water to expand from
+        
+        // Horizontal flood-fill from each water surface position
+        std::unordered_set<int64_t> newWaterSet;
+        auto encodePos = [](const Vec3& p) -> int64_t {
+            return (static_cast<int64_t>(p.x + 32768) << 32) | 
+                   (static_cast<int64_t>(p.y + 32768) << 16) | 
+                   static_cast<int64_t>(p.z + 32768);
+        };
+        
+        static const Vec3 horizNeighbors[4] = {
+            Vec3(1, 0, 0), Vec3(-1, 0, 0),
+            Vec3(0, 0, 1), Vec3(0, 0, -1)
+        };
+        
+        for (const Vec3& surfacePos : waterSurfaces)
+        {
+            Vec3 startPos = surfacePos + Vec3(0, 1, 0);
+            int64_t startKey = encodePos(startPos);
+            if (newWaterSet.count(startKey)) continue;
+            
+            // Flood fill horizontally at this Y level
+            std::queue<Vec3> fillQueue;
+            fillQueue.push(startPos);
+            newWaterSet.insert(startKey);
+            
+            while (!fillQueue.empty())
+            {
+                Vec3 current = fillQueue.front();
+                fillQueue.pop();
+                
+                uint8_t currentBlock = getBlockIDInIsland(islandID, current);
+                if (currentBlock != BlockID::AIR) continue;
+                
+                // Check if solid below
+                uint8_t blockBelow = getBlockIDInIsland(islandID, current + Vec3(0, -1, 0));
+                if (blockBelow == BlockID::AIR) continue;
+                
+                // Expand horizontally
+                for (const Vec3& delta : horizNeighbors)
+                {
+                    Vec3 neighbor = current + delta;
+                    int64_t neighborKey = encodePos(neighbor);
+                    if (newWaterSet.count(neighborKey)) continue;
+                    newWaterSet.insert(neighborKey);
+                    fillQueue.push(neighbor);
+                }
+            }
+        }
+        
+        if (newWaterSet.empty()) break;
+        
+        // Place new water layer
+        for (int64_t key : newWaterSet)
+        {
+            int x = static_cast<int>((key >> 32) & 0xFFFF) - 32768;
+            int y = static_cast<int>((key >> 16) & 0xFFFF) - 32768;
+            int z = static_cast<int>(key & 0xFFFF) - 32768;
+            setBlockIDWithAutoChunk(islandID, Vec3(x, y, z), palette.waterBlock);
+        }
+        
+        // Cull exposed water at this layer
+        cullExposedWater(islandID);
+        
+        // Check if any water survived culling - if not, we're done
+        bool anyWaterRemains = false;
+        for (int64_t key : newWaterSet)
+        {
+            int x = static_cast<int>((key >> 32) & 0xFFFF) - 32768;
+            int y = static_cast<int>((key >> 16) & 0xFFFF) - 32768;
+            int z = static_cast<int>(key & 0xFFFF) - 32768;
+            uint8_t block = getBlockIDInIsland(islandID, Vec3(x, y, z));
+            if (block == BlockID::WATER || block == BlockID::ICE || block == BlockID::LAVA)
+            {
+                anyWaterRemains = true;
+                break;
+            }
+        }
+        
+        if (!anyWaterRemains) break; // Layer was completely culled, stop
+        
+        layersAdded++;
+    }
+    
+    auto waterEnd = std::chrono::high_resolution_clock::now();
+    auto waterDuration = std::chrono::duration_cast<std::chrono::milliseconds>(waterEnd - waterStart).count();
+    std::cout << "💧 Water Basins: " << waterDuration << "ms (" << layersAdded << " layers added)" << std::endl;
+    
     // **VEGETATION DECORATION PASS**
     // Place grass GLB models and voxel trees based on biome vegetation density
     auto decorationStart = std::chrono::high_resolution_clock::now();
@@ -442,7 +577,7 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     int treesPlaced = 0;
     
     // Use biome-specific vegetation density - SPARSE trees for Terralith-like feel
-    float grassChance = palette.vegetationDensity * 30.0f;  // Convert to percentage (0-30%)
+    float grassChance = palette.vegetationDensity * 80.0f;  // Lots of grass models (0-80%)
     float treeChance = palette.vegetationDensity * 1.5f;    // Much sparser trees (0-1.5%)
     
     // Direct chunk iteration - we already have the island pointer, no locks needed
@@ -788,6 +923,245 @@ void IslandChunkSystem::updatePlayerChunks(const Vec3& playerPosition)
 {
     // Infinite world generation will be implemented in a future version
     // For now, we manually create islands in GameState
+}
+
+void IslandChunkSystem::placeWaterBasins(uint32_t islandID, const BiomePalette& palette, uint32_t seed)
+{
+    FloatingIsland* island = getIsland(islandID);
+    if (!island) return;
+    
+    // Find all surface blocks that could be basin candidates
+    std::vector<Vec3> surfacePositions;
+    
+    for (auto& [chunkCoord, chunk] : island->chunks)
+    {
+        if (!chunk) continue;
+        
+        for (int lz = 0; lz < VoxelChunk::SIZE; ++lz)
+        {
+            for (int lx = 0; lx < VoxelChunk::SIZE; ++lx)
+            {
+                for (int ly = 0; ly < VoxelChunk::SIZE; ++ly)
+                {
+                    uint8_t blockID = chunk->getVoxel(lx, ly, lz);
+                    if (blockID != palette.surfaceBlock) continue;
+                    
+                    // Check if air above (surface exposed upward)
+                    Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(lx, ly, lz);
+                    uint8_t blockAbove = getBlockIDInIsland(islandID, worldPos + Vec3(0, 1, 0));
+                    if (blockAbove == BlockID::AIR)
+                    {
+                        surfacePositions.push_back(worldPos);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Track processed positions to avoid duplicate basin detection
+    std::unordered_set<int64_t> processed;
+    auto encodePos = [](const Vec3& p) -> int64_t {
+        return (static_cast<int64_t>(p.x + 32768) << 32) | 
+               (static_cast<int64_t>(p.y + 32768) << 16) | 
+               static_cast<int64_t>(p.z + 32768);
+    };
+    
+    int basinsCreated = 0;
+    int waterBlocksPlaced = 0;
+    
+    // Check each surface position for basin potential
+    for (const Vec3& surfacePos : surfacePositions)
+    {
+        int64_t posKey = encodePos(surfacePos);
+        if (processed.count(posKey)) continue;
+        
+        // Simply try to fill from here - flood fill will determine if it's valid
+        static const Vec3 horizNeighbors[4] = {
+            Vec3(1, 0, 0), Vec3(-1, 0, 0),
+            Vec3(0, 0, 1), Vec3(0, 0, -1)
+        };
+        
+        // Flood-fill horizontally at THIS layer (Y level), then build up layer by layer
+        std::queue<Vec3> fillQueue;
+        std::unordered_set<int64_t> filledThisBasin;
+        std::vector<Vec3> basinPositions;
+        
+        Vec3 startPos = surfacePos + Vec3(0, 1, 0);
+        fillQueue.push(startPos);
+        filledThisBasin.insert(encodePos(startPos));
+        
+        // Determine max water depth for this basin
+        uint32_t depthHash = seed;
+        depthHash ^= static_cast<uint32_t>(surfacePos.x * 374761393.0f);
+        depthHash ^= static_cast<uint32_t>(surfacePos.z * 668265263.0f);
+        float depthRand = (depthHash & 0xFFFF) / 65535.0f;
+        int maxWaterDepth = palette.minWaterDepth + static_cast<int>(depthRand * (palette.maxWaterDepth - palette.minWaterDepth));
+        
+        // Flood fill horizontally on this Y-level
+        while (!fillQueue.empty() && basinPositions.size() < 500)
+        {
+            Vec3 current = fillQueue.front();
+            fillQueue.pop();
+            
+            uint8_t currentBlock = getBlockIDInIsland(islandID, current);
+            if (currentBlock != BlockID::AIR) continue;
+            
+            // Check if there's solid ground below
+            uint8_t blockBelow = getBlockIDInIsland(islandID, current + Vec3(0, -1, 0));
+            if (blockBelow == BlockID::AIR) continue; // Skip if void below
+            
+            // Valid water position
+            basinPositions.push_back(current);
+            processed.insert(encodePos(current));
+            
+            // Expand horizontally on same Y level
+            for (const Vec3& delta : horizNeighbors)
+            {
+                Vec3 neighbor = current + delta;
+                int64_t neighborKey = encodePos(neighbor);
+                if (filledThisBasin.count(neighborKey)) continue;
+                filledThisBasin.insert(neighborKey);
+                fillQueue.push(neighbor);
+            }
+        }
+        
+        // Place water for this basin
+        if (!basinPositions.empty())
+        {
+            for (const Vec3& pos : basinPositions)
+            {
+                setBlockIDWithAutoChunk(islandID, pos, palette.waterBlock);
+                waterBlocksPlaced++;
+            }
+            basinsCreated++;
+        }
+    }
+    
+    std::cout << "   └─ Surface Positions: " << surfacePositions.size() 
+              << ", Basins Created: " << basinsCreated 
+              << ", Initial Water: " << waterBlocksPlaced << " blocks" << std::endl;
+}
+
+void IslandChunkSystem::cullExposedWater(uint32_t islandID)
+{
+    FloatingIsland* island = getIsland(islandID);
+    if (!island) return;
+    
+    static const Vec3 neighbors[6] = {
+        Vec3(1, 0, 0), Vec3(-1, 0, 0),
+        Vec3(0, 1, 0), Vec3(0, -1, 0),
+        Vec3(0, 0, 1), Vec3(0, 0, -1)
+    };
+    
+    auto encodePos = [](const Vec3& p) -> int64_t {
+        return (static_cast<int64_t>(p.x + 32768) << 32) | 
+               (static_cast<int64_t>(p.y + 32768) << 16) | 
+               static_cast<int64_t>(p.z + 32768);
+    };
+    
+    // PHASE 1: Find all water blocks with exposed leaks (side/bottom air)
+    std::vector<Vec3> exposedWater;
+    std::unordered_set<int64_t> allWater;
+    
+    for (auto& [chunkCoord, chunk] : island->chunks)
+    {
+        if (!chunk) continue;
+        
+        for (int lz = 0; lz < VoxelChunk::SIZE; ++lz)
+        {
+            for (int ly = 0; ly < VoxelChunk::SIZE; ++ly)
+            {
+                for (int lx = 0; lx < VoxelChunk::SIZE; ++lx)
+                {
+                    uint8_t blockID = chunk->getVoxel(lx, ly, lz);
+                    
+                    // Check if this is a water-type block
+                    if (blockID != BlockID::WATER && blockID != BlockID::ICE && blockID != BlockID::LAVA)
+                        continue;
+                    
+                    Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(lx, ly, lz);
+                    allWater.insert(encodePos(worldPos));
+                    
+                    // Check if any SIDE or BOTTOM neighbor is air (exposed leak)
+                    // Allow air on TOP (that's just the water surface!)
+                    bool hasExposedLeak = false;
+                    for (int i = 0; i < 6; ++i)
+                    {
+                        // Skip checking above (neighbors[2] is Vec3(0, 1, 0))
+                        if (i == 2) continue;
+                        
+                        const Vec3& delta = neighbors[i];
+                        Vec3 neighborPos = worldPos + delta;
+                        uint8_t neighborBlock = getBlockIDInIsland(islandID, neighborPos);
+                        if (neighborBlock == BlockID::AIR)
+                        {
+                            hasExposedLeak = true;
+                            break;
+                        }
+                    }
+                    
+                    if (hasExposedLeak)
+                    {
+                        exposedWater.push_back(worldPos);
+                    }
+                }
+            }
+        }
+    }
+    
+    // PHASE 2: Flood-fill from exposed water to find all HORIZONTALLY connected water
+    // Only expand in X/Z directions, NOT vertically (allows layered water)
+    static const Vec3 horizNeighbors[4] = {
+        Vec3(1, 0, 0), Vec3(-1, 0, 0),
+        Vec3(0, 0, 1), Vec3(0, 0, -1)
+    };
+    
+    std::unordered_set<int64_t> toRemove;
+    std::queue<Vec3> floodQueue;
+    
+    for (const Vec3& exposed : exposedWater)
+    {
+        int64_t key = encodePos(exposed);
+        if (toRemove.count(key)) continue; // Already marked
+        
+        floodQueue.push(exposed);
+        toRemove.insert(key);
+        
+        while (!floodQueue.empty())
+        {
+            Vec3 current = floodQueue.front();
+            floodQueue.pop();
+            
+            // Check ONLY horizontal neighbors for connected water (X/Z only)
+            for (const Vec3& delta : horizNeighbors)
+            {
+                Vec3 neighborPos = current + delta;
+                int64_t neighborKey = encodePos(neighborPos);
+                
+                // Skip if not water or already marked
+                if (!allWater.count(neighborKey)) continue;
+                if (toRemove.count(neighborKey)) continue;
+                
+                // Mark and flood from this water block
+                toRemove.insert(neighborKey);
+                floodQueue.push(neighborPos);
+            }
+        }
+    }
+    
+    // PHASE 3: Remove all connected water blocks
+    for (int64_t key : toRemove)
+    {
+        // Decode position
+        int x = static_cast<int>((key >> 32) & 0xFFFF) - 32768;
+        int y = static_cast<int>((key >> 16) & 0xFFFF) - 32768;
+        int z = static_cast<int>(key & 0xFFFF) - 32768;
+        
+        setBlockIDWithAutoChunk(islandID, Vec3(x, y, z), BlockID::AIR);
+    }
+    
+    std::cout << "   └─ Water Culled: " << toRemove.size() << " blocks (flood-fill from " 
+              << exposedWater.size() << " leak points)" << std::endl;
 }
 
 void IslandChunkSystem::generateChunksAroundPoint(const Vec3& center)

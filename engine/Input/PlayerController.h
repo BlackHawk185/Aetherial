@@ -114,10 +114,10 @@ private:
     float m_airFriction = 0.94f;        // Air resistance (reduced from 0.98 for more drag)
     float m_cameraSmoothing = 0.15f;    // Camera interpolation speed (lower = smoother)
     
-    // Capsule collision dimensions (player is 3 blocks tall, ~1.1 blocks wide)
+    // Capsule collision dimensions (player is 2.9 blocks tall, ~1.1 blocks wide)
     float m_capsuleRadius = 0.55f;      // Horizontal radius (requires 2-block gap, won't fit through 1)
-    float m_capsuleHeight = 3.0f;       // Total height including caps
-    float m_eyeHeightOffset = 1.2f;     // Eye level above physics center (90% of height)
+    float m_capsuleHeight = 2.9f;       // Total height including caps (fits through 3-block gaps)
+    float m_eyeHeightOffset = 1.2f;     // Eye level above physics center
     float m_maxStepHeight = 1.1f;       // Maximum height the player can step up (1 block + margin)
     
     // Debug modes

@@ -48,6 +48,96 @@ void main(){
 )GLSL";
 
     // ========== FORWARD SHADERS (for main rendering) ==========
+    // Water shader with wave displacement
+    static const char* kVS_Water = R"GLSL(
+#version 460 core
+layout (location=0) in vec3 aPos;
+layout (location=1) in vec3 aNormal;
+layout (location=2) in vec2 aUV;
+layout (location=4) in vec4 aInstance; // xyz=position offset, w=unused
+
+uniform mat4 uView;
+uniform mat4 uProjection;
+uniform mat4 uModel;
+uniform mat4 uLightVP;
+uniform float uTime;
+
+out vec2 vUV;
+out vec3 vNormalWS;
+out vec3 vWorldPos;
+out vec4 vLightSpacePos;
+out float vViewZ;
+
+// Smooth noise for waves
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+float noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);  // Quintic interpolation
+    
+    float a = hash(i);
+    float b = hash(i + vec2(1.0, 0.0));
+    float c = hash(i + vec2(0.0, 1.0));
+    float d = hash(i + vec2(1.0, 1.0));
+    
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float fbm(vec2 p) {
+    float value = 0.0;
+    float amplitude = 0.5;
+    float frequency = 1.0;
+    
+    for (int i = 0; i < 4; i++) {
+        value += amplitude * noise(p * frequency);
+        frequency *= 2.0;
+        amplitude *= 0.5;
+    }
+    return value;
+}
+
+void main(){
+    vec3 pos = aPos + aInstance.xyz;
+    vec4 world = uModel * vec4(pos, 1.0);
+    float waveHeight = 0.0;
+    
+    // Only displace vertices on top surface (y > 0.4 in model space)
+    if (aPos.y > 0.4) {
+        vec2 waveCoord = world.xz * 0.1;  // More visible waves
+        float wave = fbm(waveCoord + vec2(uTime * 0.2, uTime * 0.15));
+        waveHeight = (wave - 0.5) * 1.5;  // Exaggerated for testing (1.5 blocks!)
+        world.y += waveHeight;
+    }
+    
+    gl_Position = uProjection * uView * world;
+    vUV = aUV;
+    
+    // Compute normal from wave displacement for proper lighting
+    // For displaced surfaces, use vertex normal but tilt based on wave gradient
+    vec3 normal = aNormal;
+    if (aPos.y > 0.4) {
+        // Sample neighboring points to compute gradient (use same frequency as displacement)
+        float h = 0.1;
+        vec2 waveCoord = world.xz * 0.1;
+        float wave = fbm(waveCoord + vec2(uTime * 0.2, uTime * 0.15));
+        float heightR = fbm((world.xz + vec2(h, 0.0)) * 0.1 + vec2(uTime * 0.2, uTime * 0.15));
+        float heightU = fbm((world.xz + vec2(0.0, h)) * 0.1 + vec2(uTime * 0.2, uTime * 0.15));
+        
+        vec3 tangentX = vec3(h, (heightR - wave) * 1.5, 0.0);
+        vec3 tangentZ = vec3(0.0, (heightU - wave) * 1.5, h);
+        normal = normalize(cross(tangentZ, tangentX));
+    }
+    
+    vNormalWS = normalize(mat3(transpose(inverse(uModel))) * normal);
+    vWorldPos = world.xyz;
+    vLightSpacePos = uLightVP * world;
+    vViewZ = -(uView * world).z;
+}
+)GLSL";
+    
     // Wind-animated shader for grass/foliage
     static const char* kVS_Wind = R"GLSL(
 #version 460 core
@@ -239,6 +329,7 @@ in vec4 vLightSpacePos;
 in float vViewZ;
 
 uniform sampler2D uGrassTexture;
+uniform int uMaterialType;  // 0=textured, 1=water
 
 // G-buffer outputs (MRT)
 layout(location = 0) out vec3 gAlbedo;    // Base color
@@ -247,16 +338,88 @@ layout(location = 2) out vec3 gPosition;  // World position
 layout(location = 3) out vec4 gMetadata;  // Reserved for future use
 
 void main(){
-    vec4 albedo = texture(uGrassTexture, vUV);
+    vec3 albedoRGB;
+    float materialID = 0.0;
     
-    // Alpha cutout
-    if (albedo.a < 0.3) discard;
+    if (uMaterialType == 1) {
+        // Water - base blue color (will be enhanced in lighting pass)
+        albedoRGB = vec3(0.05, 0.2, 0.4);  // Deep ocean blue (darker for better reflections)
+        materialID = 1.0;  // Mark as water for special lighting
+    } else {
+        // Textured models (grass, etc.)
+        vec4 albedo = texture(uGrassTexture, vUV);
+        if (albedo.a < 0.3) discard;  // Alpha cutout
+        albedoRGB = albedo.rgb;
+        materialID = 0.0;  // Standard material
+    }
     
     // Write to G-buffer
-    gAlbedo = albedo.rgb;
+    gAlbedo = albedoRGB;
     gNormal = normalize(vNormalWS);
     gPosition = vWorldPos;
-    gMetadata = vec4(0.0);  // Reserved (could store material properties later)
+    gMetadata = vec4(materialID, 0.0, 0.0, 0.0);  // x=materialID (0=standard, 1=water)
+}
+)GLSL";
+
+    // ========== FORWARD TRANSPARENT WATER SHADER ==========
+    static const char* kWaterTransparent_FS = R"GLSL(
+#version 460 core
+in vec2 vUV;
+in vec3 vNormalWS;
+in vec3 vWorldPos;
+in vec4 vLightSpacePos;
+in float vViewZ;
+
+uniform vec3 uSunDir;
+uniform vec3 uMoonDir;
+uniform float uSunIntensity;
+uniform float uMoonIntensity;
+uniform vec3 uCameraPos;
+
+out vec4 FragColor;
+
+void main(){
+    vec3 N = normalize(vNormalWS);
+    vec3 V = normalize(uCameraPos - vWorldPos);
+    
+    // Fresnel effect - more reflection at grazing angles
+    float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+    fresnel = mix(0.02, 0.95, fresnel);
+    
+    // Sky reflection color (gradient based on reflected direction)
+    vec3 R = reflect(-V, N);
+    float skyGradient = R.y * 0.5 + 0.5;
+    vec3 skyColor = mix(vec3(0.4, 0.7, 1.0), vec3(0.1, 0.3, 0.6), skyGradient);
+    
+    // Sun specular highlight
+    vec3 L_sun = normalize(-uSunDir);
+    vec3 H_sun = normalize(L_sun + V);
+    float specSun = pow(max(dot(N, H_sun), 0.0), 256.0);
+    vec3 sunSpecular = vec3(1.0, 0.95, 0.8) * specSun * uSunIntensity * 3.0;
+    
+    // Moon specular
+    vec3 L_moon = normalize(-uMoonDir);
+    vec3 H_moon = normalize(L_moon + V);
+    float specMoon = pow(max(dot(N, H_moon), 0.0), 128.0);
+    vec3 moonSpecular = vec3(0.6, 0.7, 1.0) * specMoon * uMoonIntensity * 0.5;
+    
+    // Water base color (light, clear blue-green)
+    vec3 waterColor = vec3(0.1, 0.4, 0.5);
+    
+    // Lighting (simple lambert for now, could sample light maps later)
+    float ndotl_sun = max(dot(N, L_sun), 0.0);
+    float ndotl_moon = max(dot(N, L_moon), 0.0);
+    vec3 diffuse = waterColor * (ndotl_sun * uSunIntensity + ndotl_moon * uMoonIntensity * 0.15);
+    
+    // Combine: water diffuse + sky reflection + specular
+    vec3 reflectionColor = skyColor * fresnel;
+    vec3 finalColor = mix(diffuse, reflectionColor, 0.7) + sunSpecular + moonSpecular;
+    
+    // Much more transparent - alpha based on viewing angle
+    // Looking straight down = very clear (0.2), looking at edge = more opaque (0.6)
+    float alpha = mix(0.2, 0.6, fresnel);
+    
+    FragColor = vec4(finalColor, alpha);
 }
 )GLSL";
 
@@ -294,11 +457,18 @@ ModelInstanceRenderer::~ModelInstanceRenderer() { shutdown(); }
 
 // Compile shader for specific block type
 GLuint ModelInstanceRenderer::compileShaderForBlock(uint8_t blockID) {
+    // NOTE: This function is currently unused - G-buffer compilation happens inline in renderToGBuffer()
+    // Kept for potential future forward rendering pass
+    
     // Determine which vertex shader to use based on block type
     const char* vertexShader = kVS_Static;  // Default to static (no wind)
     
+    // Water with wave displacement
+    if (blockID == 45) {  // BlockID::WATER
+        vertexShader = kVS_Water;
+    }
     // Wind animation for grass and foliage
-    if (blockID == 13) {  // BlockID::DECOR_GRASS
+    else if (blockID == 102) {  // BlockID::DECOR_GRASS
         vertexShader = kVS_Wind;
     }
     // TODO: Add other wind-animated blocks (leaves, reeds, etc.)
@@ -346,17 +516,14 @@ void ModelInstanceRenderer::shutdown() {
     m_albedoTextures.clear();
     if (m_engineGrassTex) { glDeleteTextures(1, &m_engineGrassTex); m_engineGrassTex = 0; }
     
-    // Clean up per-block shaders
-    for (auto& shaderPair : m_shaders) {
-        if (shaderPair.second) glDeleteProgram(shaderPair.second);
-    }
-    m_shaders.clear();
-    
-    // Clean up G-buffer shaders
+    // Clean up G-buffer shaders (one shader per block type for deferred rendering)
     for (auto& shaderPair : m_gbufferShaders) {
         if (shaderPair.second) glDeleteProgram(shaderPair.second);
     }
     m_gbufferShaders.clear();
+    
+    // Clean up forward water shader
+    if (m_waterTransparentShader) { glDeleteProgram(m_waterTransparentShader); m_waterTransparentShader = 0; }
     
     // Clean up depth shader
     if (m_depthProgram) { glDeleteProgram(m_depthProgram); m_depthProgram = 0; }
@@ -499,16 +666,6 @@ bool ModelInstanceRenderer::loadModel(uint8_t blockID, const std::string& path) 
         }
     }
 
-    // NEW: Compile shader for this block type if not already compiled
-    if (m_shaders.find(blockID) == m_shaders.end()) {
-        GLuint shader = compileShaderForBlock(blockID);
-        if (shader == 0) {
-            std::cerr << "Failed to compile shader for block " << (int)blockID << std::endl;
-            return false;
-        }
-        m_shaders[blockID] = shader;
-    }
-
     return gpuModel.valid;
 }
 
@@ -648,13 +805,22 @@ void ModelInstanceRenderer::renderToGBuffer(const glm::mat4& view, const glm::ma
     for (const auto& [blockID, model] : m_models) {
         if (!model.valid) continue;
         
+        // Skip water - it's rendered in the transparent forward pass
+        if (blockID == 45) continue;  // BlockID::WATER
+        
         // Get or compile G-buffer shader for this block type
         GLuint shader = 0;
         auto shaderIt = m_gbufferShaders.find(blockID);
         if (shaderIt == m_gbufferShaders.end()) {
-            // Compile G-buffer shader (uses same vertex shader, different fragment shader)
-            const char* vs = (blockID == 13) ? kVS_Wind : kVS_Static;
-            GLuint vsShader = Compile(GL_VERTEX_SHADER, vs);
+            // Get block-specific vertex shader (water, wind, or static)
+            const char* vertexShader = kVS_Static;
+            if (blockID == 45) {  // BlockID::WATER
+                vertexShader = kVS_Water;
+            } else if (blockID == 102) {  // BlockID::DECOR_GRASS
+                vertexShader = kVS_Wind;
+            }
+            
+            GLuint vsShader = Compile(GL_VERTEX_SHADER, vertexShader);
             GLuint fsShader = Compile(GL_FRAGMENT_SHADER, kGBuffer_FS);
             if (vsShader && fsShader) {
                 shader = Link(vsShader, fsShader);
@@ -679,10 +845,17 @@ void ModelInstanceRenderer::renderToGBuffer(const glm::mat4& view, const glm::ma
         int loc_Model = glGetUniformLocation(shader, "uModel");
         int loc_Time = glGetUniformLocation(shader, "uTime");
         int loc_Texture = glGetUniformLocation(shader, "uGrassTexture");
+        int loc_MaterialType = glGetUniformLocation(shader, "uMaterialType");
         
         glUniformMatrix4fv(loc_View, 1, GL_FALSE, &view[0][0]);
         glUniformMatrix4fv(loc_Proj, 1, GL_FALSE, &proj[0][0]);
         glUniform1f(loc_Time, m_time);
+        
+        // Set material type: 0=textured, 1=water
+        int materialType = (blockID == 45) ? 1 : 0;  // BlockID::WATER = 45
+        if (loc_MaterialType != -1) {
+            glUniform1i(loc_MaterialType, materialType);
+        }
         
         // Bind texture - CRITICAL: Must bind before rendering or will sample wrong texture!
         GLuint tex = 0;
@@ -811,5 +984,72 @@ void ModelInstanceRenderer::endDepthPass(int screenWidth, int screenHeight)
     // This method exists for API consistency but doesn't need to do anything
     (void)screenWidth;
     (void)screenHeight;
+}
+
+// ========== TRANSPARENT WATER FORWARD PASS ==========
+
+void ModelInstanceRenderer::renderWaterTransparent(const glm::mat4& view, const glm::mat4& proj,
+                                                  const glm::vec3& sunDir, float sunIntensity,
+                                                  const glm::vec3& moonDir, float moonIntensity,
+                                                  const glm::vec3& cameraPos)
+{
+    // Compile water shader if needed
+    if (m_waterTransparentShader == 0) {
+        GLuint vs = Compile(GL_VERTEX_SHADER, kVS_Water);  // Reuse water vertex shader with waves
+        GLuint fs = Compile(GL_FRAGMENT_SHADER, kWaterTransparent_FS);
+        if (vs && fs) {
+            m_waterTransparentShader = Link(vs, fs);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+        }
+        if (m_waterTransparentShader == 0) return;  // Failed to compile
+    }
+    
+    // Only render water blocks (BlockID 45)
+    const uint8_t waterBlockID = 45;
+    
+    auto modelIt = m_models.find(waterBlockID);
+    if (modelIt == m_models.end() || !modelIt->second.valid) return;
+    
+    glUseProgram(m_waterTransparentShader);
+    
+    // Set uniforms
+    int loc_View = glGetUniformLocation(m_waterTransparentShader, "uView");
+    int loc_Proj = glGetUniformLocation(m_waterTransparentShader, "uProjection");
+    int loc_Model = glGetUniformLocation(m_waterTransparentShader, "uModel");
+    int loc_Time = glGetUniformLocation(m_waterTransparentShader, "uTime");
+    int loc_SunDir = glGetUniformLocation(m_waterTransparentShader, "uSunDir");
+    int loc_MoonDir = glGetUniformLocation(m_waterTransparentShader, "uMoonDir");
+    int loc_SunIntensity = glGetUniformLocation(m_waterTransparentShader, "uSunIntensity");
+    int loc_MoonIntensity = glGetUniformLocation(m_waterTransparentShader, "uMoonIntensity");
+    int loc_CameraPos = glGetUniformLocation(m_waterTransparentShader, "uCameraPos");
+    
+    glUniformMatrix4fv(loc_View, 1, GL_FALSE, &view[0][0]);
+    glUniformMatrix4fv(loc_Proj, 1, GL_FALSE, &proj[0][0]);
+    glUniform1f(loc_Time, m_time);
+    glUniform3fv(loc_SunDir, 1, &sunDir[0]);
+    glUniform3fv(loc_MoonDir, 1, &moonDir[0]);
+    glUniform1f(loc_SunIntensity, sunIntensity);
+    glUniform1f(loc_MoonIntensity, moonIntensity);
+    glUniform3fv(loc_CameraPos, 1, &cameraPos[0]);
+    
+    // Render all water instances
+    for (auto& [key, buf] : m_chunkInstances) {
+        auto [chunk, blockID] = key;
+        if (blockID != waterBlockID) continue;
+        if (buf.count == 0 || !buf.isUploaded) continue;
+        
+        // Set model matrix (stored in buffer)
+        if (loc_Model != -1) {
+            glUniformMatrix4fv(loc_Model, 1, GL_FALSE, &buf.modelMatrix[0][0]);
+        }
+        
+        // Render instanced water
+        for (size_t i = 0; i < buf.vaos.size() && i < modelIt->second.primitives.size(); ++i) {
+            glBindVertexArray(buf.vaos[i]);
+            glDrawElementsInstanced(GL_TRIANGLES, modelIt->second.primitives[i].indexCount, GL_UNSIGNED_INT, 0, buf.count);
+            glBindVertexArray(0);
+        }
+    }
 }
 

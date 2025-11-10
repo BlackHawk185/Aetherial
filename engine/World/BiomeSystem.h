@@ -28,6 +28,9 @@ struct BiomePalette {
     uint8_t oreBlock;           // Ore type that spawns in this biome
     float vegetationDensity;    // 0.0-1.0, how many trees/decorations spawn
     float oreSpawnChance;       // 0.0-1.0, likelihood of ore veins
+    uint8_t waterBlock;         // Water block type for this biome
+    int minWaterDepth;          // Minimum depth for water features
+    int maxWaterDepth;          // Maximum depth for water features
 };
 
 /**

@@ -1,4 +1,12 @@
-// FluidSystem.cpp - Implementation of sleeping particle fluid simulation
+// FluidSystem.cpp
+// Noclip pathfinding water flow system
+// Particles follow BFS-generated waypoint paths through connected air spaces
+// Movement: Pure noclip (position += velocity * dt), no physics or collision
+// Pathfinding: Floodfill BFS within 5-block radius, FIFO queue for breadth-first exploration
+// Target priority: Lowest reachable → same level horizontal → upward (fallback)
+// Settling: Immediate when within 0.5 blocks (3D distance) of pathfinding target
+// Tug system: Activates face-adjacent water when particle moves >3.0 blocks away
+
 #include "FluidSystem.h"
 #include "VoxelRaycaster.h"
 #include "../Profiling/Profiler.h"
@@ -9,39 +17,53 @@
 #include <iostream>
 #include <random>
 
-// Global fluid system instance
 FluidSystem g_fluidSystem;
 
-FluidSystem::FluidSystem() {
-    // Default constructor
-}
-
-FluidSystem::~FluidSystem() {
-    // Cleanup
-}
+FluidSystem::FluidSystem() {}
+FluidSystem::~FluidSystem() {}
 
 void FluidSystem::initialize(IslandChunkSystem* islandSystem, ECSWorld* ecsWorld, PhysicsSystem* physics) {
     m_islandSystem = islandSystem;
     m_ecsWorld = ecsWorld;
     m_physics = physics;
-    
-    std::cout << "✨ Fluid system initialized with sleeping particle architecture" << std::endl;
+    std::cout << "✨ Fluid system initialized" << std::endl;
 }
 
 void FluidSystem::update(float deltaTime) {
     PROFILE_SCOPE("FluidSystem::update");
     
-    // Reset frame counters
     m_particlesWokenThisFrame = 0;
-    
-    // Update active particles
     updateActiveParticles(deltaTime);
-    
-    // Process state transitions (sleep/wake/destroy)
     processParticleTransitions();
-    
-    // Clean up destroyed particles
     cleanupDestroyedParticles();
+    
+    // Cascade loop: activate water, check tug for NEW particles only (not all particles)
+    // Allows cascade to propagate in single frame without O(n²) cost
+    int maxCascadeIterations = 10;
+    
+    for (int iter = 0; iter < maxCascadeIterations; ++iter) {
+        if (m_waterToWake.empty()) break;
+        
+        auto* fluidStorage = m_ecsWorld->getStorage<FluidParticleComponent>();
+        auto* transformStorage = m_ecsWorld->getStorage<TransformComponent>();
+        if (!fluidStorage || !transformStorage) break;
+        
+        size_t entityCountBefore = fluidStorage->entities.size();
+        
+        processDeferredWaterActivation();
+        
+        // Only check tug system for particles created in THIS iteration
+        // New particles are appended to the end of the storage
+        for (size_t i = entityCountBefore; i < fluidStorage->entities.size(); ++i) {
+            EntityID entity = fluidStorage->entities[i];
+            FluidParticleComponent* fluidComp = &fluidStorage->components[i];
+            TransformComponent* transform = transformStorage->getComponent(entity);
+            
+            if (fluidComp->state == FluidState::ACTIVE && transform) {
+                updateParticleTugSystem(entity, fluidComp, transform);
+            }
+        }
+    }
 }
 
 void FluidSystem::updateActiveParticles(float deltaTime) {
@@ -77,130 +99,75 @@ void FluidSystem::updateActiveParticles(float deltaTime) {
     }
 }
 
+// Per-frame particle movement: noclip pathfinding
+// 1. Check if need new path (no target or reached target)
+// 2. Calculate velocity toward current waypoint (or recalculate path if needed)
+// 3. Apply velocity: position += velocity * dt (noclip - no collision checks)
 void FluidSystem::updateParticlePhysics(EntityID /* particle */, FluidParticleComponent* fluidComp, 
                                        TransformComponent* transform, float deltaTime) {
     if (!m_physics) return;
     
-    // Apply gravity
-    fluidComp->velocity.y += m_settings.gravity * deltaTime;
+    bool needsNewTarget = !fluidComp->hasPathfindingTarget;
     
-    // Apply viscosity (simple damping)
-    fluidComp->velocity = fluidComp->velocity * (1.0f - m_settings.viscosity * deltaTime);
-    
-    // Detect ground state using the same system as player
-    const float raycastMargin = 0.1f;
-    GroundInfo groundInfo = m_physics->detectGroundCapsule(
-        transform->position, 
-        m_settings.particleRadius,
-        m_settings.particleRadius * 2.0f, // height = diameter for sphere
-        raycastMargin
-    );
-    
-    // If grounded and slow, apply pathfinding to flow downhill
-    if (groundInfo.isGrounded && fluidComp->velocity.length() < 2.0f) {
-        Vec3 pathfindingForce = calculatePathfindingForce(transform->position, fluidComp->sourceIslandID, fluidComp);
-        fluidComp->velocity = fluidComp->velocity + pathfindingForce * deltaTime * 5.0f; // Pathfinding acceleration
+    if (fluidComp->hasPathfindingTarget) {
+        FloatingIsland* island = m_islandSystem->getIsland(fluidComp->sourceIslandID);
+        if (island) {
+            Vec3 islandPos = island->worldToLocal(transform->position);
+            Vec3 toTarget = fluidComp->pathfindingTarget - islandPos;
+            
+            // Check if at target (3D distance)
+            bool atTarget = (toTarget.length() < 0.5f);
+            needsNewTarget = atTarget;
+        }
     }
     
-    // Use unified physics movement resolver with aggressive anti-stuck
-    // This handles collision, step-up, and unstuck automatically
-    // Fluid particles can only climb 10% of their height (very limited climbing)
-    transform->position = m_physics->resolveCapsuleMovement(
+    // Get pathfinding force (returns desired velocity direction)
+    Vec3 pathfindingForce = calculatePathfindingForce(transform->position, fluidComp->sourceIslandID, fluidComp, needsNewTarget);
+    
+    // Set velocity directly to pathfinding force (no physics, no accumulation)
+    fluidComp->velocity = pathfindingForce;
+    
+    // Apply movement (noclip - resolveFluidMovement is pure velocity application now)
+    transform->position = m_physics->resolveFluidMovement(
         transform->position,
         fluidComp->velocity,
         deltaTime,
-        m_settings.particleRadius,
-        m_settings.particleRadius * 2.0f,  // height
-        0.1f  // stepHeightRatio - water can barely climb (only 10% of height = ~0.08 blocks)
+        m_settings.particleRadius
     );
 }
 
+// Settling: check if particle reached target, attempt to place water voxel
+// Success: particle → voxel, entity destroyed, broadcast to clients
+// Failure (occupied): invalidate target, recalculate path next frame, keep flowing
 void FluidSystem::updateParticleSettling(EntityID particle, FluidParticleComponent* fluidComp, 
                                         TransformComponent* transform, float deltaTime) {
-    // Update alive timer for tracking purposes
     fluidComp->aliveTimer += deltaTime;
-    
-    // Check if particle is grounded
     if (!m_physics) return;
     
-    GroundInfo groundInfo = m_physics->detectGroundCapsule(
-        transform->position, 
-        m_settings.particleRadius,
-        m_settings.particleRadius * 2.0f,
-        0.1f
-    );
-    
-    if (!groundInfo.isGrounded) {
-        return;
-    }
-    
-    // Check if particle has reached its pathfinding target
     FloatingIsland* island = m_islandSystem->getIsland(fluidComp->sourceIslandID);
     if (!island) return;
     
     Vec3 islandPos = island->worldToLocal(transform->position);
-    Vec3 currentVoxel = Vec3(std::floor(islandPos.x), std::floor(islandPos.y), std::floor(islandPos.z));
-    Vec3 currentVoxelCenter = Vec3(currentVoxel.x + 0.5f, currentVoxel.y + 0.5f, currentVoxel.z + 0.5f);
     
     bool atTarget = false;
     if (fluidComp->hasPathfindingTarget) {
         Vec3 toTarget = fluidComp->pathfindingTarget - islandPos;
-        toTarget.y = 0; // Only check horizontal distance
-        atTarget = toTarget.length() < 0.15f; // Within 0.15 blocks of target
+        atTarget = toTarget.length() < 0.5f;  // 3D distance check (not just horizontal)
     }
     
-    // If at target, check if there's a better place to go
-    if (atTarget) {
-        // Search for lower neighbors one more time
-        float lowestHeight = currentVoxel.y;
-        bool foundLower = false;
+    if (atTarget && fluidComp->hasPathfindingTarget) {
+        fluidComp->targetGridPos = Vec3(
+            std::floor(fluidComp->pathfindingTarget.x),
+            std::floor(fluidComp->pathfindingTarget.y),
+            std::floor(fluidComp->pathfindingTarget.z)
+        );
         
-        Vec3 directions[] = {
-            Vec3(1, 0, 0), Vec3(-1, 0, 0),
-            Vec3(0, 0, 1), Vec3(0, 0, -1)
-        };
+        std::cout << "[FLUID] Particle reached target - settling at (" 
+                  << fluidComp->targetGridPos.x << ", " << fluidComp->targetGridPos.y << ", " 
+                  << fluidComp->targetGridPos.z << ")" << std::endl;
         
-        for (const Vec3& dir : directions) {
-            Vec3 neighborVoxel = currentVoxel + dir;
-            uint8_t voxelType = m_islandSystem->getVoxelFromIsland(fluidComp->sourceIslandID, neighborVoxel);
-            
-            if (voxelType == BlockID::AIR) {
-                // Find ground level of this neighbor
-                Vec3 checkPos = neighborVoxel;
-                float groundLevel = neighborVoxel.y;
-                
-                for (int i = 0; i < 10; ++i) {
-                    checkPos.y -= 1.0f;
-                    uint8_t belowType = m_islandSystem->getVoxelFromIsland(fluidComp->sourceIslandID, checkPos);
-                    if (belowType != BlockID::AIR) {
-                        groundLevel = checkPos.y + 1.0f;
-                        break;
-                    }
-                }
-                
-                // Check if this neighbor is lower
-                if (groundLevel < lowestHeight - 0.05f) {
-                    foundLower = true;
-                    break;
-                }
-            }
-        }
-        
-        // If no lower neighbor exists, settle immediately
-        if (!foundLower) {
-            // Round to nearest grid position
-            fluidComp->targetGridPos = Vec3(
-                std::round(islandPos.x),
-                std::round(islandPos.y),
-                std::round(islandPos.z)
-            );
-            
-            std::cout << "[FLUID] Particle at target with no lower path - settling at (" 
-                      << fluidComp->targetGridPos.x << ", " << fluidComp->targetGridPos.y << ", " 
-                      << fluidComp->targetGridPos.z << ")" << std::endl;
-            
-            m_particlesToSleep.push_back(particle);
-        }
+        m_particlesToSleep.push_back(particle);
+        fluidComp->hasPathfindingTarget = false;  // Invalidate to prevent re-settling loop
     }
 }
 
@@ -222,16 +189,16 @@ void FluidSystem::updateParticleTugSystem(EntityID particle, FluidParticleCompon
         // Calculate distance between particle and water voxel (in island space)
         float distance = (particleIslandPos - waterVoxelPos).length();
         
-        // If particle has moved more than tugDistance away, activate the water voxel
+        // If particle has moved more than tugDistance away, queue water for activation
         if (distance > m_settings.tugDistance) {
             // Check if this voxel is still water
             uint8_t voxelType = m_islandSystem->getVoxelFromIsland(fluidComp->sourceIslandID, waterVoxelPos);
             if (voxelType == BlockID::WATER) {
-                // Wake this water voxel
-                wakeFluidVoxel(fluidComp->sourceIslandID, waterVoxelPos);
+                // Queue this water voxel for activation (deferred to avoid ECS invalidation)
+                m_waterToWake.push_back({fluidComp->sourceIslandID, waterVoxelPos});
                 m_particlesWokenThisFrame++;
                 
-                // Remove from watch list (we've activated it)
+                // Remove from watch list (we've queued it for activation)
                 fluidComp->watchedWaterVoxels.erase(fluidComp->watchedWaterVoxels.begin() + i);
                 --i;  // Adjust index since we removed an element
                 
@@ -255,9 +222,25 @@ void FluidSystem::processParticleTransitions() {
 
 void FluidSystem::cleanupDestroyedParticles() {
     for (EntityID particle : m_particlesToDestroy) {
+        // Get particle data before destroying
+        FluidParticleComponent* fluidComp = m_ecsWorld->getComponent<FluidParticleComponent>(particle);
+        
+        // Notify server to broadcast despawn (particle destroyed, no voxel placement)
+        if (m_onParticleDespawn && fluidComp) {
+            m_onParticleDespawn(particle, fluidComp->sourceIslandID, Vec3(0, 0, 0), false);
+        }
+        
         m_ecsWorld->destroyEntity(particle);
     }
     m_particlesToDestroy.clear();
+}
+
+void FluidSystem::processDeferredWaterActivation() {
+    // Process all queued water activations
+    for (const WaterToWake& water : m_waterToWake) {
+        wakeFluidVoxel(water.islandID, water.position);
+    }
+    m_waterToWake.clear();
 }
 
 void FluidSystem::triggerFluidActivation(uint32_t islandID, const Vec3& islandRelativePos, float disturbanceForce) {
@@ -317,10 +300,16 @@ EntityID FluidSystem::wakeFluidVoxel(uint32_t islandID, const Vec3& islandRelati
         return 0;
     }
     
-    std::cout << "[FLUID] Calling setVoxelWithMesh to remove water..." << std::endl;
+    std::cout << "[FLUID] Step 1b: Removing water voxel..." << std::endl;
     try {
-        m_islandSystem->setVoxelWithMesh(islandID, islandRelativePos, 0);  // 0 = empty
+        // Use server-only path - no mesh generation (server doesn't need meshes)
+        m_islandSystem->setVoxelServerOnly(islandID, islandRelativePos, 0);  // 0 = empty
         std::cout << "[FLUID] Voxel removed successfully" << std::endl;
+        
+        // Notify server to broadcast voxel removal to clients
+        if (m_onVoxelChange) {
+            m_onVoxelChange(islandID, islandRelativePos, 0);
+        }
     } catch (...) {
         std::cerr << "[FLUID] EXCEPTION caught while setting voxel!" << std::endl;
         return 0;
@@ -373,6 +362,11 @@ EntityID FluidSystem::wakeFluidVoxel(uint32_t islandID, const Vec3& islandRelati
               << ") island-rel: (" << islandRelativePos.x << ", " << islandRelativePos.y << ", " << islandRelativePos.z 
               << ") watching " << fluidComp.watchedWaterVoxels.size() << " water voxels" << std::endl;
     
+    // Notify server to broadcast spawn to clients
+    if (m_onParticleSpawn) {
+        m_onParticleSpawn(particle, islandID, worldPos, fluidComp.velocity, islandRelativePos);
+    }
+    
     return particle;
 }
 
@@ -383,33 +377,32 @@ void FluidSystem::registerNearbyWaterVoxels(FluidParticleComponent* fluidComp, c
     // Use the island-relative position directly (already in the right space)
     Vec3 islandPos = islandRelativePos;
     
-    // Check neighbors within tugRadius for water voxels
-    int searchRadius = static_cast<int>(std::ceil(m_settings.tugRadius));
+    // Check only immediate face-adjacent neighbors (6 directions)
+    const Vec3 faceNeighbors[6] = {
+        Vec3(1, 0, 0),   // +X
+        Vec3(-1, 0, 0),  // -X
+        Vec3(0, 1, 0),   // +Y
+        Vec3(0, -1, 0),  // -Y
+        Vec3(0, 0, 1),   // +Z
+        Vec3(0, 0, -1)   // -Z
+    };
     
-    std::cout << "[FLUID] Scanning for water neighbors around (" << islandPos.x << ", " << islandPos.y << ", " << islandPos.z 
-              << ") radius=" << searchRadius << std::endl;
+    std::cout << "[FLUID] Scanning for water in 6 face-adjacent neighbors around (" 
+              << islandPos.x << ", " << islandPos.y << ", " << islandPos.z << ")" << std::endl;
     
-    for (int dx = -searchRadius; dx <= searchRadius; dx++) {
-        for (int dy = -searchRadius; dy <= searchRadius; dy++) {
-            for (int dz = -searchRadius; dz <= searchRadius; dz++) {
-                Vec3 neighborPos = islandPos + Vec3(dx, dy, dz);
-                
-                // Skip the particle's own position
-                if (dx == 0 && dy == 0 && dz == 0) continue;
-                
-                // Check if this position has a water voxel
-                uint8_t voxelType = m_islandSystem->getVoxelFromIsland(fluidComp->sourceIslandID, neighborPos);
-                if (voxelType == BlockID::WATER) {
-                    // Add to watch list
-                    fluidComp->watchedWaterVoxels.push_back(neighborPos);
-                    std::cout << "[FLUID]   - Found water at offset (" << dx << ", " << dy << ", " << dz 
-                              << ") absolute (" << neighborPos.x << ", " << neighborPos.y << ", " << neighborPos.z << ")" << std::endl;
-                }
-            }
+    for (int i = 0; i < 6; i++) {
+        Vec3 neighborPos = islandPos + faceNeighbors[i];
+        
+        // Check if this position has a water voxel
+        uint8_t voxelType = m_islandSystem->getVoxelFromIsland(fluidComp->sourceIslandID, neighborPos);
+        if (voxelType == BlockID::WATER) {
+            fluidComp->watchedWaterVoxels.push_back(neighborPos);
+            std::cout << "[FLUID]   - Found water at (" << neighborPos.x << ", " 
+                      << neighborPos.y << ", " << neighborPos.z << ")" << std::endl;
         }
     }
     
-    std::cout << "[FLUID] Registered " << fluidComp->watchedWaterVoxels.size() << " nearby water voxels for particle" << std::endl;
+    std::cout << "[FLUID] Registered " << fluidComp->watchedWaterVoxels.size() << " face-adjacent water voxels for particle" << std::endl;
 }
 
 void FluidSystem::sleepFluidParticle(EntityID particleEntity) {
@@ -440,14 +433,26 @@ void FluidSystem::sleepFluidParticle(EntityID particleEntity) {
     // Check if target position is empty (should be air to place water)
     uint8_t existingVoxel = m_islandSystem->getVoxelFromIsland(targetIslandID, islandRelativePos);
     if (existingVoxel != BlockID::AIR) {
-        // Target position is occupied, destroy particle instead of sleeping
-        std::cout << "[FLUID] Cannot sleep particle - position occupied by block " << (int)existingVoxel << std::endl;
-        m_particlesToDestroy.push_back(particleEntity);
-        return;
+        // Target occupied (another particle beat us to it) - invalidate target and repath
+        // Next frame: pathfinding will find a different air block (or search upward if all occupied)
+        std::cout << "[FLUID] Cannot sleep particle - position occupied by block " << (int)existingVoxel 
+                  << " - invalidating target and continuing flow" << std::endl;
+        fluidComp->hasPathfindingTarget = false;  // Triggers recalculation next update
+        return;  // Keep particle active to find new target
     }
     
-    // Place fluid voxel in island at the target grid position
-    m_islandSystem->setVoxelWithMesh(targetIslandID, islandRelativePos, FLUID_VOXEL_TYPE);
+    // Place fluid voxel in island at the target grid position (server-only, no mesh gen)
+    m_islandSystem->setVoxelServerOnly(targetIslandID, islandRelativePos, FLUID_VOXEL_TYPE);
+    
+    // Notify server to broadcast voxel placement to clients
+    if (m_onVoxelChange) {
+        m_onVoxelChange(targetIslandID, islandRelativePos, FLUID_VOXEL_TYPE);
+    }
+    
+    // Notify server to broadcast despawn to clients (particle settled back to voxel)
+    if (m_onParticleDespawn) {
+        m_onParticleDespawn(particleEntity, targetIslandID, islandRelativePos, true);
+    }
     
     // Add to sleeping voxels tracking
     addSleepingVoxel(targetIslandID, islandRelativePos, fluidComp->tugStrength);
@@ -491,90 +496,214 @@ Vec3 FluidSystem::calculateGridAlignmentForce(const Vec3& position, const Vec3& 
     return displacement * m_settings.gridAttractionStrength;
 }
 
-Vec3 FluidSystem::calculatePathfindingForce(const Vec3& worldPosition, uint32_t islandID, FluidParticleComponent* fluidComp) {
-    // Find the island this particle is on and pathfind to voxel centers
+// Pathfinding: Floodfill BFS to find lowest reachable air block, then follow waypoint path
+// Returns velocity vector toward current waypoint (or final target if path complete)
+// Recalculates path when: 1) No target, 2) Reached target, 3) Target occupied (invalidated)
+Vec3 FluidSystem::calculatePathfindingForce(const Vec3& worldPosition, uint32_t islandID, FluidParticleComponent* fluidComp, bool recalculateTarget) {
     FloatingIsland* island = m_islandSystem->getIsland(islandID);
     if (!island) return Vec3(0, 0, 0);
     
-    // Convert world position to island-relative space
     Vec3 islandPos = island->worldToLocal(worldPosition);
-    
-    // Find current voxel grid position
     Vec3 currentVoxel = Vec3(std::floor(islandPos.x), std::floor(islandPos.y), std::floor(islandPos.z));
-    
-    // Calculate center of current voxel (island-relative)
     Vec3 currentVoxelCenter = Vec3(currentVoxel.x + 0.5f, currentVoxel.y + 0.5f, currentVoxel.z + 0.5f);
     
-    // STEP 1: Find best target voxel by checking horizontal neighbors for LOWER terrain
-    Vec3 bestTarget = currentVoxelCenter; // Default to current voxel center
-    float lowestHeight = currentVoxel.y;
-    bool foundLower = false;
-    
-    Vec3 directions[] = {
-        Vec3(1, 0, 0),   // +X
-        Vec3(-1, 0, 0),  // -X
-        Vec3(0, 0, 1),   // +Z
-        Vec3(0, 0, -1)   // -Z
-    };
-    
-    for (const Vec3& dir : directions) {
-        Vec3 neighborVoxel = currentVoxel + dir;
+    // BFS pathfinding: explore connected AIR blocks, find lowest reachable position
+    if (recalculateTarget) {
+        Vec3 bestTarget = currentVoxelCenter;
+        bool foundTarget = false;
+        const int searchRadius = 5;          // Max 5 blocks away
+        const int maxFloodfillSteps = 100;   // Limit BFS iterations
         
-        // Check if neighbor is empty (air)
-        uint8_t voxelType = m_islandSystem->getVoxelFromIsland(islandID, neighborVoxel);
-        if (voxelType == BlockID::AIR) {
-            // Check what's below the empty neighbor to find ground level
-            Vec3 checkPos = neighborVoxel;
-            float groundLevel = neighborVoxel.y;
+        // PRIORITY CHECK: Try falling straight down first (most common case)
+        Vec3 directDownTarget = currentVoxel;
+        bool foundDirectDown = false;
+        for (int dy = -1; dy >= -searchRadius; dy--) {
+            Vec3 testPos = currentVoxel + Vec3(0, dy, 0);
+            uint8_t blockType = m_islandSystem->getVoxelFromIsland(islandID, testPos);
+            if (blockType != BlockID::AIR) {
+                // Hit solid block - target the air block above it
+                if (dy < -1) {  // Only if we fell at least 1 block
+                    directDownTarget = currentVoxel + Vec3(0, dy + 1, 0);
+                    foundDirectDown = true;
+                }
+                break;
+            }
+        }
+        
+        if (foundDirectDown) {
+            // Water can fall straight down - use direct path
+            bestTarget = Vec3(directDownTarget.x + 0.5f, directDownTarget.y + 0.5f, directDownTarget.z + 0.5f);
+            fluidComp->pathfindingTarget = bestTarget;
+            fluidComp->hasPathfindingTarget = true;
+            fluidComp->pathWaypoints.clear();  // Direct fall, no waypoints needed
             
-            // Scan down to find ground
-            for (int i = 0; i < 10; ++i) {
-                checkPos.y -= 1.0f;
-                uint8_t belowType = m_islandSystem->getVoxelFromIsland(islandID, checkPos);
-                if (belowType != BlockID::AIR) {
-                    groundLevel = checkPos.y + 1.0f; // Ground is one block up from solid
+            std::cout << "[PATHFIND] Direct fall from Y=" << currentVoxel.y << " to Y=" << directDownTarget.y << std::endl;
+            
+            Vec3 direction = bestTarget - islandPos;
+            float distance = direction.length();
+            return distance < 0.5f ? direction.normalized() * 1.0f : direction.normalized() * 5.0f;
+        }
+        
+        // BFS setup: queue of voxels to explore, visited set, parent tracking for path reconstruction
+        std::vector<Vec3> reachablePositions;
+        std::unordered_set<uint64_t> visited;
+        std::unordered_map<uint64_t, Vec3> cameFrom;  // Parent pointers for path rebuild
+        std::vector<Vec3> queue;
+        
+        queue.push_back(currentVoxel);
+        uint64_t startHash = ((uint64_t)(currentVoxel.x + 512) << 32) | ((uint64_t)(currentVoxel.y + 512) << 16) | (uint64_t)(currentVoxel.z + 512);
+        visited.insert(startHash);
+        
+        // CRITICAL: Use index-based iteration for FIFO (BFS), not stack-based (DFS)
+        // queue.back()/pop_back() = DFS (wrong), queue[index++] = BFS (correct)
+        size_t queueIndex = 0;
+        while (queueIndex < queue.size() && queueIndex < (size_t)maxFloodfillSteps) {
+            Vec3 pos = queue[queueIndex];
+            queueIndex++;
+            
+            // Check if within search radius
+            Vec3 offset = pos - currentVoxel;
+            float distSq = offset.x * offset.x + offset.y * offset.y + offset.z * offset.z;
+            if (distSq > searchRadius * searchRadius) continue;
+            
+            // Add to reachable positions
+            reachablePositions.push_back(pos);
+            
+            // Explore 6-connected neighbors (face-adjacent)
+            static const Vec3 neighbors[6] = {
+                Vec3(1,0,0), Vec3(-1,0,0), Vec3(0,1,0), Vec3(0,-1,0), Vec3(0,0,1), Vec3(0,0,-1)
+            };
+            
+            for (int i = 0; i < 6; ++i) {
+                Vec3 neighbor = pos + neighbors[i];
+                uint64_t hash = ((uint64_t)(neighbor.x + 512) << 32) | ((uint64_t)(neighbor.y + 512) << 16) | (uint64_t)(neighbor.z + 512);
+                
+                if (visited.find(hash) != visited.end()) continue;
+                visited.insert(hash);
+                
+                uint8_t blockType = m_islandSystem->getVoxelFromIsland(islandID, neighbor);
+                // Allow pathfinding through AIR and WATER (water can flow through water)
+                if (blockType == BlockID::AIR || blockType == BlockID::WATER) {
+                    queue.push_back(neighbor);
+                    cameFrom[hash] = pos;  // Track parent for path reconstruction
+                }
+            }
+        }
+        
+        std::cout << "[PATHFIND] Found " << reachablePositions.size() << " reachable positions from (" 
+                  << currentVoxel.x << "," << currentVoxel.y << "," << currentVoxel.z << ")" << std::endl;
+        
+        // Priority 1: Lowest AIR block (water flows downward, prefers empty spaces)
+        Vec3 bestTargetVoxel = currentVoxel;
+        float lowestHeight = currentVoxel.y;
+        bool foundAirBelow = false;
+        
+        for (const Vec3& pos : reachablePositions) {
+            uint8_t blockType = m_islandSystem->getVoxelFromIsland(islandID, pos);
+            bool isAir = (blockType == BlockID::AIR);
+            
+            // Prefer AIR over WATER, and lower positions over higher
+            if (pos.y < lowestHeight) {
+                if (!foundAirBelow && !isAir) continue;  // Skip water if we haven't found any air yet
+                if (foundAirBelow && !isAir) continue;   // Skip water if we already have air targets
+                
+                lowestHeight = pos.y;
+                bestTargetVoxel = pos;
+                bestTarget = Vec3(pos.x + 0.5f, pos.y + 0.5f, pos.z + 0.5f);
+                foundTarget = true;
+                if (isAir) foundAirBelow = true;
+            }
+        }
+        
+        // Priority 2: Same level horizontal spread (if nothing below)
+        if (!foundTarget) {
+            for (const Vec3& pos : reachablePositions) {
+                if (pos.y == currentVoxel.y && (pos.x != currentVoxel.x || pos.z != currentVoxel.z)) {
+                    bestTargetVoxel = pos;
+                    bestTarget = Vec3(pos.x + 0.5f, pos.y + 0.5f, pos.z + 0.5f);
+                    foundTarget = true;
                     break;
                 }
             }
-            
-            // ONLY accept neighbor if it has LOWER ground (not equal!)
-            if (groundLevel < lowestHeight - 0.05f) {
-                lowestHeight = groundLevel;
-                bestTarget = Vec3(neighborVoxel.x + 0.5f, neighborVoxel.y + 0.5f, neighborVoxel.z + 0.5f);
-                foundLower = true;
+        }
+        
+        // Priority 3: Upward (fallback when trapped in pit)
+        if (!foundTarget) {
+            float lowestAbove = currentVoxel.y + searchRadius + 1;
+            for (const Vec3& pos : reachablePositions) {
+                if (pos.y > currentVoxel.y && pos.y < lowestAbove) {
+                    lowestAbove = pos.y;
+                    bestTargetVoxel = pos;
+                    bestTarget = Vec3(pos.x + 0.5f, pos.y + 0.5f, pos.z + 0.5f);
+                    foundTarget = true;
+                }
             }
         }
-    }
-    
-    // STEP 2: Decide whether to commit to new target or keep existing one
-    if (foundLower) {
-        // Found a lower neighbor - only override existing target if it's better
-        if (!fluidComp->hasPathfindingTarget || lowestHeight < fluidComp->pathfindingTarget.y - 0.05f) {
+        
+        // Path reconstruction: walk backward from target to start using parent pointers
+        if (foundTarget && bestTargetVoxel != currentVoxel) {
             fluidComp->pathfindingTarget = bestTarget;
             fluidComp->hasPathfindingTarget = true;
-        }
-    } else {
-        // No lower neighbor found - commit to current voxel center if we don't have a target
-        if (!fluidComp->hasPathfindingTarget) {
+            
+            std::vector<Vec3> path;
+            Vec3 current = bestTargetVoxel;
+            uint64_t currentHash = ((uint64_t)(current.x + 512) << 32) | ((uint64_t)(current.y + 512) << 16) | (uint64_t)(current.z + 512);
+            
+            while (cameFrom.find(currentHash) != cameFrom.end()) {
+                path.push_back(Vec3(current.x + 0.5f, current.y + 0.5f, current.z + 0.5f));
+                current = cameFrom[currentHash];
+                currentHash = ((uint64_t)(current.x + 512) << 32) | ((uint64_t)(current.y + 512) << 16) | (uint64_t)(current.z + 512);
+                
+                if (current.x == currentVoxel.x && current.y == currentVoxel.y && current.z == currentVoxel.z) {
+                    break;  // Reached start
+                }
+            }
+            
+            std::reverse(path.begin(), path.end());  // Forward direction
+            fluidComp->pathWaypoints = path;
+            fluidComp->currentWaypointIndex = 0;
+            
+            std::cout << "[PATHFIND] Created path with " << path.size() << " waypoints from (" 
+                      << currentVoxel.x << "," << currentVoxel.y << "," << currentVoxel.z 
+                      << ") to (" << bestTargetVoxel.x << "," << bestTargetVoxel.y << "," << bestTargetVoxel.z << ")" << std::endl;
+        } else if (foundTarget && bestTargetVoxel == currentVoxel) {
+            // Already at target voxel - no path needed
+            fluidComp->pathfindingTarget = bestTarget;
+            fluidComp->hasPathfindingTarget = true;
+            fluidComp->pathWaypoints.clear();
+        } else {
+            // No reachable positions found - stay put
             fluidComp->pathfindingTarget = currentVoxelCenter;
             fluidComp->hasPathfindingTarget = true;
+            fluidComp->pathWaypoints.clear();
         }
     }
     
-    // STEP 3: Calculate force toward committed target
-    Vec3 directionToTarget = fluidComp->pathfindingTarget - islandPos;
-    directionToTarget.y = 0; // Only horizontal movement
-    
-    float distanceToTarget = directionToTarget.length();
-    
-    // If we're very close to target (within 0.1 blocks), apply no force (we're settled)
-    if (distanceToTarget < 0.1f) {
-        return Vec3(0, 0, 0);
+    // Waypoint following: move toward current waypoint, advance when within 0.5 blocks
+    if (!fluidComp->pathWaypoints.empty() && fluidComp->currentWaypointIndex < (int)fluidComp->pathWaypoints.size()) {
+        Vec3 currentWaypoint = fluidComp->pathWaypoints[fluidComp->currentWaypointIndex];
+        Vec3 directionToWaypoint = currentWaypoint - islandPos;
+        float distanceToWaypoint = directionToWaypoint.length();
+        
+        if (distanceToWaypoint < 0.5f) {
+            fluidComp->currentWaypointIndex++;  // Advance to next waypoint
+            if (fluidComp->currentWaypointIndex >= (int)fluidComp->pathWaypoints.size()) {
+                // Completed path - move toward final target
+                Vec3 directionToTarget = fluidComp->pathfindingTarget - islandPos;
+                float distanceToTarget = directionToTarget.length();
+                return distanceToTarget < 0.5f ? directionToTarget.normalized() * 1.0f : directionToTarget.normalized() * 5.0f;
+            }
+            currentWaypoint = fluidComp->pathWaypoints[fluidComp->currentWaypointIndex];
+            directionToWaypoint = currentWaypoint - islandPos;
+        }
+        
+        return directionToWaypoint.normalized() * 5.0f;  // Normal speed toward waypoint
+    } else {
+        // No path - move directly toward target (same voxel or no reachable positions)
+        Vec3 directionToTarget = fluidComp->pathfindingTarget - islandPos;
+        float distanceToTarget = directionToTarget.length();
+        return distanceToTarget < 0.5f ? directionToTarget.normalized() * 1.0f : directionToTarget.normalized() * 5.0f;
     }
-    
-    // Return force toward committed target
-    Vec3 force = directionToTarget.normalized() * 3.0f;
-    return force;
 }
 
 Vec3 FluidSystem::findNearestValidGridPosition(const Vec3& worldPosition) {

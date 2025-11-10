@@ -20,12 +20,13 @@
 #include "../Network/NetworkManager.h"
 #include "../Network/NetworkMessages.h"
 #include "../Rendering/BlockHighlightRenderer.h"
-#include "../Rendering/FluidParticleRenderer.h"
+
 #include "../Rendering/GBuffer.h"
 #include "../Rendering/DeferredLightingPass.h"
 #include "../Rendering/PostProcessingPipeline.h"
 #include "../Rendering/HDRFramebuffer.h"
 #include "../Rendering/SkyRenderer.h"
+#include "../Rendering/VolumetricCloudRenderer.h"
 #include "../UI/HUD.h"
 #include "../UI/PeriodicTableUI.h"  // NEW: Periodic table UI for hotbar binding
 #include "../Core/Window.h"
@@ -86,6 +87,13 @@ GameClient::GameClient()
 
         client->onEntityStateUpdate = [this](const EntityStateUpdate& update)
         { this->handleEntityStateUpdate(update); };
+        
+        // Setup fluid particle callbacks
+        client->onFluidParticleSpawn = [this](const FluidParticleSpawnMessage& msg)
+        { this->handleFluidParticleSpawn(msg); };
+        
+        client->onFluidParticleDespawn = [this](const FluidParticleDespawnMessage& msg)
+        { this->handleFluidParticleDespawn(msg); };
     }
 }
 
@@ -469,6 +477,13 @@ bool GameClient::initializeGraphics()
         return false;
     }
 
+    // Initialize volumetric cloud renderer
+    if (!g_cloudRenderer.initialize())
+    {
+        std::cerr << "❌ Failed to initialize cloud renderer!" << std::endl;
+        return false;
+    }
+
     // Initialize post-processing pipeline (tone mapping only)
     if (!g_postProcessing.initialize(m_windowWidth, m_windowHeight))
     {
@@ -505,14 +520,6 @@ bool GameClient::initializeGraphics()
     {
         std::cerr << "Warning: Failed to initialize BlockHighlightRenderer" << std::endl;
         m_blockHighlighter.reset();
-    }
-    
-    // Initialize fluid particle renderer
-    m_fluidParticleRenderer = std::make_unique<FluidParticleRenderer>();
-    if (!m_fluidParticleRenderer->initialize())
-    {
-        std::cerr << "Warning: Failed to initialize FluidParticleRenderer" << std::endl;
-        m_fluidParticleRenderer.reset();
     }
     
     // Initialize HUD overlay
@@ -952,7 +959,8 @@ void GameClient::renderWorld()
         }
         
         // Render full-screen quad with deferred lighting to HDR framebuffer
-        g_deferredLighting.render(sunDirGLM, moonDirGLM, sunIntensity, moonIntensity, cameraPosGLM);
+        float timeOfDay = m_dayNightController ? m_dayNightController->getTimeOfDay() : 12.0f;
+        g_deferredLighting.render(sunDirGLM, moonDirGLM, sunIntensity, moonIntensity, cameraPosGLM, timeOfDay);
     }
     
     // 3. Sky Pass: Render sky gradient with sun disc to HDR framebuffer
@@ -972,6 +980,39 @@ void GameClient::renderWorld()
         g_skyRenderer.render(sunDirGLM, sunIntensity, moonDirGLM, moonIntensity, 
                            cameraPosGLM, viewMatrix, projectionMatrix, timeOfDay);
         
+        // Render volumetric clouds (after sky, before transparent objects)
+        g_cloudRenderer.render(sunDirGLM, sunIntensity, cameraPosGLM, 
+                              viewMatrix, projectionMatrix, 
+                              g_gBuffer.getDepthTexture(), timeOfDay);
+        
+        g_hdrFramebuffer.unbind();
+    }
+    
+    // 3.5. Transparent Water Pass: Render water with alpha blending after lighting
+    {
+        PROFILE_SCOPE("Transparent_Water_Pass");
+        
+        // Bind HDR framebuffer (already has depth from G-buffer)
+        g_hdrFramebuffer.bind();
+        
+        // Enable blending for transparency
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glEnable(GL_DEPTH_TEST);     // Read depth buffer
+        glDepthMask(GL_FALSE);       // Don't write to depth buffer
+        
+        // Render water blocks with transparency
+        if (g_modelRenderer) {
+            g_modelRenderer->renderWaterTransparent(viewMatrix, projectionMatrix, 
+                                                   sunDirGLM, sunIntensity, 
+                                                   moonDirGLM, moonIntensity, 
+                                                   cameraPosGLM);
+        }
+        
+        // Restore state
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        
         g_hdrFramebuffer.unbind();
     }
     
@@ -988,10 +1029,11 @@ void GameClient::renderWorld()
                                sunDirGLM, cameraPosGLM, viewProjectionMatrix);
     }
     
-    // 5. Forward Pass: Render transparent/special objects (block highlight, fluid particles, UI)
+    // 5. Forward Pass: Render transparent/special objects (water, block highlight, UI)
     {
         PROFILE_SCOPE("Forward_Pass");
         
+        // Render screen-space fluid (water GLBs + particles with smoothing)
         // Render block highlight (yellow wireframe cube on selected block)
         if (m_blockHighlighter && m_inputState.cachedTargetBlock.hit)
         {
@@ -1008,14 +1050,6 @@ void GameClient::renderWorld()
                 m_blockHighlighter->render(localBlockPos, glm::value_ptr(islandTransform), 
                     glm::value_ptr(viewMatrix), glm::value_ptr(projectionMatrix));
             }
-        }
-        
-        // Render fluid particles
-        if (m_fluidParticleRenderer && m_clientWorld)
-        {
-            PROFILE_SCOPE("renderFluidParticles");
-            m_fluidParticleRenderer->render(&g_ecs, 
-                glm::value_ptr(viewMatrix), glm::value_ptr(projectionMatrix));
         }
     }
 }
@@ -1575,4 +1609,48 @@ void GameClient::handleEntityStateUpdate(const EntityStateUpdate& update)
             // Handle other entity types in the future
             break;
     }
+}
+
+void GameClient::handleFluidParticleSpawn(const FluidParticleSpawnMessage& msg)
+{
+    extern ECSWorld g_ecs;
+    
+    std::cout << "[CLIENT] Spawning fluid particle entity " << msg.entityID 
+              << " at (" << msg.worldPosition.x << ", " << msg.worldPosition.y << ", " << msg.worldPosition.z << ")" << std::endl;
+    
+    // Create entity with specific ID (client mirrors server's entity ID)
+    EntityID entity = g_ecs.createEntityWithID(msg.entityID);
+    
+    // Add transform component
+    TransformComponent transform;
+    transform.position = msg.worldPosition;
+    g_ecs.addComponent(entity, transform);
+    
+    // Add fluid component (client-side, render-only)
+    FluidParticleComponent fluidComp;
+    fluidComp.state = FluidState::ACTIVE;
+    fluidComp.velocity = msg.velocity;
+    fluidComp.sourceIslandID = msg.islandID;
+    fluidComp.originalVoxelPos = msg.originalVoxelPos;
+    g_ecs.addComponent(entity, fluidComp);
+}
+
+void GameClient::handleFluidParticleDespawn(const FluidParticleDespawnMessage& msg)
+{
+    extern ECSWorld g_ecs;
+    
+    std::cout << "[CLIENT] Despawning fluid particle entity " << msg.entityID << std::endl;
+    
+    // If particle settled and should create voxel
+    if (msg.shouldCreateVoxel && m_clientWorld)
+    {
+        std::cout << "[CLIENT] Placing water voxel at (" << msg.settledVoxelPos.x 
+                  << ", " << msg.settledVoxelPos.y << ", " << msg.settledVoxelPos.z << ")" << std::endl;
+        
+        // Place water voxel on client
+        m_clientWorld->applyServerVoxelChange(msg.islandID, msg.settledVoxelPos, BlockID::WATER);
+    }
+    
+    // Destroy the particle entity
+    g_ecs.destroyEntity(msg.entityID);
 }

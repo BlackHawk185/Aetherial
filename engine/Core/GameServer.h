@@ -125,6 +125,23 @@ private:
      */
     void broadcastIslandStates();
     
+    /**
+     * Broadcast fluid particle spawn to all connected clients
+     */
+    void broadcastFluidParticleSpawn(EntityID entityID, uint32_t islandID, const Vec3& worldPos, 
+                                     const Vec3& velocity, const Vec3& originalVoxelPos);
+    
+    /**
+     * Broadcast fluid particle despawn to all connected clients
+     */
+    void broadcastFluidParticleDespawn(EntityID entityID, uint32_t islandID, const Vec3& settledVoxelPos, 
+                                       bool shouldCreateVoxel);
+    
+    /**
+     * Setup fluid system callbacks for network broadcasting
+     */
+    void setupFluidSystemCallbacks();
+    
     // Core systems
     std::unique_ptr<ServerWorld> m_serverWorld;
     std::unique_ptr<TimeManager> m_timeManager;

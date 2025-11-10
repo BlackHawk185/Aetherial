@@ -2,8 +2,11 @@
 #include "GBuffer.h"
 #include "CascadedShadowMap.h"
 #include "HDRFramebuffer.h"
+#include "VolumetricCloudRenderer.h"
+#include "Parameters.h"
 #include <glad/gl.h>
 #include <iostream>
+#include <string>
 
 DeferredLightingPass g_deferredLighting;
 
@@ -22,8 +25,8 @@ void main() {
 }
 )GLSL";
 
-    // Deferred lighting fragment shader
-    static const char* kFS = R"GLSL(
+    // Deferred lighting fragment shader - dynamically generated with parameters
+    std::string lightingFS = R"GLSL(
 #version 460 core
 in vec2 vUV;
 
@@ -42,6 +45,11 @@ uniform int uNumCascades;
 uniform float uCascadeOrthoSizes[4];
 uniform float uDitherStrength;
 
+// Cloud shadows
+uniform sampler3D uCloudNoiseTex;
+uniform float uTimeOfDay;
+uniform bool uEnableCloudShadows;
+
 // Lighting
 uniform vec3 uSunDir;
 uniform vec3 uMoonDir;
@@ -53,6 +61,52 @@ out vec4 FragColor;
 
 // Cascade split: hard cutoff at 128 blocks (no blending)
 const float CASCADE_SPLIT = 128.0;
+
+// Cloud volume parameters - injected from EngineParameters::Clouds
+const float CLOUD_BASE_MIN = )GLSL" + std::to_string(EngineParameters::Clouds::CLOUD_BASE_MIN_HEIGHT) + R"GLSL(;
+const float CLOUD_BASE_MAX = )GLSL" + std::to_string(EngineParameters::Clouds::CLOUD_BASE_MAX_HEIGHT) + R"GLSL(;
+const float CLOUD_COVERAGE = )GLSL" + std::to_string(EngineParameters::Clouds::CLOUD_COVERAGE) + R"GLSL(;
+const float CLOUD_DENSITY = )GLSL" + std::to_string(EngineParameters::Clouds::CLOUD_DENSITY) + R"GLSL(;
+const float CLOUD_SPEED = )GLSL" + std::to_string(EngineParameters::Clouds::CLOUD_SPEED) + R"GLSL(;
+const float CLOUD_SCALE = )GLSL" + std::to_string(EngineParameters::Clouds::CLOUD_SCALE) + R"GLSL(;
+
+// Sample cloud density for shadow casting using 3D noise (Y-axis gives natural height variation)
+float sampleCloudShadow(vec3 worldPos, float time) {
+    if (!uEnableCloudShadows) return 0.0;
+    
+    // Raymarch from surface point UP toward sun through cloud volume
+    // Use fewer samples for shadow pass (performance)
+    const int SHADOW_SAMPLES = 6;
+    float totalOcclusion = 0.0;
+    
+    vec3 rayDir = -uSunDir;  // March toward sun
+    float stepSize = 40.0;    // Large steps for shadow sampling
+    
+    for (int i = 0; i < SHADOW_SAMPLES; i++) {
+        vec3 samplePos = worldPos + rayDir * (float(i) * stepSize);
+        
+        // Check if we're in the cloud volume
+        if (samplePos.y >= CLOUD_BASE_MIN && samplePos.y <= CLOUD_BASE_MAX) {
+            // Sample 3D noise (Y-axis naturally creates varied height clouds)
+            vec3 windOffset = vec3(time * CLOUD_SPEED * 0.05, 0.0, time * CLOUD_SPEED * 0.03);
+            vec3 noisePos = (samplePos + windOffset) * CLOUD_SCALE;
+            
+            float noise = texture(uCloudNoiseTex, noisePos).r;
+            float density = max(0.0, noise - (1.0 - CLOUD_COVERAGE)) * CLOUD_DENSITY;
+            
+            // Height gradient at volume edges
+            float heightInVolume = samplePos.y - CLOUD_BASE_MIN;
+            float volumeHeight = CLOUD_BASE_MAX - CLOUD_BASE_MIN;
+            float heightGradient = smoothstep(0.0, 30.0, heightInVolume) * 
+                                  smoothstep(volumeHeight, volumeHeight - 30.0, heightInVolume);
+            
+            totalOcclusion += density * heightGradient * 0.2; // Accumulate with falloff
+        }
+    }
+    
+    // Return occlusion factor (0 = no clouds, 1 = fully occluded)
+    return clamp(totalOcclusion, 0.0, 0.85); // Max 85% occlusion for atmosphere realism
+}
 
 // Poisson disk for PCF soft lighting (64 samples)
 const vec2 POISSON[64] = vec2[64](
@@ -153,6 +207,8 @@ void main() {
     }
     
     vec3 N = normalize(normal);
+    float materialID = metadata.x;
+    bool isWater = (materialID > 0.5);
     
     // Sample sun light
     vec3 L_sun = normalize(-uSunDir);
@@ -160,22 +216,62 @@ void main() {
     float bias_sun = max(0.0005, 0.001 * (1.0 - ndotl_sun));
     float sunLightFactor = sampleSunLight(worldPos, bias_sun);
     
+    // Apply cloud shadows to sun light
+    float cloudShadow = sampleCloudShadow(worldPos, uTimeOfDay);
+    sunLightFactor *= (1.0 - cloudShadow);
+    
     // Sample moon light
     vec3 L_moon = normalize(-uMoonDir);
     float ndotl_moon = max(dot(N, L_moon), 0.0);
     float bias_moon = max(0.0005, 0.001 * (1.0 - ndotl_moon));
     float moonLightFactor = sampleMoonLight(worldPos, bias_moon);
     
-    // Combine sun and moon lighting (additive, moon is much dimmer)
-    vec3 sunContribution = albedo * sunLightFactor * uSunIntensity;
-    vec3 moonContribution = albedo * moonLightFactor * uMoonIntensity * 0.15;  // Moon is 15% as bright
+    vec3 finalColor;
     
-    // Final color: dark by default, lit only where light maps indicate
-    vec3 finalColor = sunContribution + moonContribution;
+    if (isWater) {
+        // === WATER RENDERING ===
+        vec3 V = normalize(uCameraPos - worldPos);
+        
+        // Fresnel effect - more reflection at grazing angles
+        float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+        fresnel = mix(0.02, 0.9, fresnel);  // 2% reflective head-on, 90% at edges
+        
+        // Sky/environment reflection color (gradient based on view direction)
+        vec3 R = reflect(-V, N);
+        float skyGradient = R.y * 0.5 + 0.5;
+        vec3 skyColor = mix(vec3(0.4, 0.7, 1.0), vec3(0.1, 0.3, 0.6), skyGradient);
+        
+        // Sun specular highlight (bright spot on water)
+        vec3 H_sun = normalize(L_sun + V);
+        float specSun = pow(max(dot(N, H_sun), 0.0), 128.0) * sunLightFactor;
+        vec3 sunSpecular = vec3(1.0, 0.95, 0.8) * specSun * uSunIntensity * 2.0;
+        
+        // Moon specular (dimmer, bluer)
+        vec3 H_moon = normalize(L_moon + V);
+        float specMoon = pow(max(dot(N, H_moon), 0.0), 64.0) * moonLightFactor;
+        vec3 moonSpecular = vec3(0.6, 0.7, 1.0) * specMoon * uMoonIntensity * 0.3;
+        
+        // Water base color with lighting
+        vec3 waterDiffuse = albedo * (sunLightFactor * uSunIntensity + moonLightFactor * uMoonIntensity * 0.15);
+        
+        // Combine: water color + sky reflection + specular highlights
+        vec3 reflectionColor = skyColor * fresnel;
+        finalColor = mix(waterDiffuse, reflectionColor, 0.7) + sunSpecular + moonSpecular;
+        
+        // Add subtle transparency effect (can see darker depths)
+        finalColor = mix(finalColor, albedo * 0.3, 0.2);
+    } else {
+        // === STANDARD MATERIAL RENDERING ===
+        vec3 sunContribution = albedo * sunLightFactor * uSunIntensity;
+        vec3 moonContribution = albedo * moonLightFactor * uMoonIntensity * 0.15;
+        finalColor = sunContribution + moonContribution;
+    }
     
     FragColor = vec4(finalColor, 1.0);
 }
 )GLSL";
+    
+    const char* kFS = lightingFS.c_str();
 
     GLuint CompileShader(GLenum type, const char* src) {
         GLuint shader = glCreateShader(type);
@@ -263,6 +359,9 @@ bool DeferredLightingPass::initialize() {
     m_loc_lightTexel = glGetUniformLocation(m_shader, "uLightTexel");
     m_loc_cascadeOrthoSizes = glGetUniformLocation(m_shader, "uCascadeOrthoSizes");
     m_loc_ditherStrength = glGetUniformLocation(m_shader, "uDitherStrength");
+    m_loc_cloudNoiseTex = glGetUniformLocation(m_shader, "uCloudNoiseTex");
+    m_loc_timeOfDay = glGetUniformLocation(m_shader, "uTimeOfDay");
+    m_loc_enableCloudShadows = glGetUniformLocation(m_shader, "uEnableCloudShadows");
     
     // Create full-screen quad
     float quadVertices[] = {
@@ -309,7 +408,8 @@ void DeferredLightingPass::setCascadeData(int index, const glm::mat4& viewProj, 
 }
 
 void DeferredLightingPass::render(const glm::vec3& sunDirection, const glm::vec3& moonDirection,
-                                  float sunIntensity, float moonIntensity, const glm::vec3& cameraPosition) {
+                                  float sunIntensity, float moonIntensity, const glm::vec3& cameraPosition,
+                                  float timeOfDay) {
     // Bind HDR framebuffer for output
     g_hdrFramebuffer.bind();
     g_hdrFramebuffer.clear();
@@ -360,6 +460,15 @@ void DeferredLightingPass::render(const glm::vec3& sunDirection, const glm::vec3
     if (m_loc_ditherStrength >= 0) {
         glUniform1f(m_loc_ditherStrength, m_ditherStrength);
     }
+    
+    // Bind cloud noise texture for shadow sampling
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_3D, g_cloudRenderer.getNoiseTexture());
+    if (m_loc_cloudNoiseTex >= 0) glUniform1i(m_loc_cloudNoiseTex, 6);
+    
+    // Set cloud shadow parameters
+    if (m_loc_timeOfDay >= 0) glUniform1f(m_loc_timeOfDay, timeOfDay);
+    if (m_loc_enableCloudShadows >= 0) glUniform1i(m_loc_enableCloudShadows, m_cloudShadowsEnabled ? 1 : 0);
     
     // Disable depth testing for full-screen quad
     glDisable(GL_DEPTH_TEST);

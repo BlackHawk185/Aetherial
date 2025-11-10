@@ -12,14 +12,18 @@ VoronoiIslandPlacer::VoronoiIslandPlacer() {
 std::vector<IslandDefinition> VoronoiIslandPlacer::generateIslands(
     uint32_t worldSeed,
     float regionSize,
-    float islandDensity,
-    float minRadius,
-    float maxRadius)
+    float minCellSize,
+    float maxCellSize,
+    float islandToVoronoiRatio)
 {
-    // Calculate target island count based on density and region size
-    // islandDensity = islands per 1000x1000 area
-    float areaMultiplier = (regionSize * regionSize) / (1000.0f * 1000.0f);
-    int targetIslandCount = static_cast<int>(islandDensity * areaMultiplier);
+    // Calculate average cell size for Voronoi distribution
+    float avgCellSize = (minCellSize + maxCellSize) * 0.5f;
+    
+    // Calculate target island count based on region size and cell size
+    // Each cell represents one island, so count = area / cellArea
+    float regionArea = regionSize * regionSize;
+    float avgCellArea = avgCellSize * avgCellSize;
+    int targetIslandCount = static_cast<int>(regionArea / avgCellArea);
     
     std::vector<IslandDefinition> islands;
     islands.reserve(targetIslandCount);
@@ -27,9 +31,8 @@ std::vector<IslandDefinition> VoronoiIslandPlacer::generateIslands(
     // Create biome system for assigning biomes
     BiomeSystem biomeSystem;
     
-    // Calculate cell size for Voronoi distribution
-    // We want roughly 'targetIslandCount' cells in the region
-    float cellSize = regionSize / std::sqrt(static_cast<float>(targetIslandCount));
+    // Use average cell size for Voronoi frequency
+    float cellSize = avgCellSize;
     
     // Use FastNoiseLite's Cellular (Voronoi) noise for island placement
     FastNoiseLite cellularNoise;
@@ -128,23 +131,23 @@ std::vector<IslandDefinition> VoronoiIslandPlacer::generateIslands(
     
     for (int i = 0; i < numIslands; ++i) {
         Vec3 pos = candidateIslands[i].first;
-        float cellSize = candidateIslands[i].second;
+        float localCellSize = candidateIslands[i].second;
         
-        // Map cell size to island radius with added noise variation
-        // Larger cells = larger islands (they have more space)
-        // Normalize cell size to [0, 1] range (approximate)
-        float normalizedSize = std::min(1.0f, cellSize / (regionSize * 0.5f));
+        // Island radius is directly proportional to cell size
+        // Larger Voronoi cells = more space = larger islands
+        float radiusVariation = 0.05f;  // ±5% noise variation
         
-        // Add Perlin noise for additional size variation (range: -1 to 1)
+        // Add Perlin noise for size variation (range: -1 to 1)
         float sizeVariation = sizeNoise.GetNoise(pos.x, pos.z);
         
-        // Combine cell size (60% weight) with noise variation (40% weight)
-        // This gives us both spatial coherence AND interesting variation
-        float combinedSize = (normalizedSize * 0.6f) + ((sizeVariation * 0.5f + 0.5f) * 0.4f);
-        combinedSize = std::max(0.0f, std::min(1.0f, combinedSize));  // Clamp to [0, 1]
+        // Calculate radius: cell size * (ratio ± variation)
+        float radiusRatio = islandToVoronoiRatio + (sizeVariation * radiusVariation);
+        float radius = localCellSize * radiusRatio;
         
-        // Map to radius range
-        float radius = minRadius + combinedSize * (maxRadius - minRadius);
+        // Clamp to reasonable bounds based on cell size range
+        float minRadius = minCellSize * (islandToVoronoiRatio - radiusVariation);
+        float maxRadius = maxCellSize * (islandToVoronoiRatio + radiusVariation);
+        radius = std::max(minRadius, std::min(maxRadius, radius));
         
         // Generate unique seed for this island based on position
         uint32_t islandSeed = worldSeed;

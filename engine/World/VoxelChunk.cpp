@@ -61,11 +61,11 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
             updateNeighborQuads(x, y, z, true);
         } else if (oldType != BlockID::AIR && type == BlockID::AIR) {
             // Block removed - remove its quads and update neighbors
-            removeBlockQuads(x, y, z);
+            removeBlockQuads(x, y, z, oldType);
             updateNeighborQuads(x, y, z, false);
         } else {
             // Block type changed (rare) - remove old, add new
-            removeBlockQuads(x, y, z);
+            removeBlockQuads(x, y, z, oldType);
             addBlockQuads(x, y, z, type);
             // No neighbor update needed - faces stay the same
         }
@@ -74,9 +74,13 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
         if (m_meshUpdateCallback) {
             m_meshUpdateCallback(this);
         }
+    } else {
+        // Incremental updates not enabled yet - mark dirty and trigger full regeneration
+        meshDirty = true;
+        if (m_meshUpdateCallback) {
+            m_meshUpdateCallback(this);
+        }
     }
-    
-    meshDirty = true; // Keep for backwards compatibility with generateMesh()
 }
 
 void VoxelChunk::setVoxelDataDirect(int x, int y, int z, uint8_t type)
@@ -382,10 +386,13 @@ void VoxelChunk::addBlockQuads(int x, int y, int z, uint8_t blockType)
     // Skip air blocks
     if (blockType == BlockID::AIR) return;
     
-    // Skip OBJ-type blocks (they use instanced models, not voxel quads)
+    // Check if this is an OBJ-type block (they use instanced models, not voxel quads)
     auto& registry = BlockTypeRegistry::getInstance();
     const BlockTypeInfo* blockInfo = registry.getBlockType(blockType);
     if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
+        // Add model instance instead of voxel quads
+        Vec3 instancePos(static_cast<float>(x) + 0.5f, static_cast<float>(y), static_cast<float>(z) + 0.5f);
+        m_modelInstances[blockType].push_back(instancePos);
         return;
     }
     
@@ -419,8 +426,37 @@ void VoxelChunk::addBlockQuads(int x, int y, int z, uint8_t blockType)
 }
 
 // Remove all quads for a block
-void VoxelChunk::removeBlockQuads(int x, int y, int z)
+void VoxelChunk::removeBlockQuads(int x, int y, int z, uint8_t oldBlockType)
 {
+    // First check if this is an OBJ-type block and remove its model instance
+    // Use oldBlockType parameter since the voxel has already been changed to AIR
+    if (oldBlockType != BlockID::AIR) {
+        auto& registry = BlockTypeRegistry::getInstance();
+        const BlockTypeInfo* blockInfo = registry.getBlockType(oldBlockType);
+        if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
+            // Remove model instance at this position
+            Vec3 instancePos(static_cast<float>(x) + 0.5f, static_cast<float>(y), static_cast<float>(z) + 0.5f);
+            auto it = m_modelInstances.find(oldBlockType);
+            if (it != m_modelInstances.end()) {
+                auto& instances = it->second;
+                instances.erase(
+                    std::remove_if(instances.begin(), instances.end(),
+                        [&instancePos](const Vec3& pos) {
+                            return std::abs(pos.x - instancePos.x) < 0.01f &&
+                                   std::abs(pos.y - instancePos.y) < 0.01f &&
+                                   std::abs(pos.z - instancePos.z) < 0.01f;
+                        }),
+                    instances.end()
+                );
+                // Remove empty instance lists
+                if (instances.empty()) {
+                    m_modelInstances.erase(it);
+                }
+            }
+            return;
+        }
+    }
+    
     if (!renderMesh || renderMesh->quads.empty()) return;
     
     // Find and remove all 6 possible face quads for this block
@@ -517,7 +553,7 @@ void VoxelChunk::updateNeighborQuads(int x, int y, int z, bool blockWasAdded)
             auto it = m_quadLookup.find(key);
             if (it != m_quadLookup.end()) {
                 // Remove this specific quad (inefficient, but correct)
-                removeBlockQuads(nx, ny, nz);
+                removeBlockQuads(nx, ny, nz, neighborBlock);
                 addBlockQuads(nx, ny, nz, neighborBlock);
             }
         } else {

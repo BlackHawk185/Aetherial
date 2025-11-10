@@ -211,15 +211,14 @@ void PlayerController::updatePhysics(GLFWwindow* window, float deltaTime, Island
     // ==========================================
     
     // Use unified physics resolver with aggressive anti-stuck
-    // Player can step up 37% of their height (1.1 / 3.0 = 0.37)
-    float playerStepRatio = m_maxStepHeight / m_capsuleHeight; // ~0.37
+    // Uses default step ratio from physics system (0.4 = 40% of height)
     m_physicsPosition = physics->resolveCapsuleMovement(
         m_physicsPosition,
         m_playerVelocity,
         deltaTime,
         m_capsuleRadius,
-        m_capsuleHeight,
-        playerStepRatio
+        m_capsuleHeight
+        // stepHeightRatio uses default 0.4
     );
     
     // ==========================================

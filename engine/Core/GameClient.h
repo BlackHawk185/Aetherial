@@ -16,7 +16,6 @@
 // Forward declarations
 class ClientWorld;
 class BlockHighlightRenderer;
-class FluidParticleRenderer;
 class HUD;
 class PeriodicTableUI;
 struct GLFWwindow;
@@ -139,7 +138,6 @@ private:
     PlayerController m_playerController;
     FrustumCuller m_frustumCuller;
     std::unique_ptr<BlockHighlightRenderer> m_blockHighlighter;
-    std::unique_ptr<FluidParticleRenderer> m_fluidParticleRenderer;
     std::unique_ptr<HUD> m_hud;
     std::unique_ptr<PeriodicTableUI> m_periodicTableUI;
     
@@ -233,6 +231,16 @@ private:
      * Handle received entity state updates from server
      */
     void handleEntityStateUpdate(const EntityStateUpdate& update);
+    
+    /**
+     * Handle fluid particle spawn from server
+     */
+    void handleFluidParticleSpawn(const FluidParticleSpawnMessage& msg);
+    
+    /**
+     * Handle fluid particle despawn from server
+     */
+    void handleFluidParticleDespawn(const FluidParticleDespawnMessage& msg);
     
     /**
      * Helper: Register a chunk with the renderer and set up callbacks

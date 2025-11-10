@@ -41,33 +41,33 @@ namespace PostProcessing {
 }
 
 // =============================================================================
-// FUTURE PARAMETER CATEGORIES (examples)
+// VOLUMETRIC CLOUDS
 // =============================================================================
 
-/*
-namespace Rendering {
-    static constexpr int SHADOW_MAP_SIZE = 8192;
-    static constexpr int MAX_CASCADES = 2;
-    static constexpr float LOD_DISTANCE = 1000.0f;
+namespace Clouds {
+    // === PERFORMANCE SETTINGS ===
+    static constexpr int RAYMARCH_SAMPLES = 64;         // Cloud raymarching steps (32 = fast, 64 = balanced, 128 = quality)
+    static constexpr int NOISE_TEXTURE_SIZE = 128;      // 3D noise resolution (64 = 256KB, 128 = 2MB, 256 = 16MB)
+    
+    // === CLOUD VOLUME SETTINGS ===
+    // 3D noise naturally creates varied height clouds - just define min/max bounds
+    static constexpr float CLOUD_BASE_MIN_HEIGHT = -100.0f;    // Bottom of cloud volume (world units)
+    static constexpr float CLOUD_BASE_MAX_HEIGHT = 300.0f;   // Top of cloud volume (world units)
+    
+    // === APPEARANCE SETTINGS ===
+    static constexpr float CLOUD_COVERAGE = 0.2f;       // Cloud coverage (0.0 = clear, 1.0 = overcast)
+    static constexpr float CLOUD_DENSITY = 0.8f;        // Cloud density multiplier (higher = thicker/darker)
+    static constexpr float CLOUD_SPEED = 0.1f;          // Wind speed for cloud movement
+    static constexpr float CLOUD_SCALE = 0.001f;        // World-space scale for noise sampling
+    
+    // === LIGHTING SETTINGS ===
+    static constexpr float LIGHT_ABSORPTION = 2.0f;     // Beer-Lambert absorption coefficient
+    static constexpr float AMBIENT_STRENGTH = 0.3f;     // Ambient light contribution
+    
+    // === DEBUG SETTINGS ===
+    static constexpr bool ENABLE_CLOUDS = true;         // Master cloud toggle
+    static constexpr bool ENABLE_CLOUD_SHADOWS = true;  // Cloud shadows on terrain/islands
 }
 
-namespace Physics {
-    static constexpr float GRAVITY = -9.81f;
-    static constexpr int MAX_PHYSICS_STEPS = 8;
-    static constexpr float TIME_STEP = 1.0f / 60.0f;
-}
-
-namespace World {
-    static constexpr int CHUNK_SIZE = 32;
-    static constexpr int RENDER_DISTANCE = 10;
-    static constexpr float ISLAND_SPACING = 500.0f;
-}
-
-namespace Performance {
-    static constexpr int TARGET_FPS = 60;
-    static constexpr bool ENABLE_VSYNC = true;
-    static constexpr int MAX_PARTICLES = 10000;
-}
-*/
 
 } // namespace EngineParameters

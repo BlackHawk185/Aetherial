@@ -5,6 +5,7 @@
 #include "../World/VoronoiIslandPlacer.h"
 #include "../World/VoxelChunk.h"
 #include <iostream>
+#include <random>
 
 SimulationState::SimulationState()
 {
@@ -118,34 +119,33 @@ void SimulationState::createDefaultWorld()
 {
     std::cout << "🏝️ Creating procedural world with Voronoi island placement..." << std::endl;
 
+    // Generate random seed
+    std::random_device rd;
+    uint32_t randomSeed = rd();
+    std::cout << "🎲 World seed: " << randomSeed << std::endl;
+
     // World generation config
     struct WorldGenConfig {
-        uint32_t worldSeed = 12345;
-        float regionSize = 3000.0f;
-        float islandDensity = 3.0f;
-        float minIslandRadius = 100.0f;
-        float maxIslandRadius = 200.0f;
-        float minVerticalOffset = 50.0f;
-        float maxVerticalOffset = 200.0f;
-        float islandSpacing = 350.0f;
+        uint32_t worldSeed;
+        float regionSize = 2500.0f;
+        float voronoiCellSizeMin = 600.0f;   // Min Voronoi cell size (determines spacing & island size)
+        float voronoiCellSizeMax = 1000.0f;  // Max Voronoi cell size (variation in spacing & size)
+        float islandToVoronoiCellRatio = 0.5f;  // Island radius = 35% of cell size (30-40% with noise)
     } config;
-
-    // Calculate island count based on density
-    float area = config.regionSize * config.regionSize;
-    float referenceArea = 1000.0f * 1000.0f;
-    int islandCount = static_cast<int>((area / referenceArea) * config.islandDensity);
-    std::cout << "📊 Generating " << islandCount << " islands in " << config.regionSize 
-              << "x" << config.regionSize << " region (density=" << config.islandDensity << ")" << std::endl;
+    config.worldSeed = randomSeed;
 
     // Generate Voronoi island placement
     VoronoiIslandPlacer placer;
     std::vector<IslandDefinition> islandDefs = placer.generateIslands(
         config.worldSeed,
         config.regionSize,
-        config.islandDensity,
-        config.minIslandRadius,
-        config.maxIslandRadius
+        config.voronoiCellSizeMin,
+        config.voronoiCellSizeMax,
+        config.islandToVoronoiCellRatio
     );
+    
+    std::cout << "✅ Generated " << islandDefs.size() << " islands in " << config.regionSize 
+              << "x" << config.regionSize << " region" << std::endl;
 
     std::cout << "✅ Generated " << islandDefs.size() << " island definitions" << std::endl;
 
