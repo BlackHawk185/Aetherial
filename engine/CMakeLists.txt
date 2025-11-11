@@ -28,6 +28,7 @@ add_library(engine STATIC
     
     # Rendering systems
     Rendering/InstancedQuadRenderer.cpp  # GPU instanced quad renderer with shared unit quad
+    Rendering/GPUMeshQueue.cpp           # Main-thread mesh generation queue
     Rendering/TextureManager.cpp
     Rendering/ShaderManager.cpp
     Rendering/CascadedShadowMap.cpp

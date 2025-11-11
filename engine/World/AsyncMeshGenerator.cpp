@@ -1,6 +1,10 @@
 #include "AsyncMeshGenerator.h"
+#include "../Rendering/GPUMeshQueue.h"
 #include "../Profiling/Profiler.h"
 #include <iostream>
+
+// MIGRATION NOTE: This now delegates to GPUMeshQueue for main-thread processing
+// The multi-threaded worker system is being phased out due to OpenGL threading restrictions
 
 AsyncMeshGenerator* g_asyncMeshGenerator = nullptr;
 
@@ -48,42 +52,50 @@ void AsyncMeshGenerator::queueChunkMeshGeneration(VoxelChunk* chunk, std::functi
 {
     if (!chunk) return;
 
-    {
+    // Delegate to GPUMeshQueue for main-thread processing
+    if (g_gpuMeshQueue) {
+        g_gpuMeshQueue->queueFullChunkMesh(chunk, onComplete);
+    } else {
+        // Fallback: use old multi-threaded system (deprecated)
         std::lock_guard<std::mutex> lock(m_jobMutex);
         m_jobQueue.push({chunk, onComplete});
         m_pendingJobs++;
+        m_jobCondition.notify_one();
     }
-
-    m_jobCondition.notify_one();
 }
 
 void AsyncMeshGenerator::processCompletedMeshes()
 {
     PROFILE_SCOPE("AsyncMeshGenerator::processCompletedMeshes");
 
-    std::queue<CompletedMesh> localQueue;
+    // Delegate to GPUMeshQueue (processes work on main thread)
+    if (g_gpuMeshQueue) {
+        g_gpuMeshQueue->processQueue(4);  // Process up to 4 items per frame
+    } else {
+        // Fallback: use old multi-threaded system (deprecated)
+        std::queue<CompletedMesh> localQueue;
 
-    {
-        std::lock_guard<std::mutex> lock(m_completedMutex);
-        std::swap(localQueue, m_completedQueue);
-    }
-
-    while (!localQueue.empty())
-    {
-        auto& completed = localQueue.front();
-
-        // Fast atomic swap on main thread - no actual mesh generation here
-        completed.chunk->setRenderMesh(completed.renderMesh);
-        completed.chunk->setCollisionMesh(completed.collisionMesh);
-        completed.chunk->m_modelInstances = std::move(completed.modelInstances);
-        completed.chunk->meshDirty = false;
-
-        // Call completion callback if provided
-        if (completed.onComplete) {
-            completed.onComplete();
+        {
+            std::lock_guard<std::mutex> lock(m_completedMutex);
+            std::swap(localQueue, m_completedQueue);
         }
 
-        localQueue.pop();
+        while (!localQueue.empty())
+        {
+            auto& completed = localQueue.front();
+
+            // Fast atomic swap on main thread - no actual mesh generation here
+            completed.chunk->setRenderMesh(completed.renderMesh);
+            completed.chunk->m_modelInstances = std::move(completed.modelInstances);
+            completed.chunk->meshDirty = false;
+
+            // Call completion callback if provided
+            if (completed.onComplete) {
+                completed.onComplete();
+            }
+
+            localQueue.pop();
+        }
     }
 }
 
@@ -112,7 +124,6 @@ void AsyncMeshGenerator::workerThreadFunc()
 
         // Generate mesh on background thread (CPU-intensive work)
         auto newMesh = std::make_shared<VoxelMesh>();
-        auto newCollisionMesh = std::make_shared<CollisionMesh>();
         std::unordered_map<uint8_t, std::vector<Vec3>> tempModelInstances;
 
         // Scan for OBJ-type model instances
@@ -135,24 +146,12 @@ void AsyncMeshGenerator::workerThreadFunc()
         // Use shared mesh generation logic instead of duplicating it
         job.chunk->generateSimpleMeshInto(newMesh->quads);
 
-        // Build collision mesh from quads
-        for (const auto& quad : newMesh->quads)
-        {
-            newCollisionMesh->faces.push_back({
-                quad.position,
-                quad.normal,
-                quad.width,
-                quad.height
-            });
-        }
-
         // Add to completed queue
         {
             std::lock_guard<std::mutex> lock(m_completedMutex);
             m_completedQueue.push({
                 job.chunk,
                 newMesh,
-                newCollisionMesh,
                 std::move(tempModelInstances),
                 job.onComplete
             });

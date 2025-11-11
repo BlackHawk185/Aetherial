@@ -40,7 +40,6 @@ private:
     {
         VoxelChunk* chunk;
         std::shared_ptr<VoxelMesh> renderMesh;
-        std::shared_ptr<CollisionMesh> collisionMesh;
         std::unordered_map<uint8_t, std::vector<Vec3>> modelInstances;
         std::function<void()> onComplete;
     };

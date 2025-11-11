@@ -38,28 +38,6 @@ struct VoxelMesh
     GLuint instanceVBO = 0;  // Instance buffer for QuadFace data
 };
 
-struct CollisionFace
-{
-    Vec3 position;  // Center position of the face
-    Vec3 normal;    // Normal vector of the face
-    float width;    // Width of the quad
-    float height;   // Height of the quad
-};
-
-struct CollisionMesh
-{
-    std::vector<CollisionFace> faces;
-    
-    CollisionMesh() = default;
-    CollisionMesh(const CollisionMesh& other) : faces(other.faces) {}
-    CollisionMesh& operator=(const CollisionMesh& other) {
-        if (this != &other) {
-            faces = other.faces;
-        }
-        return *this;
-    }
-};
-
 class IslandChunkSystem;  // Forward declaration
 
 class VoxelChunk
@@ -79,9 +57,10 @@ class VoxelChunk
     void setIsClient(bool isClient) { m_isClientChunk = isClient; }
     bool isClient() const { return m_isClientChunk; }
     
-    // Event-driven GPU update callback - called immediately when mesh changes
+    // Event-driven GPU update callback - called after mesh regeneration
     using MeshUpdateCallback = std::function<void(VoxelChunk*)>;
     void setMeshUpdateCallback(MeshUpdateCallback callback) { m_meshUpdateCallback = callback; }
+    void triggerMeshUpdateCallback() { if (m_meshUpdateCallback) m_meshUpdateCallback(this); }
 
     // Voxel data access (ID-based - clean and efficient)
     uint8_t getVoxel(int x, int y, int z) const;
@@ -107,11 +86,15 @@ class VoxelChunk
 
     // Mesh generation and management
     void generateMesh(bool generateLighting = true);
+    void generateMeshForRegion(int regionIndex);  // Generate mesh for single region only
     
-    // Incremental quad manipulation (for direct block modifications)
-    void addBlockQuads(int x, int y, int z, uint8_t blockType);
-    void removeBlockQuads(int x, int y, int z, uint8_t oldBlockType);
-    void updateNeighborQuads(int x, int y, int z, bool blockWasAdded);
+    // Region-based dirty tracking for partial mesh updates
+    void markRegionDirty(int regionIndex);
+    void markRegionDirtyAtVoxel(int x, int y, int z);
+    bool isRegionDirty(int regionIndex) const;
+    void clearAllRegionDirtyFlags();
+    const std::vector<int>& getDirtyRegions() const { return m_dirtyRegions; }
+    void processDirtyRegions();  // Queue dirty regions for remeshing
     
     // Control incremental updates (disable during world generation)
     void enableIncrementalUpdates() { m_incrementalUpdatesEnabled = true; }
@@ -129,9 +112,6 @@ class VoxelChunk
     bool shouldRender(const Vec3& cameraPos, float maxDistance = 1024.0f) const;
 
     // Direct mesh access (fast - no atomic overhead)
-    std::shared_ptr<CollisionMesh> getCollisionMesh() const { return collisionMesh; }
-    void setCollisionMesh(std::shared_ptr<CollisionMesh> newMesh) { collisionMesh = newMesh; }
-    
     std::shared_ptr<VoxelMesh> getRenderMesh() const { return renderMesh; }
     void setRenderMesh(std::shared_ptr<VoxelMesh> newMesh) { renderMesh = newMesh; }
     bool isMeshDirty() const { return meshDirty; }
@@ -160,7 +140,6 @@ class VoxelChunk
    private:
     std::array<uint8_t, VOLUME> voxels;
     std::shared_ptr<VoxelMesh> renderMesh;  // Direct access (no atomic overhead)
-    std::shared_ptr<CollisionMesh> collisionMesh;  // Direct access (no atomic overhead)
     bool meshDirty = true;
     
     // Island context for inter-chunk culling
@@ -171,8 +150,9 @@ class VoxelChunk
     // Key: BlockID, Value: list of instance positions within this chunk
     std::unordered_map<uint8_t, std::vector<Vec3>> m_modelInstances;
     
-    // Fast quad lookup for incremental updates: (x, y, z, face) -> quad index
-    std::unordered_map<uint64_t, size_t> m_quadLookup;
+    // Region-based dirty tracking for partial mesh updates
+    std::array<bool, ChunkConfig::TOTAL_REGIONS> m_regionDirtyFlags;
+    std::vector<int> m_dirtyRegions;  // List of dirty region indices for efficient iteration
     
     // Disable incremental updates during bulk operations (world generation)
     bool m_incrementalUpdatesEnabled = false;
@@ -182,11 +162,6 @@ class VoxelChunk
     
     // Event-driven GPU update callback
     MeshUpdateCallback m_meshUpdateCallback;
-    
-    // Helper: Pack voxel coord + face direction into lookup key
-    static inline uint64_t makeQuadKey(int x, int y, int z, int face) {
-        return ((uint64_t)x << 48) | ((uint64_t)y << 32) | ((uint64_t)z << 16) | (uint64_t)face;
-    }
 
     // Quad generation helper
     void addQuad(std::vector<QuadFace>& quads, float x, float y, float z, int face, int width, int height, uint8_t blockType);

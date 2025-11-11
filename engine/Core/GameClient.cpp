@@ -34,8 +34,9 @@
 #include "../Rendering/ModelInstanceRenderer.h"
 #include "../Rendering/TextureManager.h"
 #include "../Rendering/CascadedShadowMap.h"
+#include "../Rendering/GPUMeshQueue.h"  // Main-thread mesh generation queue
 #include "../Physics/PhysicsSystem.h"  // For ground detection
-#include "../World/AsyncMeshGenerator.h"  // Async mesh generation
+#include "../World/AsyncMeshGenerator.h"  // Async mesh generation (deprecated, delegates to GPUMeshQueue)
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include "../Time/TimeEffects.h"
@@ -126,7 +127,13 @@ bool GameClient::initialize(bool enableDebug)
         return false;
     }
 
-    // Initialize async mesh generator for non-blocking chunk loading
+    // Initialize GPU mesh queue (main-thread mesh generation)
+    if (!g_gpuMeshQueue)
+    {
+        g_gpuMeshQueue = std::make_unique<GPUMeshQueue>();
+    }
+    
+    // Initialize async mesh generator (now delegates to GPUMeshQueue)
     if (!g_asyncMeshGenerator)
     {
         g_asyncMeshGenerator = new AsyncMeshGenerator();
@@ -273,6 +280,12 @@ void GameClient::shutdown()
         return;
     }
 
+    // Shutdown GPU mesh queue
+    if (g_gpuMeshQueue)
+    {
+        g_gpuMeshQueue.reset();
+    }
+    
     // Shutdown async mesh generator
     if (g_asyncMeshGenerator)
     {

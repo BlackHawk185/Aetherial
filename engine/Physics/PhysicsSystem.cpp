@@ -71,40 +71,19 @@ void PhysicsSystem::debugCollisionInfo(const Vec3& playerPos, float playerRadius
             const VoxelChunk* chunk = chunkPair.second.get();
             if (!chunk) continue;
 
-            auto mesh = chunk->getCollisionMesh();
-            int faces = mesh ? mesh->faces.size() : 0;
-            totalFaces += faces;
-            std::cout << "    Chunk at (" << chunkPair.first.x << ", " << chunkPair.first.y << ", " << chunkPair.first.z << "): " << faces << " collision faces" << std::endl;
+            // Voxel-based collision - no face mesh needed
+            std::cout << "    Chunk at (" << chunkPair.first.x << ", " << chunkPair.first.y << ", " << chunkPair.first.z << "): Using voxel-based collision" << std::endl;
         }
     }
 
-    std::cout << "Total collision faces: " << totalFaces << std::endl;
+    std::cout << "Using voxel-based collision (no face meshes)" << std::endl;
     std::cout << "==========================" << std::endl;
 }
 
 int PhysicsSystem::getTotalCollisionFaces() const
 {
-    if (!m_islandSystem) return 0;
-
-    int total = 0;
-    const auto& islands = m_islandSystem->getIslands();
-    for (const auto& islandPair : islands)
-    {
-        const FloatingIsland* island = &islandPair.second;
-        if (!island) continue;
-
-        for (const auto& chunkPair : island->chunks)
-        {
-            const VoxelChunk* chunk = chunkPair.second.get();
-            if (chunk)
-            {
-                auto mesh = chunk->getCollisionMesh();
-                if (mesh)
-                    total += mesh->faces.size();
-            }
-        }
-    }
-    return total;
+    // Voxel-based collision doesn't use face meshes
+    return 0;
 }
 
 // ============================================================================
@@ -256,30 +235,6 @@ bool PhysicsSystem::checkChunkCapsuleCollision(const VoxelChunk* chunk, const Ve
     
     return false;
 }
-
-// OLD APPROACH (KEPT FOR REFERENCE - DELETE AFTER TESTING):
-// This iterated ALL collision faces (10K-100K at 256^3 chunks)
-// New approach checks only voxels within capsule AABB (~10-50 voxels)
-/*
-bool PhysicsSystem::checkChunkCapsuleCollision_OLD_FACE_ITERATION(const VoxelChunk* chunk, const Vec3& capsuleCenter,
-                                               float radius, float height)
-{
-    auto collisionMesh = chunk->getCollisionMesh();
-    if (!collisionMesh)
-        return false;
-    
-    float cylinderHalfHeight = (height - 2.0f * radius) * 0.5f;
-    Vec3 topSphereCenter = capsuleCenter + Vec3(0, cylinderHalfHeight, 0);
-    Vec3 bottomSphereCenter = capsuleCenter - Vec3(0, cylinderHalfHeight, 0);
-    
-    for (const auto& face : collisionMesh->faces)
-    {
-        // ... old face iteration logic ...
-    }
-    
-    return false;
-}
-*/
 
 bool PhysicsSystem::checkCapsuleCollision(const Vec3& capsuleCenter, float radius, float height,
                                          Vec3& outNormal, const FloatingIsland** outIsland)

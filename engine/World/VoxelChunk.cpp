@@ -3,6 +3,7 @@
 #include "BlockType.h"
 
 #include "../Time/DayNightController.h"  // For dynamic sun direction
+#include "../Rendering/GPUMeshQueue.h"  // For region-based remeshing queue
 
 #include <algorithm>
 #include <cmath>
@@ -24,9 +25,12 @@ VoxelChunk::VoxelChunk()
     std::fill(voxels.begin(), voxels.end(), 0);
     meshDirty = true;
     
-    // Initialize render mesh and collision mesh with empty shared_ptrs
+    // Initialize render mesh with empty shared_ptr
     renderMesh = std::make_shared<VoxelMesh>();
-    collisionMesh = std::make_shared<CollisionMesh>();
+    
+    // Initialize region dirty flags to false
+    m_regionDirtyFlags.fill(false);
+    m_dirtyRegions.clear();
 }
 
 VoxelChunk::~VoxelChunk()
@@ -52,28 +56,16 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
     
     voxels[x + y * SIZE + z * SIZE * SIZE] = type;
     
-    // Only use incremental updates if enabled (disabled during world generation)
+    // Mark region dirty for remeshing (new region-based system)
     if (m_incrementalUpdatesEnabled) {
-        // Use incremental updates for runtime block changes
-        if (oldType == BlockID::AIR && type != BlockID::AIR) {
-            // Block placed - add its quads and update neighbors
-            addBlockQuads(x, y, z, type);
-            updateNeighborQuads(x, y, z, true);
-        } else if (oldType != BlockID::AIR && type == BlockID::AIR) {
-            // Block removed - remove its quads and update neighbors
-            removeBlockQuads(x, y, z, oldType);
-            updateNeighborQuads(x, y, z, false);
-        } else {
-            // Block type changed (rare) - remove old, add new
-            removeBlockQuads(x, y, z, oldType);
-            addBlockQuads(x, y, z, type);
-            // No neighbor update needed - faces stay the same
-        }
+        // Mark the region containing this voxel as dirty
+        markRegionDirtyAtVoxel(x, y, z);
         
-        // EVENT-DRIVEN: Immediately notify renderer of mesh changes (zero latency)
-        if (m_meshUpdateCallback) {
-            m_meshUpdateCallback(this);
-        }
+        // Queue dirty regions for remeshing (callback will fire after remesh completes)
+        processDirtyRegions();
+        
+        // NOTE: Callback is NOT called here - it will be called by GPUMeshQueue
+        // after the mesh is actually regenerated to avoid 1-frame lag
     } else {
         // Incremental updates not enabled yet - mark dirty and trigger full regeneration
         meshDirty = true;
@@ -136,7 +128,6 @@ void VoxelChunk::generateMesh(bool generateLighting)
     
     // Build into a new mesh (no locks needed - parallel-safe!)
     auto newMesh = std::make_shared<VoxelMesh>();
-    // NOTE: Collision mesh generation removed - voxel-based collision doesn't use it
     
     // Temporary storage for model instances during mesh generation
     std::unordered_map<uint8_t, std::vector<Vec3>> tempModelInstances;
@@ -170,29 +161,8 @@ void VoxelChunk::generateMesh(bool generateLighting)
     
     auto t_mesh_end = std::chrono::high_resolution_clock::now();
 
-    
-    // Build quad lookup map for incremental updates
-    m_quadLookup.clear();
-    for (size_t i = 0; i < newMesh->quads.size(); ++i) {
-        const auto& quad = newMesh->quads[i];
-        // Reverse-engineer voxel position from quad center position
-        int x = static_cast<int>(quad.position.x);
-        int y = static_cast<int>(quad.position.y);
-        int z = static_cast<int>(quad.position.z);
-        int face = quad.faceDir;
-        
-        // Adjust for face offset (quad center is offset from voxel corner)
-        if (face == 1) y--;       // Top face (+Y)
-        else if (face == 3) z--;  // Front face (+Z)
-        else if (face == 5) x--;  // Right face (+X)
-        
-        uint64_t key = makeQuadKey(x, y, z, face);
-        m_quadLookup[key] = i;
-    }
-    
     // DIRECT ASSIGNMENT - fast, no atomic overhead!
     renderMesh = newMesh;
-    // NOTE: collisionMesh no longer generated - voxel-based collision uses voxel data directly
     
     // Update model instances (protected by implicit synchronization)
     m_modelInstances = std::move(tempModelInstances);
@@ -215,6 +185,91 @@ void VoxelChunk::generateMesh(bool generateLighting)
               << "ms, Mesh=" << mesh_ms << "ms) Quads=" << newMesh->quads.size() << std::endl;
 }
 
+// Generate mesh for a single region only (partial update)
+void VoxelChunk::generateMeshForRegion(int regionIndex)
+{
+    PROFILE_SCOPE("VoxelChunk::generateMeshForRegion");
+    
+    if (regionIndex < 0 || regionIndex >= ChunkConfig::TOTAL_REGIONS) {
+        std::cerr << "⚠️  Invalid region index: " << regionIndex << std::endl;
+        return;
+    }
+    
+    auto t_start = std::chrono::high_resolution_clock::now();
+    
+    // Calculate region boundaries
+    int rx = regionIndex % ChunkConfig::REGIONS_PER_AXIS;
+    int ry = (regionIndex / ChunkConfig::REGIONS_PER_AXIS) % ChunkConfig::REGIONS_PER_AXIS;
+    int rz = regionIndex / (ChunkConfig::REGIONS_PER_AXIS * ChunkConfig::REGIONS_PER_AXIS);
+    
+    int minX = rx * ChunkConfig::REGION_SIZE;
+    int minY = ry * ChunkConfig::REGION_SIZE;
+    int minZ = rz * ChunkConfig::REGION_SIZE;
+    
+    int maxX = std::min(minX + ChunkConfig::REGION_SIZE, SIZE);
+    int maxY = std::min(minY + ChunkConfig::REGION_SIZE, SIZE);
+    int maxZ = std::min(minZ + ChunkConfig::REGION_SIZE, SIZE);
+    
+    if (!renderMesh) {
+        renderMesh = std::make_shared<VoxelMesh>();
+    }
+    
+    // Remove all quads from this region (we'll regenerate them)
+    // This is a simple approach - we could optimize by tracking quad indices per region
+    auto& quads = renderMesh->quads;
+    quads.erase(
+        std::remove_if(quads.begin(), quads.end(), [&](const QuadFace& quad) {
+            int qx = static_cast<int>(quad.position.x);
+            int qy = static_cast<int>(quad.position.y);
+            int qz = static_cast<int>(quad.position.z);
+            
+            // Adjust for face offset to get actual voxel coords
+            int face = quad.faceDir;
+            if (face == 1) qy--;       // Top face
+            else if (face == 3) qz--;  // Front face
+            else if (face == 5) qx--;  // Right face
+            
+            return (qx >= minX && qx < maxX &&
+                    qy >= minY && qy < maxY &&
+                    qz >= minZ && qz < maxZ);
+        }),
+        quads.end()
+    );
+    
+    // Generate new quads for this region
+    std::vector<QuadFace> newQuads;
+    for (int z = minZ; z < maxZ; ++z) {
+        for (int y = minY; y < maxY; ++y) {
+            for (int x = minX; x < maxX; ++x) {
+                if (!isVoxelSolid(x, y, z)) continue;
+                
+                uint8_t blockType = getVoxel(x, y, z);
+                
+                // Check all 6 faces
+                for (int face = 0; face < 6; ++face) {
+                    if (isFaceExposed(x, y, z, face)) {
+                        addQuad(newQuads, static_cast<float>(x), static_cast<float>(y),
+                               static_cast<float>(z), face, 1, 1, blockType);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Append new quads to mesh
+    quads.insert(quads.end(), newQuads.begin(), newQuads.end());
+    
+    // Clear this region's dirty flag
+    if (regionIndex >= 0 && regionIndex < ChunkConfig::TOTAL_REGIONS) {
+        m_regionDirtyFlags[regionIndex] = false;
+    }
+    
+    auto t_end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    
+    std::cout << "🔧 REGION MESH GEN: Region=" << regionIndex << " Time=" << ms 
+              << "ms Quads=" << newQuads.size() << " Total=" << quads.size() << std::endl;
+}
 
 int VoxelChunk::calculateLOD(const Vec3& cameraPos) const
 {
@@ -377,207 +432,84 @@ void VoxelChunk::addQuad(std::vector<QuadFace>& quads, float x, float y, float z
 }
 
 // ========================================
-// INCREMENTAL QUAD MANIPULATION
+// REGION-BASED DIRTY TRACKING
 // ========================================
 
-// Add quads for a single block's exposed faces
-void VoxelChunk::addBlockQuads(int x, int y, int z, uint8_t blockType)
+void VoxelChunk::markRegionDirty(int regionIndex)
 {
-    // Skip air blocks
-    if (blockType == BlockID::AIR) return;
-    
-    // Check if this is an OBJ-type block (they use instanced models, not voxel quads)
-    auto& registry = BlockTypeRegistry::getInstance();
-    const BlockTypeInfo* blockInfo = registry.getBlockType(blockType);
-    if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
-        // Add model instance instead of voxel quads
-        Vec3 instancePos(static_cast<float>(x) + 0.5f, static_cast<float>(y), static_cast<float>(z) + 0.5f);
-        m_modelInstances[blockType].push_back(instancePos);
+    if (regionIndex < 0 || regionIndex >= ChunkConfig::TOTAL_REGIONS)
         return;
-    }
     
-    // Get mutable mesh (create if needed)
-    if (!renderMesh) {
-        renderMesh = std::make_shared<VoxelMesh>();
+    if (!m_regionDirtyFlags[regionIndex]) {
+        m_regionDirtyFlags[regionIndex] = true;
+        m_dirtyRegions.push_back(regionIndex);
     }
-    
-    // Add quads for all exposed faces
-    for (int face = 0; face < 6; ++face)
-    {
-        if (isFaceExposed(x, y, z, face))
-        {
-            // Store quad index in lookup map
-            uint64_t key = makeQuadKey(x, y, z, face);
-            size_t quadIndex = renderMesh->quads.size();
-            m_quadLookup[key] = quadIndex;
-            
-            // Add quad to mesh
-            addQuad(renderMesh->quads, static_cast<float>(x), static_cast<float>(y), 
-                   static_cast<float>(z), face, 1, 1, blockType);
-        }
-    }
-    
-    // Update collision mesh (simple copy)
-    auto collMesh = std::make_shared<CollisionMesh>();
-    for (const auto& quad : renderMesh->quads) {
-        collMesh->faces.push_back({quad.position, quad.normal, quad.width, quad.height});
-    }
-    collisionMesh = collMesh;
 }
 
-// Remove all quads for a block
-void VoxelChunk::removeBlockQuads(int x, int y, int z, uint8_t oldBlockType)
+void VoxelChunk::markRegionDirtyAtVoxel(int x, int y, int z)
 {
-    // First check if this is an OBJ-type block and remove its model instance
-    // Use oldBlockType parameter since the voxel has already been changed to AIR
-    if (oldBlockType != BlockID::AIR) {
-        auto& registry = BlockTypeRegistry::getInstance();
-        const BlockTypeInfo* blockInfo = registry.getBlockType(oldBlockType);
-        if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
-            // Remove model instance at this position
-            Vec3 instancePos(static_cast<float>(x) + 0.5f, static_cast<float>(y), static_cast<float>(z) + 0.5f);
-            auto it = m_modelInstances.find(oldBlockType);
-            if (it != m_modelInstances.end()) {
-                auto& instances = it->second;
-                instances.erase(
-                    std::remove_if(instances.begin(), instances.end(),
-                        [&instancePos](const Vec3& pos) {
-                            return std::abs(pos.x - instancePos.x) < 0.01f &&
-                                   std::abs(pos.y - instancePos.y) < 0.01f &&
-                                   std::abs(pos.z - instancePos.z) < 0.01f;
-                        }),
-                    instances.end()
-                );
-                // Remove empty instance lists
-                if (instances.empty()) {
-                    m_modelInstances.erase(it);
-                }
-            }
-            return;
-        }
+    if (x < 0 || x >= SIZE || y < 0 || y >= SIZE || z < 0 || z >= SIZE)
+        return;
+    
+    int regionIndex = ChunkConfig::voxelToRegionIndex(x, y, z);
+    markRegionDirty(regionIndex);
+    
+    // Also mark neighbor regions if on boundary
+    // This ensures proper face culling across region boundaries
+    if (x % ChunkConfig::REGION_SIZE == 0 && x > 0) {
+        int neighborIndex = ChunkConfig::voxelToRegionIndex(x - 1, y, z);
+        markRegionDirty(neighborIndex);
+    }
+    if ((x + 1) % ChunkConfig::REGION_SIZE == 0 && x < SIZE - 1) {
+        int neighborIndex = ChunkConfig::voxelToRegionIndex(x + 1, y, z);
+        markRegionDirty(neighborIndex);
     }
     
-    if (!renderMesh || renderMesh->quads.empty()) return;
-    
-    // Find and remove all 6 possible face quads for this block
-    std::vector<size_t> indicesToRemove;
-    for (int face = 0; face < 6; ++face)
-    {
-        uint64_t key = makeQuadKey(x, y, z, face);
-        auto it = m_quadLookup.find(key);
-        if (it != m_quadLookup.end()) {
-            indicesToRemove.push_back(it->second);
-            m_quadLookup.erase(it);
-        }
+    if (y % ChunkConfig::REGION_SIZE == 0 && y > 0) {
+        int neighborIndex = ChunkConfig::voxelToRegionIndex(x, y - 1, z);
+        markRegionDirty(neighborIndex);
+    }
+    if ((y + 1) % ChunkConfig::REGION_SIZE == 0 && y < SIZE - 1) {
+        int neighborIndex = ChunkConfig::voxelToRegionIndex(x, y + 1, z);
+        markRegionDirty(neighborIndex);
     }
     
-    // Sort in reverse order to avoid index invalidation during removal
-    std::sort(indicesToRemove.rbegin(), indicesToRemove.rend());
-    
-    // Remove quads (swap-and-pop for efficiency)
-    for (size_t idx : indicesToRemove) {
-        if (idx < renderMesh->quads.size()) {
-            // Swap with last element
-            if (idx != renderMesh->quads.size() - 1) {
-                renderMesh->quads[idx] = renderMesh->quads.back();
-                // Update lookup map for the swapped quad
-                // TODO: Need to reverse-lookup the swapped quad to update its index
-            }
-            renderMesh->quads.pop_back();
-        }
+    if (z % ChunkConfig::REGION_SIZE == 0 && z > 0) {
+        int neighborIndex = ChunkConfig::voxelToRegionIndex(x, y, z - 1);
+        markRegionDirty(neighborIndex);
     }
-    
-    // Rebuild lookup map (safer than tracking swaps)
-    m_quadLookup.clear();
-    for (size_t i = 0; i < renderMesh->quads.size(); ++i) {
-        const auto& quad = renderMesh->quads[i];
-        // Reverse-engineer position from quad data
-        int qx = static_cast<int>(quad.position.x);
-        int qy = static_cast<int>(quad.position.y);
-        int qz = static_cast<int>(quad.position.z);
-        int qface = quad.faceDir;
-        
-        // Adjust for face offset
-        if (qface == 1) qy--;       // Top face
-        else if (qface == 3) qz--;  // Front face
-        else if (qface == 5) qx--;  // Right face
-        
-        uint64_t key = makeQuadKey(qx, qy, qz, qface);
-        m_quadLookup[key] = i;
+    if ((z + 1) % ChunkConfig::REGION_SIZE == 0 && z < SIZE - 1) {
+        int neighborIndex = ChunkConfig::voxelToRegionIndex(x, y, z + 1);
+        markRegionDirty(neighborIndex);
     }
-    
-    // Update collision mesh
-    auto collMesh = std::make_shared<CollisionMesh>();
-    for (const auto& quad : renderMesh->quads) {
-        collMesh->faces.push_back({quad.position, quad.normal, quad.width, quad.height});
-    }
-    collisionMesh = collMesh;
 }
 
-// Update neighbor quads when a block is added or removed
-void VoxelChunk::updateNeighborQuads(int x, int y, int z, bool blockWasAdded)
+bool VoxelChunk::isRegionDirty(int regionIndex) const
 {
-    // Face offsets and their opposite faces
-    static const int dx[6] = { 0,  0,  0,  0, -1,  1};
-    static const int dy[6] = {-1,  1,  0,  0,  0,  0};
-    static const int dz[6] = { 0,  0, -1,  1,  0,  0};
-    static const int oppositeFace[6] = {1, 0, 3, 2, 5, 4};
+    if (regionIndex < 0 || regionIndex >= ChunkConfig::TOTAL_REGIONS)
+        return false;
     
-    for (int face = 0; face < 6; ++face)
-    {
-        int nx = x + dx[face];
-        int ny = y + dy[face];
-        int nz = z + dz[face];
-        
-        // Check if neighbor is within chunk bounds
-        if (nx < 0 || nx >= SIZE || ny < 0 || ny >= SIZE || nz < 0 || nz >= SIZE) {
-            // TODO: Cross-chunk updates - notify neighboring chunk
-            continue;
-        }
-        
-        uint8_t neighborBlock = getVoxel(nx, ny, nz);
-        if (neighborBlock == BlockID::AIR) continue;
-        
-        // Skip OBJ blocks
-        auto& registry = BlockTypeRegistry::getInstance();
-        const BlockTypeInfo* blockInfo = registry.getBlockType(neighborBlock);
-        if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
-            continue;
-        }
-        
-        int neighborFace = oppositeFace[face];
-        uint64_t key = makeQuadKey(nx, ny, nz, neighborFace);
-        
-        if (blockWasAdded) {
-            // A block was placed - neighbor face is now hidden, remove it
-            auto it = m_quadLookup.find(key);
-            if (it != m_quadLookup.end()) {
-                // Remove this specific quad (inefficient, but correct)
-                removeBlockQuads(nx, ny, nz, neighborBlock);
-                addBlockQuads(nx, ny, nz, neighborBlock);
-            }
-        } else {
-            // A block was removed - neighbor face is now exposed, add it
-            if (m_quadLookup.find(key) == m_quadLookup.end()) {
-                // Quad doesn't exist - add it
-                if (renderMesh) {
-                    size_t quadIndex = renderMesh->quads.size();
-                    m_quadLookup[key] = quadIndex;
-                    addQuad(renderMesh->quads, static_cast<float>(nx), static_cast<float>(ny),
-                           static_cast<float>(nz), neighborFace, 1, 1, neighborBlock);
-                }
-            }
-        }
+    return m_regionDirtyFlags[regionIndex];
+}
+
+void VoxelChunk::clearAllRegionDirtyFlags()
+{
+    m_regionDirtyFlags.fill(false);
+    m_dirtyRegions.clear();
+}
+
+void VoxelChunk::processDirtyRegions()
+{
+    // Queue all dirty regions for remeshing via GPUMeshQueue
+    // This is called by the renderer callback when mesh changes occur
+    if (!g_gpuMeshQueue) return;
+    
+    for (int regionIndex : m_dirtyRegions) {
+        g_gpuMeshQueue->queueRegionMesh(this, regionIndex, nullptr);
     }
     
-    // Update collision mesh after all neighbor updates
-    if (renderMesh) {
-        auto collMesh = std::make_shared<CollisionMesh>();
-        for (const auto& quad : renderMesh->quads) {
-            collMesh->faces.push_back({quad.position, quad.normal, quad.width, quad.height});
-        }
-        collisionMesh = collMesh;
-    }
+    // Clear dirty flags after queuing
+    clearAllRegionDirtyFlags();
 }
 
 
