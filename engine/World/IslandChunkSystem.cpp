@@ -16,7 +16,7 @@
 #include "VoxelChunk.h"
 #include "BlockType.h"
 #include "TreeGenerator.h"
-#include "AsyncMeshGenerator.h"
+#include "../Rendering/GPUMeshQueue.h"
 #include "../Profiling/Profiler.h"
 #include "../Rendering/InstancedQuadRenderer.h"
 #include "../Rendering/ModelInstanceRenderer.h"
@@ -664,28 +664,28 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     // Chunks will be registered with renderer when client receives them via network
     // (Don't register here - renderer may not exist yet, and this violates separation of concerns)
     
-    // Queue chunks for async mesh generation (if available)
+    // Queue chunks for mesh generation (if available)
     auto meshGenStart = std::chrono::high_resolution_clock::now();
     int chunksQueued = 0;
     
-    if (g_asyncMeshGenerator)
+    if (g_greedyMeshQueue)
     {
         for (auto& [chunkCoord, chunk] : island->chunks)
         {
             if (chunk)
             {
-                g_asyncMeshGenerator->queueChunkMeshGeneration(chunk.get());
+                g_greedyMeshQueue->queueFullChunkMesh(chunk.get());
                 chunksQueued++;
             }
         }
         
         auto meshGenEnd = std::chrono::high_resolution_clock::now();
         auto meshGenDuration = std::chrono::duration_cast<std::chrono::milliseconds>(meshGenEnd - meshGenStart).count();
-        std::cout << "🔄 Async Mesh Queue: " << meshGenDuration << "ms (" << chunksQueued << " chunks queued)" << std::endl;
+        std::cout << "🔄 Mesh Queue: " << meshGenDuration << "ms (" << chunksQueued << " chunks queued)" << std::endl;
     }
     else
     {
-        std::cout << "   └─ Async mesh generator not available - meshes will generate on first render" << std::endl;
+        std::cout << "   └─ Mesh generator not available - meshes will generate on first render" << std::endl;
     }
     
     auto totalEnd = std::chrono::high_resolution_clock::now();
@@ -948,10 +948,7 @@ void IslandChunkSystem::getVisibleChunksFrustum(const Frustum& frustum, std::vec
     {
         if (totalChunks > 0)
         {
-            float cullPercent = (culledChunks / (float)totalChunks) * 100.0f;
-            std::cout << "Frustum Culling: " << culledChunks << "/" << totalChunks 
-                      << " chunks (" << std::fixed << std::setprecision(1) << cullPercent 
-                      << "%) | Rendering: " << outChunks.size() << std::endl;
+            // Removed verbose frustum culling logging
         }
         lastLogTime = now;
     }

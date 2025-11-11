@@ -18,7 +18,6 @@ add_library(engine STATIC
     World/ConnectivityAnalyzer.cpp
     World/ElementRecipes.cpp
     World/VoronoiIslandPlacer.cpp
-    World/AsyncMeshGenerator.cpp
     World/BiomeSystem.cpp
     World/TreeGenerator.cpp
     World/FluidSystem.cpp
@@ -30,7 +29,6 @@ add_library(engine STATIC
     Rendering/InstancedQuadRenderer.cpp  # GPU instanced quad renderer with shared unit quad
     Rendering/GPUMeshQueue.cpp           # Main-thread mesh generation queue
     Rendering/TextureManager.cpp
-    Rendering/ShaderManager.cpp
     Rendering/CascadedShadowMap.cpp
     Rendering/ModelInstanceRenderer.cpp
     Rendering/BlockHighlightRenderer.cpp

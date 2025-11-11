@@ -19,9 +19,9 @@ namespace ChunkConfig
     
     // Region subdivision for partial mesh updates
     // Each chunk is subdivided into REGIONS_PER_AXIS^3 regions for granular remeshing
-    static constexpr int REGION_SIZE = 64;  // 64³ voxels per region
-    static constexpr int REGIONS_PER_AXIS = CHUNK_SIZE / REGION_SIZE;  // 4 regions per axis
-    static constexpr int TOTAL_REGIONS = REGIONS_PER_AXIS * REGIONS_PER_AXIS * REGIONS_PER_AXIS;  // 64 total regions
+    static constexpr int REGION_SIZE = 32;  // 32³ voxels per region
+    static constexpr int REGIONS_PER_AXIS = CHUNK_SIZE / REGION_SIZE;  // 8 regions per axis
+    static constexpr int TOTAL_REGIONS = REGIONS_PER_AXIS * REGIONS_PER_AXIS * REGIONS_PER_AXIS;  // 512 total regions
     
     // Convert voxel coordinates to region index
     static constexpr inline int voxelToRegionCoord(int voxelCoord) {

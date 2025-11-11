@@ -86,7 +86,7 @@ class VoxelChunk
 
     // Mesh generation and management
     void generateMesh(bool generateLighting = true);
-    void generateMeshForRegion(int regionIndex);  // Generate mesh for single region only
+    std::vector<QuadFace> generateMeshForRegion(int regionIndex);  // Generate mesh for single region only
     
     // Region-based dirty tracking for partial mesh updates
     void markRegionDirty(int regionIndex);
@@ -130,12 +130,8 @@ class VoxelChunk
     
     // NOTE: For raycasting, use VoxelRaycaster::raycast() - it's DDA-based and handles rotated islands
 
-   public:
     // Island context for inter-chunk culling
     void setIslandContext(uint32_t islandID, const Vec3& chunkCoord);
-    
-    // Friend class for async mesh generation
-    friend class AsyncMeshGenerator;
 
    private:
     std::array<uint8_t, VOLUME> voxels;
@@ -170,8 +166,5 @@ class VoxelChunk
     
     // Intra-chunk culling only (inter-chunk culling removed for performance)
     bool isFaceExposed(int x, int y, int z, int face) const;
-    
-    // Simple meshing implementation
-    void generateSimpleMeshInto(std::vector<QuadFace>& quads);
 };
 

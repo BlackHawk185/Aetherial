@@ -448,9 +448,8 @@ void main(){
     vec3 N = normalize(vNormalWS);
     vec3 V = normalize(uCameraPos - vWorldPos);
     
-    // Fresnel effect - more reflection at grazing angles
-    float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-    fresnel = mix(0.02, 0.95, fresnel);
+    // Constant 90% reflectivity for all angles
+    float fresnel = 0.9;
     
     // Reflection ray
     vec3 R = reflect(-V, N);

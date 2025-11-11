@@ -36,7 +36,6 @@
 #include "../Rendering/CascadedShadowMap.h"
 #include "../Rendering/GPUMeshQueue.h"  // Main-thread mesh generation queue
 #include "../Physics/PhysicsSystem.h"  // For ground detection
-#include "../World/AsyncMeshGenerator.h"  // Async mesh generation (deprecated, delegates to GPUMeshQueue)
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include "../Time/TimeEffects.h"
@@ -127,16 +126,10 @@ bool GameClient::initialize(bool enableDebug)
         return false;
     }
 
-    // Initialize GPU mesh queue (main-thread mesh generation)
-    if (!g_gpuMeshQueue)
+    // Initialize greedy mesh queue (main-thread mesh generation)
+    if (!g_greedyMeshQueue)
     {
-        g_gpuMeshQueue = std::make_unique<GPUMeshQueue>();
-    }
-    
-    // Initialize async mesh generator (now delegates to GPUMeshQueue)
-    if (!g_asyncMeshGenerator)
-    {
-        g_asyncMeshGenerator = new AsyncMeshGenerator();
+        g_greedyMeshQueue = std::make_unique<GreedyMeshQueue>();
     }
 
     m_initialized = true;
@@ -222,10 +215,10 @@ bool GameClient::update(float deltaTime)
         m_networkManager->update();
     }
 
-    // Process completed async mesh generations (fast - just swaps data)
-    if (g_asyncMeshGenerator)
+    // Process mesh generation queue (processes up to 64 regions per frame)
+    if (g_greedyMeshQueue)
     {
-        g_asyncMeshGenerator->processCompletedMeshes();
+        g_greedyMeshQueue->processQueue(64);
     }
 
     // Update client-side physics for smooth island movement
@@ -281,16 +274,9 @@ void GameClient::shutdown()
     }
 
     // Shutdown GPU mesh queue
-    if (g_gpuMeshQueue)
+    if (g_greedyMeshQueue)
     {
-        g_gpuMeshQueue.reset();
-    }
-    
-    // Shutdown async mesh generator
-    if (g_asyncMeshGenerator)
-    {
-        delete g_asyncMeshGenerator;
-        g_asyncMeshGenerator = nullptr;
+        g_greedyMeshQueue.reset();
     }
 
     // Disconnect from game state
@@ -906,13 +892,6 @@ void GameClient::renderWorld()
         m_clientWorld->getIslandSystem()->getVisibleChunksFrustum(frustum, visibleChunks);
     }
     
-    // Log visible chunk count
-    static int frameCounter = 0;
-    if (++frameCounter % 60 == 0)
-    {
-        std::cout << "Visible chunks: " << visibleChunks.size() << std::endl;
-    }
-
     // Light depth pass (throttled - only update every Nth frame for performance)
     m_frameCounter++;
     if (m_frameCounter % m_shadowUpdateInterval == 0)
@@ -1403,7 +1382,11 @@ void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& p
         {
             // Apply the voxel data directly - this replaces any procedural generation
             chunk->setRawVoxelData(voxelData, dataSize);
-            chunk->generateMesh();  // Already builds collision mesh internally
+            
+            // Queue all regions through unified pipeline
+            if (g_greedyMeshQueue) {
+                g_greedyMeshQueue->queueFullChunkMesh(chunk);
+            }
             
             // Register chunk with renderer
             registerChunkWithRenderer(chunk, island, originChunk);
@@ -1469,10 +1452,10 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
         // IMMEDIATELY register chunk with renderer (callback must be set before any modifications)
         registerChunkWithRenderer(chunk, island, chunkCoord);
         
-        // Queue async mesh generation (will update the already-registered chunk)
-        if (g_asyncMeshGenerator)
+        // Queue mesh generation (will update the already-registered chunk)
+        if (g_greedyMeshQueue)
         {
-            g_asyncMeshGenerator->queueChunkMeshGeneration(chunk, nullptr);
+            g_greedyMeshQueue->queueFullChunkMesh(chunk);
         }
     }
     else

@@ -485,7 +485,11 @@ void InstancedQuadRenderer::registerChunk(VoxelChunk* chunk, const glm::mat4& tr
     entry.transform = transform;
     entry.instanceCount = 0;
     entry.baseInstance = 0;  // Will be set during rebuildMDIBuffers
-    entry.allocatedSlots = 0;  // Will be calculated during rebuildMDIBuffers
+    
+    // Pre-allocate slots based on expected mesh size (for floating islands, ~5-10% occupancy)
+    // This avoids the "grew beyond padding" warning on first mesh upload
+    size_t expectedQuads = (256 * 256 * 256) / 100;  // Assume ~1% of chunk volume has exposed faces
+    entry.allocatedSlots = calculateChunkSlots(expectedQuads);
     
     m_chunks.push_back(entry);
     m_mdiDirty = true;  // Mark for rebuild
@@ -747,13 +751,10 @@ void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
         auto cmd_ms = std::chrono::duration<double, std::milli>(t_cmd_end - t_cmd_start).count();
         auto total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         
-        size_t uploadBytes = newQuadCount * sizeof(QuadFace);
-        std::cout << "🚀 GPU UPLOAD: " << total_ms << "ms (Check=" << check_ms 
-                  << "ms, Upload=" << upload_ms << "ms [" << (uploadBytes/1024) << "KB], Cmd=" 
-                  << cmd_ms << "ms) Quads=" << newQuadCount << std::endl;
+        // Removed verbose GPU upload logging
     } else {
         // SLOW PATH: Chunk grew beyond allocated space - need full rebuild
-        std::cout << "⚠️ Chunk grew beyond padding - triggering full rebuild" << std::endl;
+        // This is expected on initial load when regions complete before slots are allocated
         m_mdiDirty = true;
     }
 }

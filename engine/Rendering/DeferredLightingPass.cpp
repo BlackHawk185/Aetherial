@@ -248,7 +248,8 @@ void main() {
     
     vec3 N = normalize(normal);
     float materialID = metadata.x;
-    bool isWater = (materialID > 0.5);
+    uint blockType = uint(materialID * 255.0 + 0.5);  // Convert back to block ID
+    bool isWater = (blockType == 45u);  // BlockID::WATER
     
     // Sample sun light
     vec3 L_sun = normalize(-uSunDir);
@@ -272,9 +273,8 @@ void main() {
         // === WATER RENDERING ===
         vec3 V = normalize(uCameraPos - worldPos);
         
-        // Fresnel effect - more reflection at grazing angles
-        float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-        fresnel = mix(0.02, 0.9, fresnel);  // 2% reflective head-on, 90% at edges
+        // Constant 90% reflectivity for all angles
+        float fresnel = 0.9;
         
         // Sky/environment reflection color (gradient based on view direction)
         vec3 R = reflect(-V, N);

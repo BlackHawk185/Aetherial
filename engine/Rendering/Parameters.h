@@ -41,7 +41,7 @@ namespace Clouds {
     
     // === APPEARANCE SETTINGS ===
     static constexpr float CLOUD_COVERAGE = 0.4f;       // Cloud coverage (0.0 = clear, 1.0 = overcast)
-    static constexpr float CLOUD_DENSITY = 0.1f;        // Cloud density multiplier (higher = thicker/darker)
+    static constexpr float CLOUD_DENSITY = 0.5f;        // Cloud density multiplier (higher = thicker/darker)
     static constexpr float CLOUD_SPEED = 0.5f;          // Wind speed for cloud movement
     static constexpr float CLOUD_SCALE = 0.001f;        // World-space scale for noise sampling
     

@@ -8,6 +8,8 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <fstream>
+#include <filesystem>
 
 // Global cloud renderer instance
 VolumetricCloudRenderer g_cloudRenderer;
