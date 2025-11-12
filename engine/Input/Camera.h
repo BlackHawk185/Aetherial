@@ -7,8 +7,6 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-class Frustum;  // Forward declaration
-
 class Camera {
 public:
     Camera();
@@ -19,10 +17,6 @@ public:
     glm::mat4 getViewMatrix();
     void getProjectionMatrix(float* matrix, float aspect);
     glm::mat4 getProjectionMatrix(float aspect);
-    
-    // Frustum calculation for culling
-    void updateFrustum(float aspect);
-    const Frustum& getFrustum() const;
     
     // Position and orientation - Controlled by PlayerController
     Vec3 position;
@@ -37,7 +31,4 @@ public:
     
     // Update camera vectors when yaw/pitch are modified
     void updateCameraVectors();
-
-private:
-    Frustum* m_frustum;  // Cached frustum for culling
 };

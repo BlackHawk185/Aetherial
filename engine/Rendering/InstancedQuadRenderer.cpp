@@ -247,8 +247,7 @@ void main() {
 
 InstancedQuadRenderer::InstancedQuadRenderer()
     : m_unitQuadVAO(0), m_unitQuadVBO(0), m_unitQuadEBO(0), m_gbufferMDIProgram(0), m_depthMDIProgram(0),
-      m_transformSSBO(0), m_mdiCommandBuffer(0), m_mdiInstanceBuffer(0), m_mdiVAO(0),
-      m_persistentQuadBuffer(0), m_frustumCullProgram(0), m_visibilitySSBO(0)
+      m_transformSSBO(0), m_mdiCommandBuffer(0), m_mdiInstanceBuffer(0), m_mdiVAO(0)
 {
 }
 
@@ -311,10 +310,6 @@ bool InstancedQuadRenderer::initialize()
                     GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_DYNAMIC_STORAGE_BIT);
     m_persistentTransformPtr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, maxChunks * sizeof(glm::mat4),
                                                 GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_FLUSH_EXPLICIT_BIT);
-    
-    // GPU frustum culling
-    glGenBuffers(1, &m_visibilitySSBO);
-    createFrustumCullShader();
     
     // Configure MDI VAO (shared for all chunks)
     glBindVertexArray(m_mdiVAO);
@@ -615,7 +610,12 @@ void InstancedQuadRenderer::uploadChunkMesh(VoxelChunk* chunk)
     auto it = m_chunkToIndex.find(chunk);
     if (it != m_chunkToIndex.end())
     {
-        updateSingleChunkGPU(m_chunks[it->second]);
+        // Just mark for upload - filtering happens at render time
+        ChunkEntry& entry = m_chunks[it->second];
+        auto mesh = entry.chunk->getRenderMesh();
+        if (mesh) {
+            mesh->needsGPUUpload = true;
+        }
     }
 }
 
@@ -630,59 +630,61 @@ static size_t calculateChunkSlots(size_t activeQuads)
     return ((withPadding + 255) / 256) * 256;
 }
 
-// Update single chunk GPU data
-void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
+// Update single chunk GPU data with CPU backface culling
+void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry, const Vec3& cameraPos)
 {
     auto mesh = entry.chunk->getRenderMesh();
     if (!mesh) {
         entry.instanceCount = 0;
-        return;  // No mesh yet - workers still processing
+        return;
     }
     
-    size_t newQuadCount = mesh->quads.size();
+    size_t totalQuadCount = mesh->quads.size();
     
-    // Upload if count changed OR if upload was explicitly requested
-    if (newQuadCount != entry.lastUploadedCount || mesh->needsGPUUpload) {
-        // Check if we need to allocate or reallocate space
+    if (totalQuadCount != entry.lastUploadedCount || mesh->needsGPUUpload) {
+        // Upload all quads - let GPU backface culling handle it
+        size_t visibleCount = totalQuadCount;
+        
+        // Allocate space if needed
         if (entry.allocatedSlots == 0) {
-            // FIRST TIME ALLOCATION: Assign baseInstance offset
-            entry.allocatedSlots = calculateChunkSlots(newQuadCount);
+            entry.allocatedSlots = calculateChunkSlots(totalQuadCount);
             entry.baseInstance = m_persistentQuadUsed;
             m_persistentQuadUsed += entry.allocatedSlots;
         } 
-        else if (newQuadCount > entry.allocatedSlots) {
-            // REALLOCATION NEEDED: Chunk grew beyond padding
-            // TODO: Implement defragmentation or just expand in place if possible
-            std::cout << "[GPU] WARNING: Chunk grew beyond allocated slots, needs rebuild" << std::endl;
-            entry.allocatedSlots = calculateChunkSlots(newQuadCount);
-            // Keep existing baseInstance - will overrun, but at least visible
+        else if (visibleCount > entry.allocatedSlots) {
+            std::cout << "[GPU] WARNING: Visible quads exceed allocated slots" << std::endl;
+            entry.allocatedSlots = calculateChunkSlots(totalQuadCount);
         }
         
-        // Write data to persistent buffer at chunk's baseInstance offset
-        if (newQuadCount > 0 && m_persistentQuadPtr && entry.baseInstance < m_persistentQuadCapacity) {
+        // Upload all quads
+        if (visibleCount > 0 && m_persistentQuadPtr && entry.baseInstance < m_persistentQuadCapacity) {
             QuadFace* dest = static_cast<QuadFace*>(m_persistentQuadPtr) + entry.baseInstance;
-            memcpy(dest, mesh->quads.data(), newQuadCount * sizeof(QuadFace));
+            memcpy(dest, mesh->quads.data(), visibleCount * sizeof(QuadFace));
             
-            // Flush the written range
             glBindBuffer(GL_ARRAY_BUFFER, m_persistentQuadBuffer);
             glFlushMappedBufferRange(GL_ARRAY_BUFFER,
                                      entry.baseInstance * sizeof(QuadFace),
-                                     newQuadCount * sizeof(QuadFace));
+                                     visibleCount * sizeof(QuadFace));
         }
         mesh->needsGPUUpload = false;
-    }
     
-    entry.instanceCount = newQuadCount;
-    entry.lastUploadedCount = newQuadCount;
+        entry.instanceCount = visibleCount;
+        entry.lastUploadedCount = totalQuadCount;
+    }
 }
 
-void InstancedQuadRenderer::renderToGBufferMDI(const glm::mat4& viewProjection, const glm::mat4& view)
+void InstancedQuadRenderer::renderToGBufferMDI(const glm::mat4& viewProjection, const glm::mat4& view, const Vec3& cameraPos)
 {
     (void)view;
     
     PROFILE_SCOPE("QuadRenderer_GBuffer_MDI");
     
     if (m_chunks.empty() || !m_persistentCommandPtr || !m_persistentTransformPtr) return;
+    
+    // Update all chunks with CPU backface culling
+    for (auto& entry : m_chunks) {
+        updateSingleChunkGPU(entry, cameraPos);
+    }
     
     // Write draw commands and transforms directly to persistent buffers
     DrawElementsIndirectCommand* cmdPtr = static_cast<DrawElementsIndirectCommand*>(m_persistentCommandPtr);
@@ -727,13 +729,21 @@ void InstancedQuadRenderer::renderToGBufferMDI(const glm::mat4& viewProjection, 
     glBindVertexArray(0);
 }
 
-void InstancedQuadRenderer::renderToGBufferCulledMDI(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks)
+void InstancedQuadRenderer::renderToGBufferCulledMDI(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks, const Vec3& cameraPos)
 {
     (void)view;
     
     PROFILE_SCOPE("QuadRenderer_GBuffer_MDI_Culled");
     
     if (visibleChunks.empty() || !m_persistentCommandPtr || !m_persistentTransformPtr) return;
+    
+    // Update GPU data for visible chunks with CPU backface culling
+    for (VoxelChunk* chunk : visibleChunks) {
+        auto it = m_chunkToIndex.find(chunk);
+        if (it != m_chunkToIndex.end()) {
+            updateSingleChunkGPU(m_chunks[it->second], cameraPos);
+        }
+    }
     
     // Write draw commands and transforms directly to persistent buffers for visible chunks only
     DrawElementsIndirectCommand* cmdPtr = static_cast<DrawElementsIndirectCommand*>(m_persistentCommandPtr);
@@ -780,18 +790,6 @@ void InstancedQuadRenderer::renderToGBufferCulledMDI(const glm::mat4& viewProjec
     glBindVertexArray(m_mdiVAO);
     glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, drawCount, 0);
     glBindVertexArray(0);
-}
-
-void InstancedQuadRenderer::renderToGBufferCulledMDI_GPU(const glm::mat4& viewProjection, const glm::mat4& view)
-{
-    (void)view;
-    
-    PROFILE_SCOPE("QuadRenderer_GBuffer_MDI_GPU_Culled");
-    
-    std::vector<VoxelChunk*> visibleChunks;
-    cullChunksGPU(viewProjection, visibleChunks);
-    
-    renderToGBufferCulledMDI(viewProjection, view, visibleChunks);
 }
 
 void InstancedQuadRenderer::clear()
@@ -875,16 +873,6 @@ void InstancedQuadRenderer::shutdown()
         }
         glDeleteBuffers(1, &m_persistentTransformBuffer);
         m_persistentTransformBuffer = 0;
-    }
-    
-    if (m_frustumCullProgram != 0) {
-        glDeleteProgram(m_frustumCullProgram);
-        m_frustumCullProgram = 0;
-    }
-    
-    if (m_visibilitySSBO != 0) {
-        glDeleteBuffers(1, &m_visibilitySSBO);
-        m_visibilitySSBO = 0;
     }
     
     for (GLuint vbo : m_freeVBOPool) {
@@ -985,91 +973,10 @@ void InstancedQuadRenderer::renderDepthCulledMDI(const std::vector<VoxelChunk*>&
     glBindVertexArray(0);
 }
 
-void InstancedQuadRenderer::renderDepthCulledMDI_GPU(const glm::mat4& viewProjection)
-{
-    PROFILE_SCOPE("QuadRenderer_Depth_MDI_GPU_Culled");
-    
-    std::vector<VoxelChunk*> visibleChunks;
-    cullChunksGPU(viewProjection, visibleChunks);
-    
-    renderDepthCulledMDI(visibleChunks);
-}
-
 void InstancedQuadRenderer::endDepthPass(int screenWidth, int screenHeight)
 {
     (void)screenWidth;
     (void)screenHeight;
-}
-
-void InstancedQuadRenderer::createFrustumCullShader()
-{
-    GLuint compute = compileShader(FRUSTUM_CULL_COMPUTE, GL_COMPUTE_SHADER);
-    m_frustumCullProgram = glCreateProgram();
-    glAttachShader(m_frustumCullProgram, compute);
-    glLinkProgram(m_frustumCullProgram);
-    
-    GLint success;
-    glGetProgramiv(m_frustumCullProgram, GL_LINK_STATUS, &success);
-    if (!success) {
-        char log[512];
-        glGetProgramInfoLog(m_frustumCullProgram, 512, nullptr, log);
-        std::cerr << "Frustum cull shader link failed: " << log << std::endl;
-    }
-    
-    glDeleteShader(compute);
-}
-
-void InstancedQuadRenderer::cullChunksGPU(const glm::mat4& viewProj, std::vector<VoxelChunk*>& outVisible)
-{
-    if (m_chunks.empty()) return;
-    
-    struct ChunkAABB {
-        glm::vec3 minBounds;
-        float pad1;
-        glm::vec3 maxBounds;
-        float pad2;
-    };
-    
-    std::vector<ChunkAABB> aabbs;
-    aabbs.reserve(m_chunks.size());
-    
-    for (const auto& entry : m_chunks) {
-        const auto& cachedAABB = entry.chunk->getCachedWorldAABB();
-        ChunkAABB aabb;
-        aabb.minBounds = glm::vec3(cachedAABB.min.x, cachedAABB.min.y, cachedAABB.min.z);
-        aabb.maxBounds = glm::vec3(cachedAABB.max.x, cachedAABB.max.y, cachedAABB.max.z);
-        aabbs.push_back(aabb);
-    }
-    
-    GLuint aabbBuffer;
-    glGenBuffers(1, &aabbBuffer);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, aabbBuffer);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, aabbs.size() * sizeof(ChunkAABB), aabbs.data(), GL_STREAM_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, aabbBuffer);
-    
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_visibilitySSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, m_chunks.size() * sizeof(uint32_t), nullptr, GL_STREAM_READ);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_visibilitySSBO);
-    
-    glUseProgram(m_frustumCullProgram);
-    GLint loc = glGetUniformLocation(m_frustumCullProgram, "uViewProjection");
-    glUniformMatrix4fv(loc, 1, GL_FALSE, glm::value_ptr(viewProj));
-    
-    glDispatchCompute((m_chunks.size() + 63) / 64, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-    
-    std::vector<uint32_t> visibility(m_chunks.size());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_visibilitySSBO);
-    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, visibility.size() * sizeof(uint32_t), visibility.data());
-    
-    outVisible.clear();
-    for (size_t i = 0; i < m_chunks.size(); i++) {
-        if (visibility[i] != 0) {
-            outVisible.push_back(m_chunks[i].chunk);
-        }
-    }
-    
-    glDeleteBuffers(1, &aabbBuffer);
 }
 
 GLuint InstancedQuadRenderer::allocateVBO(size_t sizeBytes)

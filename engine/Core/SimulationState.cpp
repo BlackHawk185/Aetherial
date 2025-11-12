@@ -128,9 +128,9 @@ void SimulationState::createDefaultWorld()
     // World generation config
     struct WorldGenConfig {
         uint32_t worldSeed;
-        float regionSize = 600.0f;
-        float voronoiCellSizeMin = 200.0f;   // Min Voronoi cell size (determines spacing & island size)
-        float voronoiCellSizeMax = 400.0f;  // Max Voronoi cell size (variation in spacing & size)
+        float regionSize = 1200.0f;
+        float voronoiCellSizeMax = 800.0f;  // Max Voronoi cell size (variation in spacing & size)
+        float voronoiCellSizeMin = 400.0f;   // Min Voronoi cell size (determines spacing & island size)
         float islandToVoronoiCellRatio = 0.75f;  // Island radius = 35% of cell size (30-40% with noise)
     } config;
     config.worldSeed = randomSeed;

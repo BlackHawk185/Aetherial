@@ -108,7 +108,7 @@ class VoxelChunk
     int calculateLOD(const Vec3& cameraPos) const;
     bool shouldRender(const Vec3& cameraPos, float maxDistance = 1024.0f) const;
     
-    // Cached world-space AABB for frustum culling
+    // Cached world-space AABB
     struct WorldAABB {
         Vec3 min, max;
         bool valid = false;
@@ -141,7 +141,7 @@ class VoxelChunk
     uint32_t m_islandID = 0;
     Vec3 m_chunkCoord{0, 0, 0};
     
-    // Cached world-space AABB for frustum culling optimization
+    // Cached world-space AABB
     WorldAABB m_cachedWorldAABB;
 
     // NEW: Per-block-type model instance positions (for BlockRenderType::OBJ blocks)

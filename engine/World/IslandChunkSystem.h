@@ -217,7 +217,6 @@ class IslandChunkSystem
 
     // Rendering interface
     void getAllChunks(std::vector<VoxelChunk*>& outChunks);
-    void getVisibleChunks(const Vec3& viewPosition, std::vector<VoxelChunk*>& outChunks);
     void getVisibleChunksFrustum(const class Frustum& frustum, std::vector<VoxelChunk*>& outChunks);
 
     // **ORGANIC ISLAND GENERATION** (Creates chunks dynamically based on island shape)
@@ -226,7 +225,7 @@ class IslandChunkSystem
 
     // Water basin generation (called during island generation)
     std::unordered_set<int64_t> placeWaterBasins(uint32_t islandID, const BiomePalette& palette, uint32_t seed);
-    void cullExposedWater(uint32_t islandID);
+    void cullExposedWater(uint32_t islandID, const std::unordered_set<int64_t>* waterPositionsToCheck = nullptr);
 
     // Island queries
     Vec3 getIslandCenter(uint32_t islandID) const;    // Get current physics center of island

@@ -21,16 +21,13 @@ add_library(engine STATIC
     World/BiomeSystem.cpp
     World/TreeGenerator.cpp
     World/FluidSystem.cpp
-    
-    # Culling systems
-    Culling/Frustum.cpp
-    
+
     # Rendering systems
     Rendering/InstancedQuadRenderer.cpp  # MDI quad renderer with greedy meshing
     Rendering/GPUMeshQueue.cpp           # Main-thread mesh generation queue
     Rendering/TextureManager.cpp
     Rendering/CascadedShadowMap.cpp
-    Rendering/ModelInstanceRenderer.cpp
+    Rendering/GLBModelRenderer.cpp       # MDI GLB model renderer (grass, water, etc.)
     Rendering/BlockHighlightRenderer.cpp
 
     Rendering/GBuffer.cpp               # Deferred rendering G-buffer
@@ -130,6 +127,7 @@ target_link_libraries(engine PUBLIC
     glad
     OpenGL::GL
     glm::glm
+    FastNoiseSIMD
 )
 
 # Ensure GLFW does not include a GL header (glad provides it)

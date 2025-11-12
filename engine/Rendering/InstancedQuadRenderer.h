@@ -7,6 +7,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
+#include "../Math/Vec3.h"
 
 class VoxelChunk;
 
@@ -26,16 +27,23 @@ public:
     // Update chunk transform (for moving islands)
     void updateChunkTransform(VoxelChunk* chunk, const glm::mat4& transform);
     
+    // Get shared transform SSBO for use by other renderers (ModelInstanceRenderer)
+    GLuint getTransformSSBO() const { return m_persistentTransformBuffer; }
+    
+    // Get the draw ID (chunk index) for a chunk - returns -1 if not found
+    int getChunkDrawID(VoxelChunk* chunk) const {
+        auto it = m_chunkToIndex.find(chunk);
+        return (it != m_chunkToIndex.end()) ? static_cast<int>(it->second) : -1;
+    }
+    
     void uploadChunkMesh(VoxelChunk* chunk);
     
-    void renderToGBufferMDI(const glm::mat4& viewProjection, const glm::mat4& view);
-    void renderToGBufferCulledMDI(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks);
-    void renderToGBufferCulledMDI_GPU(const glm::mat4& viewProjection, const glm::mat4& view);
+    void renderToGBufferMDI(const glm::mat4& viewProjection, const glm::mat4& view, const Vec3& cameraPos);
+    void renderToGBufferCulledMDI(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks, const Vec3& cameraPos);
     
     void beginDepthPass(const glm::mat4& lightVP, int cascadeIndex);
     void renderDepthMDI();
     void renderDepthCulledMDI(const std::vector<VoxelChunk*>& visibleChunks);
-    void renderDepthCulledMDI_GPU(const glm::mat4& viewProjection);
     void endDepthPass(int screenWidth, int screenHeight);
     
     // Clear all registered chunks
@@ -78,6 +86,9 @@ private:
     std::vector<ChunkEntry> m_chunks;
     std::unordered_map<VoxelChunk*, size_t> m_chunkToIndex;
     
+    // Helper methods
+    void updateSingleChunkGPU(ChunkEntry& entry, const Vec3& cameraPos);
+    
     GLuint m_transformSSBO;
     GLuint m_blockTextureArray;
     GLuint m_mdiCommandBuffer;
@@ -101,12 +112,6 @@ private:
     GLuint allocateVBO(size_t sizeBytes);
     void freeVBO(GLuint vbo);
     
-    // GPU frustum culling
-    GLuint m_frustumCullProgram;
-    GLuint m_visibilitySSBO;
-    void createFrustumCullShader();
-    void cullChunksGPU(const glm::mat4& viewProj, std::vector<VoxelChunk*>& outVisible);
-    
     // Helper methods
     void createUnitQuad();
     void createShader();
@@ -115,7 +120,6 @@ private:
     bool loadBlockTextureArray();  // Load all block textures into texture array
     GLuint compileShader(const char* source, GLenum type);
     void uploadChunkInstances(ChunkEntry& entry);
-    void updateSingleChunkGPU(ChunkEntry& entry);  // Upload new quads to per-chunk VBO
 };
 
 // Global instance

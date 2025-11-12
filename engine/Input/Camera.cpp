@@ -1,6 +1,5 @@
 // Camera.cpp - Pure view/projection matrix system
 #include "Camera.h"
-#include "../Culling/Frustum.h"
 
 #define _USE_MATH_DEFINES
 #include <cmath>
@@ -12,14 +11,12 @@
 constexpr float PI_F = 3.14159265358979323846f;
 
 Camera::Camera()
-    : m_frustum(new Frustum())
 {
     updateCameraVectors();
 }
 
 Camera::~Camera()
 {
-    delete m_frustum;
 }
 
 void Camera::updateCameraVectors()
@@ -71,13 +68,3 @@ glm::mat4 Camera::getProjectionMatrix(float aspect)
     return glm::perspective(fov, aspect, 0.1f, 1000.0f);
 }
 
-void Camera::updateFrustum(float aspect)
-{
-    glm::mat4 viewProj = getProjectionMatrix(aspect) * getViewMatrix();
-    m_frustum->extractFromMatrix(viewProj);
-}
-
-const Frustum& Camera::getFrustum() const
-{
-    return *m_frustum;
-}

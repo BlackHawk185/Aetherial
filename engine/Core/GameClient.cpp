@@ -31,7 +31,7 @@
 #include "../UI/PeriodicTableUI.h"  // NEW: Periodic table UI for hotbar binding
 #include "../Core/Window.h"
 #include "../Rendering/InstancedQuadRenderer.h"
-#include "../Rendering/ModelInstanceRenderer.h"
+#include "../Rendering/GLBModelRenderer.h"
 #include "../Rendering/TextureManager.h"
 #include "../Rendering/CascadedShadowMap.h"
 #include "../Rendering/GPUMeshQueue.h"  // Main-thread mesh generation queue
@@ -245,11 +245,11 @@ bool GameClient::update(float deltaTime)
         m_dayNightController->update(deltaTime);
     }
 
-    // Update model instancing time (wind animation)
-    if (g_modelRenderer)
-    {
-        g_modelRenderer->update(deltaTime);
-    }
+    // OLD: Update model instancing time (wind animation)
+    // if (g_modelRenderer)
+    // {
+    //     g_modelRenderer->update(deltaTime);
+    // }
 
     // Process input
     {
@@ -296,11 +296,11 @@ void GameClient::shutdown()
         std::cout << "InstancedQuadRenderer shutdown" << std::endl;
     }
 
-    if (g_modelRenderer)
-    {
-        g_modelRenderer->shutdown();
-        g_modelRenderer.reset();
-    }
+    // if (g_modelRenderer)
+    // {
+    //     g_modelRenderer->shutdown();
+    //     g_modelRenderer.reset();
+    // }
     
     // Cleanup ImGui
     ImGui_ImplOpenGL3_Shutdown();
@@ -432,6 +432,35 @@ bool GameClient::initializeGraphics()
         return false;
     }
     std::cout << "✅ InstancedQuadRenderer initialized - MDI rendering ready!" << std::endl;
+    
+    // Initialize GLB model renderer
+    g_glbModelRenderer = std::make_unique<GLBModelRenderer>();
+    if (!g_glbModelRenderer->initialize())
+    {
+        std::cerr << "❌ Failed to initialize GLBModelRenderer!" << std::endl;
+        g_glbModelRenderer.reset();
+        return false;
+    }
+    g_glbModelRenderer->setChunkTransformSSBO(g_instancedQuadRenderer->getTransformSSBO());
+    g_glbModelRenderer->loadModel(102, "assets/models/grass.glb");  // DECOR_GRASS
+    g_glbModelRenderer->loadModel(180, "assets/models/water.glb");  // WATER
+    std::cout << "✅ GLBModelRenderer initialized!" << std::endl;
+    
+    // Initialize GLB model renderer
+    g_glbModelRenderer = std::make_unique<GLBModelRenderer>();
+    if (!g_glbModelRenderer->initialize())
+    {
+        std::cerr << "❌ Failed to initialize GLBModelRenderer!" << std::endl;
+        g_glbModelRenderer.reset();
+        return false;
+    }
+    // Share chunk transform SSBO with quad renderer
+    g_glbModelRenderer->setChunkTransformSSBO(g_instancedQuadRenderer->getTransformSSBO());
+    
+    // Load GLB models for block types
+    g_glbModelRenderer->loadModel(102, "assets/models/grass.glb");  // BlockID::DECOR_GRASS
+    g_glbModelRenderer->loadModel(180, "assets/models/water.glb");  // BlockID::WATER
+    std::cout << "✅ GLBModelRenderer initialized!" << std::endl;
 
     // Initialize light map system (must happen before renderers that use it)
     // 4 cascades: 2 for sun (near+far), 2 for moon (near+far)
@@ -483,7 +512,9 @@ bool GameClient::initializeGraphics()
         return false;
     }
 
-    // Initialize model instancing renderer (decorative GLB like grass)
+    // OLD: Initialize model instancing renderer (decorative GLB like grass)
+    // REMOVED - using new GLBModelRenderer instead
+    /*
     g_modelRenderer = std::make_unique<ModelInstanceRenderer>();
     if (!g_modelRenderer->initialize())
     {
@@ -505,6 +536,7 @@ bool GameClient::initializeGraphics()
             }
         }
     }
+    */
 
     // Initialize block highlighter for selected block wireframe
     m_blockHighlighter = std::make_unique<BlockHighlightRenderer>();
@@ -892,16 +924,9 @@ void GameClient::renderWorld()
     glm::mat4 projectionMatrix = m_playerController.getCamera().getProjectionMatrix(aspect);
     glm::mat4 viewMatrix = m_playerController.getCamera().getViewMatrix();
     
-    // Update and get frustum for culling
-    m_playerController.getCamera().updateFrustum(aspect);
-    const Frustum& frustum = m_playerController.getCamera().getFrustum();
-    
-    // Get visible chunks using frustum culling
+    // Get all chunks - GPU compute shader handles frustum culling
     std::vector<VoxelChunk*> visibleChunks;
-    {
-        PROFILE_SCOPE("FrustumCull");
-        m_clientWorld->getIslandSystem()->getVisibleChunksFrustum(frustum, visibleChunks);
-    }
+    m_clientWorld->getIslandSystem()->getAllChunks(visibleChunks);
     
     // Light depth pass (throttled - only update every Nth frame for performance)
     m_frameCounter++;
@@ -919,17 +944,35 @@ void GameClient::renderWorld()
         g_gBuffer.bindForGeometryPass();
         
         glm::mat4 viewProjection = projectionMatrix * viewMatrix;
+        Vec3 cameraPos = m_playerController.getCamera().position;
         
         if (g_instancedQuadRenderer)
         {
-            g_instancedQuadRenderer->renderToGBufferCulledMDI(viewProjection, viewMatrix, visibleChunks);
+            g_instancedQuadRenderer->renderToGBufferCulledMDI(viewProjection, viewMatrix, visibleChunks, cameraPos);
         }
         
-        // Render GLB models to G-buffer (frustum culled)
-        if (g_modelRenderer)
+        // Render GLB models (grass, water) to G-buffer
+        if (g_glbModelRenderer)
         {
-            g_modelRenderer->renderToGBufferCulled(viewMatrix, projectionMatrix, visibleChunks);
+            g_glbModelRenderer->updateInstances(visibleChunks);
+            float timeOfDay = m_dayNightController ? m_dayNightController->getTimeOfDay() : 0.0f;
+            g_glbModelRenderer->renderToGBuffer(viewProjection, timeOfDay);
         }
+        
+        // Render GLB models to G-buffer
+        if (g_glbModelRenderer)
+        {
+            g_glbModelRenderer->updateInstances(visibleChunks);
+            float timeOfDay = m_dayNightController ? m_dayNightController->getTimeOfDay() : 0.0f;
+            g_glbModelRenderer->renderToGBuffer(viewProjection, timeOfDay);
+        }
+        
+        // Render old model renderer (if still in use)
+        // OLD: Render GLB models to G-buffer (frustum culled)
+        // if (g_modelRenderer)
+        // {
+        //     g_modelRenderer->renderToGBufferCulled(viewMatrix, projectionMatrix, visibleChunks);
+        // }
         
         g_gBuffer.unbind();
     }
@@ -1001,6 +1044,8 @@ void GameClient::renderWorld()
         glDepthMask(GL_FALSE);       // Don't write to depth buffer
         
         // Render water blocks with transparency and SSR
+        // OLD: Using g_modelRenderer (disabled)
+        /*
         if (g_modelRenderer) {
             g_modelRenderer->renderWaterTransparent(viewMatrix, projectionMatrix, 
                                                    sunDirGLM, sunIntensity, 
@@ -1011,6 +1056,7 @@ void GameClient::renderWorld()
                                                    g_gBuffer.getAlbedoTexture(),
                                                    g_hdrFramebuffer.getColorTexture());
         }
+        */
         
         // Restore state
         glDepthMask(GL_TRUE);
@@ -1134,11 +1180,12 @@ void GameClient::renderShadowPass(const std::vector<VoxelChunk*>& visibleChunks)
             }
             
             // Render GLB models into light map
-            if (g_modelRenderer) {
-                g_modelRenderer->beginDepthPass(lightVP, cascadeIdx);
-                g_modelRenderer->renderDepth();
-                g_modelRenderer->endDepthPass(m_windowWidth, m_windowHeight);
-            }
+            // OLD: Model renderer depth
+            // if (g_modelRenderer) {
+            //     g_modelRenderer->beginDepthPass(lightVP, cascadeIdx);
+            //     g_modelRenderer->renderDepth();
+            //     g_modelRenderer->endDepthPass(m_windowWidth, m_windowHeight);
+            // }
             
             // End light map rendering (restores viewport/framebuffer)
             g_shadowMap.end(m_windowWidth, m_windowHeight);
@@ -1151,10 +1198,11 @@ void GameClient::renderShadowPass(const std::vector<VoxelChunk*>& visibleChunks)
     
     // Set lighting data for forward pass (use sun cascade 0 for basic forward lighting)
     glm::vec3 sunDirVec(sunDir.x, sunDir.y, sunDir.z);
-    if (g_modelRenderer)
-    {
-        g_modelRenderer->setLightingData(g_shadowMap.getCascade(0).viewProj, sunDirVec);
-    }
+    // OLD: Set lighting data for model renderer
+    // if (g_modelRenderer)
+    // {
+    //     g_modelRenderer->setLightingData(g_shadowMap.getCascade(0).viewProj, sunDirVec);
+    // }
 }
 
 void GameClient::renderWaitingScreen()
@@ -1290,6 +1338,25 @@ void GameClient::registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* is
     
     glm::mat4 chunkTransform = island->getChunkTransform(chunkCoord);
     g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+    
+    // Register model instances with model renderer (shares same chunk transforms from SSBO)
+    // OLD: Disabled - using new GLBModelRenderer
+    /*
+    if (g_modelRenderer) {
+        Vec3 chunkLocalPos = island->chunkCoordToWorldPos(chunkCoord);
+        glm::vec3 chunkOffset(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z);
+        
+        auto& registry = BlockTypeRegistry::getInstance();
+        for (const auto& blockType : registry.getAllBlockTypes()) {
+            if (!blockType.assetPath.empty()) {
+                const auto& instances = chunk->getModelInstances(blockType.id);
+                if (!instances.empty()) {
+                    g_modelRenderer->updateChunkOffset(blockType.id, chunk, chunkOffset);
+                }
+            }
+        }
+    }
+    */
 }
 
 void GameClient::syncPhysicsToChunks()
@@ -1323,30 +1390,25 @@ void GameClient::syncPhysicsToChunks()
         // Skip islands that haven't moved (need const_cast because getIslands() returns const ref)
         if (!island.needsPhysicsUpdate) continue;
         
+        // Calculate island transform once and reuse for all chunks
+        const glm::mat4& islandTransform = island.getTransformMatrix();
+        
         // Update transforms for all chunks in this island
         for (auto& [chunkCoord, chunk] : island.chunks)
         {
             if (!chunk) continue;
             
-            // Use helper to compute chunk transform
-            glm::mat4 chunkTransform = island.getChunkTransform(chunkCoord);
+            // Build chunk transform from cached island transform + chunk offset
+            Vec3 chunkLocalPos = island.chunkCoordToWorldPos(chunkCoord);
+            glm::mat4 chunkTransform = islandTransform * 
+                glm::translate(glm::mat4(1.0f), glm::vec3(chunkLocalPos.x, chunkLocalPos.y, chunkLocalPos.z));
             
             // === UPDATE CHUNK QUAD RENDERER (voxel chunks) ===
+            // This also updates the shared transform SSBO that ModelInstanceRenderer uses
             g_instancedQuadRenderer->updateChunkTransform(chunk.get(), chunkTransform);
             
-            // === UPDATE GLB MODEL RENDERER (only for chunks with OBJ instances) ===
-            if (g_modelRenderer && !objBlockTypes.empty())
-            {
-                for (uint8_t blockID : objBlockTypes)
-                {
-                    // OPTIMIZATION: Skip chunks with zero instances of this block type
-                    const auto& instances = chunk->getModelInstances(blockID);
-                    if (!instances.empty())
-                    {
-                        g_modelRenderer->updateModelMatrix(blockID, chunk.get(), chunkTransform);
-                    }
-                }
-            }
+            // === GLB MODEL RENDERER uses same transforms via shared SSBO ===
+            // No per-frame updates needed - chunk offsets are static and set once during chunk creation
         }
         
         // Clear update flag after processing (need mutable access)
