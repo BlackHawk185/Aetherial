@@ -2,6 +2,7 @@
 #pragma once
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <vector>
 #include <cmath>
@@ -203,7 +204,6 @@ class IslandChunkSystem
     
     // ID-based block methods (clean and efficient)
     void setBlockIDWithAutoChunk(uint32_t islandID, const Vec3& islandRelativePos, uint8_t blockID);
-    uint8_t getBlockIDInIsland(uint32_t islandID, const Vec3& islandRelativePosition) const;
 
     // Physics integration
     void updateIslandPhysics(float deltaTime);
@@ -225,7 +225,7 @@ class IslandChunkSystem
     void generateFloatingIslandOrganic(uint32_t islandID, uint32_t seed, float radius = 48.0f, BiomeType biome = BiomeType::GRASSLAND);
 
     // Water basin generation (called during island generation)
-    void placeWaterBasins(uint32_t islandID, const BiomePalette& palette, uint32_t seed);
+    std::unordered_set<int64_t> placeWaterBasins(uint32_t islandID, const BiomePalette& palette, uint32_t seed);
     void cullExposedWater(uint32_t islandID);
 
     // Island queries

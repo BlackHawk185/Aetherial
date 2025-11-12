@@ -386,7 +386,7 @@ void VoxelChunk::greedyMeshFace(std::vector<QuadFace>& quads, int face)
                             visited[x + (y + dy) * SIZE + (z + dz) * SIZE * SIZE] = true;
                 }
                 
-                // Add merged quad
+                // Add merged quad (quad index will be assigned after all faces are generated)
                 addQuad(quads, static_cast<float>(x), static_cast<float>(y),
                        static_cast<float>(z), face, width, height, blockType);
             }
@@ -411,7 +411,6 @@ std::vector<QuadFace> VoxelChunk::generateFullChunkMesh()
     }
     
     if (!hasAnyVoxel) {
-        std::cout << "[MESH GEN] Chunk " << this << " is empty, skipping mesh generation" << std::endl;
         return quads;
     }
     
@@ -423,8 +422,7 @@ std::vector<QuadFace> VoxelChunk::generateFullChunkMesh()
 
     auto endTime = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-    std::cout << "[MESH GEN] Chunk " << this << " greedy meshed in " << duration.count() 
-              << "ms, generated " << quads.size() << " quads" << std::endl;
+    (void)duration; // Suppress unused warning
 
     return quads;
 }
@@ -496,6 +494,10 @@ void VoxelChunk::explodeQuad(uint16_t quadIndex)
     int height = static_cast<int>(quad.height);
     int face = quad.faceDir;
     uint8_t blockType = quad.blockType;
+    
+    // Zero out the old quad immediately so it doesn't render
+    quad.width = 0;
+    quad.height = 0;
     
     // Calculate base corner position from center position (reverse of addQuad)
     int baseX, baseY, baseZ;

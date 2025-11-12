@@ -40,7 +40,7 @@ namespace Clouds {
     static constexpr float CLOUD_BASE_MAX_HEIGHT = 300.0f;   // Top of cloud volume (world units)
     
     // === APPEARANCE SETTINGS ===
-    static constexpr float CLOUD_COVERAGE = 0.4f;       // Cloud coverage (0.0 = clear, 1.0 = overcast)
+    static constexpr float CLOUD_COVERAGE = 0.5f;       // Cloud coverage (0.0 = clear, 1.0 = overcast)
     static constexpr float CLOUD_DENSITY = 0.5f;        // Cloud density multiplier (higher = thicker/darker)
     static constexpr float CLOUD_SPEED = 0.5f;          // Wind speed for cloud movement
     static constexpr float CLOUD_SCALE = 0.001f;        // World-space scale for noise sampling
@@ -50,7 +50,7 @@ namespace Clouds {
     static constexpr float AMBIENT_STRENGTH = 0.3f;     // Ambient light contribution
     
     // === DEBUG SETTINGS ===
-    static constexpr bool ENABLE_CLOUDS = true;         // Master cloud toggle
+    static constexpr bool ENABLE_CLOUDS = true;          // Master cloud toggle
     static constexpr bool ENABLE_CLOUD_SHADOWS = true;  // Cloud shadows on terrain/islands
 }
 

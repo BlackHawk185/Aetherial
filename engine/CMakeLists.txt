@@ -26,7 +26,7 @@ add_library(engine STATIC
     Culling/Frustum.cpp
     
     # Rendering systems
-    Rendering/InstancedQuadRenderer.cpp  # GPU instanced quad renderer with shared unit quad
+    Rendering/InstancedQuadRenderer.cpp  # MDI quad renderer with greedy meshing
     Rendering/GPUMeshQueue.cpp           # Main-thread mesh generation queue
     Rendering/TextureManager.cpp
     Rendering/CascadedShadowMap.cpp

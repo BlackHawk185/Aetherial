@@ -13,11 +13,12 @@
 #include <unordered_set>
 #include "../World/VoxelChunk.h"
 
-// Chunk mesh generation result
+// Legacy ChunkMeshResult - no longer used (kept for API compatibility)
 struct ChunkMeshResult
 {
     VoxelChunk* chunk;
-    std::vector<QuadFace> quads;
+    std::vector<uint8_t> vertices;  // Changed from ChunkVertex to dummy type
+    std::vector<uint32_t> indices;
 };
 
 class GreedyMeshQueue

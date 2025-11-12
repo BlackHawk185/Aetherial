@@ -224,8 +224,27 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     
     std::cout << "[BIOME] Island " << islandID << " - " << biomeSystem.getBiomeName(biome) << std::endl;
 
-    // Start with a center chunk at origin to ensure we have at least one chunk
-    addChunkToIsland(islandID, Vec3(0, 0, 0));
+    // WORLDGEN OPTIMIZATION: Cache chunk map to avoid mutex locking on every voxel set
+    // We can safely access island->chunks without locking during single-threaded generation
+    auto& chunkMap = island->chunks;
+    
+    // Helper lambda: Direct voxel lookup without mutex (worldgen is single-threaded)
+    // Used throughout worldgen to avoid getBlockIDInIsland() which has mutex locks
+    auto getVoxelDirect = [&](const Vec3& pos) -> uint8_t {
+        int chunkX = static_cast<int>(std::floor(pos.x / VoxelChunk::SIZE));
+        int chunkY = static_cast<int>(std::floor(pos.y / VoxelChunk::SIZE));
+        int chunkZ = static_cast<int>(std::floor(pos.z / VoxelChunk::SIZE));
+        Vec3 chunkCoord(chunkX, chunkY, chunkZ);
+        
+        auto it = chunkMap.find(chunkCoord);
+        if (it == chunkMap.end() || !it->second) return 0;
+        
+        int localX = static_cast<int>(std::floor(pos.x)) - (chunkX * VoxelChunk::SIZE);
+        int localY = static_cast<int>(std::floor(pos.y)) - (chunkY * VoxelChunk::SIZE);
+        int localZ = static_cast<int>(std::floor(pos.z)) - (chunkZ * VoxelChunk::SIZE);
+        
+        return it->second->getVoxel(localX, localY, localZ);
+    };
     
     // **NOISE CONFIGURATION**
     float densityThreshold = 0.35f;
@@ -257,8 +276,8 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     
     auto voxelGenStart = std::chrono::high_resolution_clock::now();
     
-    // **BFS CONNECTIVITY-AWARE GENERATION**
-    // Only place voxels reachable from center - guarantees connectivity
+    // **BULK DENSITY-BASED GENERATION**
+    // Place all voxels based on density threshold - connectivity handled by later satellite culling
     int islandHeight = static_cast<int>(radius * baseHeightRatio);
     float radiusSquared = (radius * 1.4f) * (radius * 1.4f);
     float radiusDivisor = 1.0f / (radius * 1.2f);
@@ -266,81 +285,85 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     long long voxelsGenerated = 0;
     long long voxelsSampled = 0;
     
-    // BFS from center
-    std::queue<Vec3> frontier;
-    std::unordered_set<int64_t> visited;
+    // Chunk cache: avoid hash map lookups when placing consecutive voxels in same chunk
+    VoxelChunk* cachedChunk = nullptr;
+    Vec3 cachedChunkCoord(-999999, -999999, -999999);
     
-    auto encodePos = [](const Vec3& p) -> int64_t {
-        return (static_cast<int64_t>(p.x + 32768) << 32) | 
-               (static_cast<int64_t>(p.y + 32768) << 16) | 
-               static_cast<int64_t>(p.z + 32768);
+    // Helper lambda: Direct voxel placement without mutex (worldgen is single-threaded)
+    auto setVoxelDirect = [&](const Vec3& pos, uint8_t blockID) {
+        int chunkX = static_cast<int>(std::floor(pos.x / VoxelChunk::SIZE));
+        int chunkY = static_cast<int>(std::floor(pos.y / VoxelChunk::SIZE));
+        int chunkZ = static_cast<int>(std::floor(pos.z / VoxelChunk::SIZE));
+        
+        int localX = static_cast<int>(std::floor(pos.x)) - (chunkX * VoxelChunk::SIZE);
+        int localY = static_cast<int>(std::floor(pos.y)) - (chunkY * VoxelChunk::SIZE);
+        int localZ = static_cast<int>(std::floor(pos.z)) - (chunkZ * VoxelChunk::SIZE);
+        
+        // Check chunk cache to avoid hash map lookup
+        if (cachedChunk == nullptr || cachedChunkCoord.x != chunkX || 
+            cachedChunkCoord.y != chunkY || cachedChunkCoord.z != chunkZ) {
+            Vec3 chunkCoord(chunkX, chunkY, chunkZ);
+            std::unique_ptr<VoxelChunk>& chunkPtr = chunkMap[chunkCoord];
+            if (!chunkPtr) {
+                chunkPtr = std::make_unique<VoxelChunk>();
+                chunkPtr->setIslandContext(islandID, chunkCoord);
+                chunkPtr->setIsClient(m_isClient);
+            }
+            cachedChunk = chunkPtr.get();
+            cachedChunkCoord = chunkCoord;
+        }
+        
+        cachedChunk->setVoxelDataDirect(localX, localY, localZ, blockID);
     };
     
-    Vec3 startPos(0, 0, 0);
-    frontier.push(startPos);
-    visited.insert(encodePos(startPos));
-    setBlockIDWithAutoChunk(islandID, startPos, palette.deepBlock);  // Use biome deep block
-    voxelsGenerated++;
-    
-    while (!frontier.empty())
+    // Iterate through bounding box - no neighbor checking, just density evaluation
+    int maxRadius = static_cast<int>(radius * 1.4f);
+    for (int y = -islandHeight; y <= islandHeight; ++y)
     {
-        Vec3 current = frontier.front();
-        frontier.pop();
+        float dy = static_cast<float>(y);
         
-        // Check all 6 neighbors
-        static const Vec3 neighbors[6] = {
-            Vec3(1, 0, 0), Vec3(-1, 0, 0),
-            Vec3(0, 1, 0), Vec3(0, -1, 0),
-            Vec3(0, 0, 1), Vec3(0, 0, -1)
-        };
+        // Vertical density
+        float islandHeightRange = islandHeight * 2.0f;
+        float normalizedY = (dy + islandHeight) / islandHeightRange;
+        float centerOffset = normalizedY - 0.5f;
+        float verticalDensity = 1.0f - (centerOffset * centerOffset * 4.0f);
+        verticalDensity = std::max(0.0f, verticalDensity);
         
-        for (const Vec3& delta : neighbors)
+        if (verticalDensity < 0.01f) continue;
+        
+        for (int x = -maxRadius; x <= maxRadius; ++x)
         {
-            Vec3 neighbor = current + delta;
-            int64_t neighborKey = encodePos(neighbor);
+            float dx = static_cast<float>(x);
             
-            if (visited.count(neighborKey)) continue;
-            visited.insert(neighborKey);
-            voxelsSampled++;
-            
-            float dx = static_cast<float>(neighbor.x);
-            float dy = static_cast<float>(neighbor.y);
-            float dz = static_cast<float>(neighbor.z);
-            
-            // Sphere culling
-            float distanceSquared = dx * dx + dy * dy + dz * dz;
-            if (distanceSquared > radiusSquared) continue;
-            
-            // Vertical density
-            float islandHeightRange = islandHeight * 2.0f;
-            float normalizedY = (dy + islandHeight) / islandHeightRange;
-            float centerOffset = normalizedY - 0.5f;
-            float verticalDensity = 1.0f - (centerOffset * centerOffset * 4.0f);
-            verticalDensity = std::max(0.0f, verticalDensity);
-            
-            if (verticalDensity < 0.01f) continue;
-            
-            // Radial falloff
-            float distanceFromCenter = std::sqrt(distanceSquared);
-            float islandBase = 1.0f - (distanceFromCenter * radiusDivisor);
-            islandBase = std::max(0.0f, islandBase);
-            islandBase = islandBase * islandBase;
-            
-            if (islandBase < 0.01f) continue;
-            
-            // 3D noise
-            float noise = noise3D.GetNoise(dx, dy * 0.7f, dz);
-            noise = (noise + 1.0f) * 0.5f;
-            
-            float finalDensity = islandBase * verticalDensity * noise;
-            
-            if (finalDensity > densityThreshold)
+            for (int z = -maxRadius; z <= maxRadius; ++z)
             {
-                // Initially place all blocks as deep blocks
-                // We'll determine the correct surface/subsurface blocks in a second pass
-                setBlockIDWithAutoChunk(islandID, neighbor, palette.deepBlock);
-                frontier.push(neighbor);
-                voxelsGenerated++;
+                float dz = static_cast<float>(z);
+                voxelsSampled++;
+                
+                // Radial bounds
+                float distanceSquared = dx * dx + dy * dy + dz * dz;
+                if (distanceSquared > radiusSquared) continue;
+                
+                // Radial falloff
+                float distanceFromCenter = std::sqrt(distanceSquared);
+                float islandBase = 1.0f - (distanceFromCenter * radiusDivisor);
+                islandBase = std::max(0.0f, islandBase);
+                islandBase = islandBase * islandBase;
+                
+                if (islandBase < 0.01f) continue;
+                
+                // 3D noise
+                float noise = noise3D.GetNoise(dx, dy * 0.7f, dz);
+                noise = (noise + 1.0f) * 0.5f;
+                
+                float finalDensity = islandBase * verticalDensity * noise;
+                
+                if (finalDensity > densityThreshold)
+                {
+                    Vec3 pos(x, y, z);
+                    setVoxelDirect(pos, palette.deepBlock);
+                    voxelsGenerated++;
+                }
             }
         }
     }
@@ -348,21 +371,33 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     auto voxelGenEnd = std::chrono::high_resolution_clock::now();
     auto voxelGenDuration = std::chrono::duration_cast<std::chrono::milliseconds>(voxelGenEnd - voxelGenStart).count();
     
-    std::cout << "🔨 Voxel Generation (BFS): " << voxelGenDuration << "ms (" << voxelsGenerated << " voxels, " 
+    std::cout << "🔨 Voxel Generation (Bulk): " << voxelGenDuration << "ms (" << voxelsGenerated << " voxels, " 
               << island->chunks.size() << " chunks)" << std::endl;
-    std::cout << "   └─ Positions Sampled: " << voxelsSampled << " (connectivity-aware)" << std::endl;
+    std::cout << "   └─ Positions Sampled: " << voxelsSampled << std::endl;
     
     // **SURFACE DETECTION PASS**
     // Now that all voxels are placed, determine which should be surface/subsurface blocks
+    // Also collect surface voxel positions for connectivity analysis
     auto surfacePassStart = std::chrono::high_resolution_clock::now();
     int surfaceBlocksPlaced = 0;
     int subsurfaceBlocksPlaced = 0;
+    long long voxelsChecked = 0;
+    long long neighborChecks = 0;
+    
+    std::vector<Vec3> surfaceVoxelPositions;  // Collect surface blocks with horizontal air exposure
     
     static const Vec3 checkNeighbors[6] = {
         Vec3(1, 0, 0), Vec3(-1, 0, 0),
         Vec3(0, 1, 0), Vec3(0, -1, 0),
         Vec3(0, 0, 1), Vec3(0, 0, -1)
     };
+    
+    static const Vec3 horizontalNeighbors[4] = {
+        Vec3(1, 0, 0), Vec3(-1, 0, 0),
+        Vec3(0, 0, 1), Vec3(0, 0, -1)
+    };
+    
+    auto iterationStart = std::chrono::high_resolution_clock::now();
     
     // Iterate through all chunks and check each solid block
     for (auto& [chunkCoord, chunk] : island->chunks)
@@ -379,55 +414,69 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
                     if (currentBlock == BlockID::AIR) continue;
                     if (currentBlock != palette.deepBlock) continue;  // Only process deep blocks
                     
+                    voxelsChecked++;
+                    
                     // Calculate world position
                     Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(lx, ly, lz);
                     
-                    // Check if any neighbor is air (exposed surface)
-                    bool isExposed = false;
+                    // Single-pass neighbor scan: check for both air and surface blocks
+                    bool hasAirNeighbor = false;
+                    bool hasSurfaceNeighbor = false;
+                    
                     for (const Vec3& delta : checkNeighbors)
                     {
                         Vec3 neighborPos = worldPos + delta;
-                        uint8_t neighborBlock = getBlockIDInIsland(islandID, neighborPos);
+                        neighborChecks++;
+                        uint8_t neighborBlock = getVoxelDirect(neighborPos);
+                        
                         if (neighborBlock == BlockID::AIR)
-                        {
-                            isExposed = true;
+                            hasAirNeighbor = true;
+                        else if (neighborBlock == palette.surfaceBlock)
+                            hasSurfaceNeighbor = true;
+                        
+                        // Early exit if we found both - no need to check remaining neighbors
+                        if (hasAirNeighbor && hasSurfaceNeighbor)
                             break;
-                        }
                     }
                     
-                    if (isExposed)
+                    if (hasAirNeighbor)
                     {
                         // This is a surface block - replace with surface block type
                         chunk->setVoxel(lx, ly, lz, palette.surfaceBlock);
                         surfaceBlocksPlaced++;
-                    }
-                    else
-                    {
-                        // Check if any neighbor is a surface block (1 layer deep)
-                        bool nearSurface = false;
-                        for (const Vec3& delta : checkNeighbors)
+                        
+                        // Check if this surface block has horizontal air exposure (walls)
+                        // We collect these for satellite detection via surface shell connectivity
+                        bool hasHorizontalAir = false;
+                        for (const Vec3& delta : horizontalNeighbors)
                         {
                             Vec3 neighborPos = worldPos + delta;
-                            uint8_t neighborBlock = getBlockIDInIsland(islandID, neighborPos);
-                            if (neighborBlock == palette.surfaceBlock)
+                            uint8_t neighborBlock = getVoxelDirect(neighborPos);
+                            if (neighborBlock == BlockID::AIR)
                             {
-                                nearSurface = true;
+                                hasHorizontalAir = true;
                                 break;
                             }
                         }
                         
-                        if (nearSurface)
-                        {
-                            // This is a subsurface block (1 layer below surface)
-                            chunk->setVoxel(lx, ly, lz, palette.subsurfaceBlock);
-                            subsurfaceBlocksPlaced++;
-                        }
-                        // else: remains deep block
+                        // Include blocks with ANY air exposure for satellite detection
+                        // (top/bottom exposed blocks connect surface shells vertically)
+                        surfaceVoxelPositions.push_back(worldPos);
                     }
+                    else if (hasSurfaceNeighbor)
+                    {
+                        // This is a subsurface block (1 layer below surface)
+                        chunk->setVoxel(lx, ly, lz, palette.subsurfaceBlock);
+                        subsurfaceBlocksPlaced++;
+                    }
+                    // else: remains deep block
                 }
             }
         }
     }
+    
+    auto iterationEnd = std::chrono::high_resolution_clock::now();
+    auto iterationDuration = std::chrono::duration_cast<std::chrono::milliseconds>(iterationEnd - iterationStart).count();
     
     auto surfacePassEnd = std::chrono::high_resolution_clock::now();
     auto surfacePassDuration = std::chrono::duration_cast<std::chrono::milliseconds>(surfacePassEnd - surfacePassStart).count();
@@ -435,57 +484,77 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     std::cout << "🎨 Surface Detection: " << surfacePassDuration << "ms (" 
               << surfaceBlocksPlaced << " surface, " 
               << subsurfaceBlocksPlaced << " subsurface)" << std::endl;
+    std::cout << "   └─ Voxels Checked: " << voxelsChecked << " (" << neighborChecks << " neighbor lookups)" << std::endl;
+    std::cout << "   └─ Iteration Time: " << iterationDuration << "ms" << std::endl;
     
     // **WATER BASIN PASS**
     auto waterStart = std::chrono::high_resolution_clock::now();
     
     // Step 1: Fill ground-level basins
-    placeWaterBasins(islandID, palette, seed);
+    auto basinFillStart = std::chrono::high_resolution_clock::now();
+    std::unordered_set<int64_t> waterPositions = placeWaterBasins(islandID, palette, seed);
+    auto basinFillEnd = std::chrono::high_resolution_clock::now();
+    auto basinFillDuration = std::chrono::duration_cast<std::chrono::milliseconds>(basinFillEnd - basinFillStart).count();
     
     // Step 2: Cull exposed water (fast on small dataset)
+    auto initialCullStart = std::chrono::high_resolution_clock::now();
     cullExposedWater(islandID);
+    auto initialCullEnd = std::chrono::high_resolution_clock::now();
+    auto initialCullDuration = std::chrono::duration_cast<std::chrono::milliseconds>(initialCullEnd - initialCullStart).count();
+    
+    std::cout << "   └─ Basin Fill: " << basinFillDuration << "ms, Initial Cull: " << initialCullDuration << "ms" << std::endl;
+    
+    // Update waterPositions after culling - remove positions that no longer have water
+    auto decodePos = [](int64_t key) -> Vec3 {
+        int x = static_cast<int>((key >> 32) & 0xFFFF) - 32768;
+        int y = static_cast<int>((key >> 16) & 0xFFFF) - 32768;
+        int z = static_cast<int>(key & 0xFFFF) - 32768;
+        return Vec3(x, y, z);
+    };
+    
+    std::unordered_set<int64_t> survivingWater;
+    for (int64_t key : waterPositions) {
+        Vec3 pos = decodePos(key);
+        uint8_t block = getVoxelDirect(pos);
+        if (block == BlockID::WATER || block == BlockID::ICE || block == BlockID::LAVA) {
+            survivingWater.insert(key);
+        }
+    }
+    waterPositions = std::move(survivingWater);
     
     // Step 3: Iteratively add layers upward with flood-fill + cull
+    auto layerExpansionStart = std::chrono::high_resolution_clock::now();
     int layersAdded = 0;
     int maxLayers = std::max(palette.minWaterDepth, palette.maxWaterDepth);
     
     for (int layer = 0; layer < maxLayers; ++layer)
     {
-        // Find all water surface positions (water with air above)
+        auto layerStart = std::chrono::high_resolution_clock::now();
+        
+        // Find all water surface positions (water with air above) - OPTIMIZED: only scan tracked water positions
+        auto findSurfacesStart = std::chrono::high_resolution_clock::now();
         std::vector<Vec3> waterSurfaces;
-        for (auto& [chunkCoord, chunk] : island->chunks)
+        
+        for (int64_t key : waterPositions)
         {
-            if (!chunk) continue;
+            Vec3 waterPos = decodePos(key);
+            Vec3 abovePos = waterPos + Vec3(0, 1, 0);
             
-            for (int lz = 0; lz < VoxelChunk::SIZE; ++lz)
+            // Check if air above
+            uint8_t blockAbove = getVoxelDirect(abovePos);
+            if (blockAbove == BlockID::AIR)
             {
-                for (int ly = 0; ly < VoxelChunk::SIZE; ++ly)
-                {
-                    for (int lx = 0; lx < VoxelChunk::SIZE; ++lx)
-                    {
-                        uint8_t blockID = chunk->getVoxel(lx, ly, lz);
-                        
-                        // Check if this is water
-                        if (blockID != BlockID::WATER && blockID != BlockID::ICE && blockID != BlockID::LAVA)
-                            continue;
-                        
-                        Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(lx, ly, lz);
-                        Vec3 abovePos = worldPos + Vec3(0, 1, 0);
-                        
-                        // Check if air above
-                        uint8_t blockAbove = getBlockIDInIsland(islandID, abovePos);
-                        if (blockAbove == BlockID::AIR)
-                        {
-                            waterSurfaces.push_back(worldPos);
-                        }
-                    }
-                }
+                waterSurfaces.push_back(waterPos);
             }
         }
+        
+        auto findSurfacesEnd = std::chrono::high_resolution_clock::now();
+        auto findSurfacesDuration = std::chrono::duration_cast<std::chrono::milliseconds>(findSurfacesEnd - findSurfacesStart).count();
         
         if (waterSurfaces.empty()) break; // No water to expand from
         
         // Horizontal flood-fill from each water surface position
+        auto floodFillStart = std::chrono::high_resolution_clock::now();
         std::unordered_set<int64_t> newWaterSet;
         auto encodePos = [](const Vec3& p) -> int64_t {
             return (static_cast<int64_t>(p.x + 32768) << 32) | 
@@ -514,11 +583,11 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
                 Vec3 current = fillQueue.front();
                 fillQueue.pop();
                 
-                uint8_t currentBlock = getBlockIDInIsland(islandID, current);
+                uint8_t currentBlock = getVoxelDirect(current);
                 if (currentBlock != BlockID::AIR) continue;
                 
                 // Check if solid below
-                uint8_t blockBelow = getBlockIDInIsland(islandID, current + Vec3(0, -1, 0));
+                uint8_t blockBelow = getVoxelDirect(current + Vec3(0, -1, 0));
                 if (blockBelow == BlockID::AIR) continue;
                 
                 // Expand horizontally
@@ -533,9 +602,13 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
             }
         }
         
+        auto floodFillEnd = std::chrono::high_resolution_clock::now();
+        auto floodFillDuration = std::chrono::duration_cast<std::chrono::milliseconds>(floodFillEnd - floodFillStart).count();
+        
         if (newWaterSet.empty()) break;
         
         // Place new water layer
+        auto placeWaterStart = std::chrono::high_resolution_clock::now();
         for (int64_t key : newWaterSet)
         {
             int x = static_cast<int>((key >> 32) & 0xFFFF) - 32768;
@@ -543,33 +616,53 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
             int z = static_cast<int>(key & 0xFFFF) - 32768;
             setBlockIDWithAutoChunk(islandID, Vec3(x, y, z), palette.waterBlock);
         }
+        auto placeWaterEnd = std::chrono::high_resolution_clock::now();
+        auto placeWaterDuration = std::chrono::duration_cast<std::chrono::milliseconds>(placeWaterEnd - placeWaterStart).count();
         
         // Cull exposed water at this layer
+        auto cullStart = std::chrono::high_resolution_clock::now();
         cullExposedWater(islandID);
+        auto cullEnd = std::chrono::high_resolution_clock::now();
+        auto cullDuration = std::chrono::duration_cast<std::chrono::milliseconds>(cullEnd - cullStart).count();
         
         // Check if any water survived culling - if not, we're done
+        // Also update waterPositions to track only surviving water for next layer
+        std::unordered_set<int64_t> updatedWaterPositions;
         bool anyWaterRemains = false;
         for (int64_t key : newWaterSet)
         {
-            int x = static_cast<int>((key >> 32) & 0xFFFF) - 32768;
-            int y = static_cast<int>((key >> 16) & 0xFFFF) - 32768;
-            int z = static_cast<int>(key & 0xFFFF) - 32768;
-            uint8_t block = getBlockIDInIsland(islandID, Vec3(x, y, z));
+            Vec3 pos = decodePos(key);
+            uint8_t block = getVoxelDirect(pos);
             if (block == BlockID::WATER || block == BlockID::ICE || block == BlockID::LAVA)
             {
                 anyWaterRemains = true;
-                break;
+                updatedWaterPositions.insert(key);
             }
         }
         
         if (!anyWaterRemains) break; // Layer was completely culled, stop
         
+        // Update tracked water positions: combine with previous layer's water
+        waterPositions.insert(updatedWaterPositions.begin(), updatedWaterPositions.end());
+        
+        auto layerEnd = std::chrono::high_resolution_clock::now();
+        auto layerDuration = std::chrono::duration_cast<std::chrono::milliseconds>(layerEnd - layerStart).count();
+        std::cout << "   └─ Layer " << layer << ": " << layerDuration << "ms "
+                  << "(find=" << findSurfacesDuration << "ms, "
+                  << "flood=" << floodFillDuration << "ms, "
+                  << "place=" << placeWaterDuration << "ms, "
+                  << "cull=" << cullDuration << "ms)" << std::endl;
+        
         layersAdded++;
     }
+    
+    auto layerExpansionEnd = std::chrono::high_resolution_clock::now();
+    auto layerExpansionDuration = std::chrono::duration_cast<std::chrono::milliseconds>(layerExpansionEnd - layerExpansionStart).count();
     
     auto waterEnd = std::chrono::high_resolution_clock::now();
     auto waterDuration = std::chrono::duration_cast<std::chrono::milliseconds>(waterEnd - waterStart).count();
     std::cout << "💧 Water Basins: " << waterDuration << "ms (" << layersAdded << " layers added)" << std::endl;
+    std::cout << "   └─ Layer Expansion: " << layerExpansionDuration << "ms" << std::endl;
     
     // **VEGETATION DECORATION PASS**
     // Place grass GLB models and voxel trees based on biome vegetation density
@@ -827,11 +920,6 @@ void IslandChunkSystem::setBlockIDWithAutoChunk(uint32_t islandID, const Vec3& i
     setVoxelWithAutoChunk(islandID, islandRelativePos, blockID);
 }
 
-uint8_t IslandChunkSystem::getBlockIDInIsland(uint32_t islandID, const Vec3& islandRelativePosition) const
-{
-    return getVoxelFromIsland(islandID, islandRelativePosition);
-}
-
 void IslandChunkSystem::getAllChunks(std::vector<VoxelChunk*>& outChunks)
 {
     outChunks.clear();
@@ -971,11 +1059,37 @@ void IslandChunkSystem::updatePlayerChunks(const Vec3& playerPosition)
     // For now, we manually create islands in GameState
 }
 
-void IslandChunkSystem::placeWaterBasins(uint32_t islandID, const BiomePalette& palette, uint32_t seed)
+std::unordered_set<int64_t> IslandChunkSystem::placeWaterBasins(uint32_t islandID, const BiomePalette& palette, uint32_t seed)
 {
     FloatingIsland* island = getIsland(islandID);
-    if (!island) return;
+    if (!island) return std::unordered_set<int64_t>();
     
+    auto& chunkMap = island->chunks;
+    
+    // Helper lambda: Direct voxel lookup without mutex
+    auto getVoxelDirect = [&](const Vec3& pos) -> uint8_t {
+        int chunkX = static_cast<int>(std::floor(pos.x / VoxelChunk::SIZE));
+        int chunkY = static_cast<int>(std::floor(pos.y / VoxelChunk::SIZE));
+        int chunkZ = static_cast<int>(std::floor(pos.z / VoxelChunk::SIZE));
+        Vec3 chunkCoord(chunkX, chunkY, chunkZ);
+        
+        auto it = chunkMap.find(chunkCoord);
+        if (it == chunkMap.end() || !it->second) return 0;
+        
+        int localX = static_cast<int>(std::floor(pos.x)) - (chunkX * VoxelChunk::SIZE);
+        int localY = static_cast<int>(std::floor(pos.y)) - (chunkY * VoxelChunk::SIZE);
+        int localZ = static_cast<int>(std::floor(pos.z)) - (chunkZ * VoxelChunk::SIZE);
+        
+        return it->second->getVoxel(localX, localY, localZ);
+    };
+    
+    auto encodePos = [](const Vec3& p) -> int64_t {
+        return (static_cast<int64_t>(p.x + 32768) << 32) | 
+               (static_cast<int64_t>(p.y + 32768) << 16) | 
+               static_cast<int64_t>(p.z + 32768);
+    };
+    
+    std::unordered_set<int64_t> waterPositions;
     int waterBlocksPlaced = 0;
     
     for (auto& [chunkCoord, chunk] : island->chunks)
@@ -995,9 +1109,10 @@ void IslandChunkSystem::placeWaterBasins(uint32_t islandID, const BiomePalette& 
                     Vec3 waterPos = worldPos + Vec3(0, 1, 0);
                     
                     // Place water one block above surface if air
-                    if (getBlockIDInIsland(islandID, waterPos) == BlockID::AIR)
+                    if (getVoxelDirect(waterPos) == BlockID::AIR)
                     {
                         setBlockIDWithAutoChunk(islandID, waterPos, palette.waterBlock);
+                        waterPositions.insert(encodePos(waterPos));
                         waterBlocksPlaced++;
                     }
                 }
@@ -1006,12 +1121,32 @@ void IslandChunkSystem::placeWaterBasins(uint32_t islandID, const BiomePalette& 
     }
     
     std::cout << "   └─ Initial Water: " << waterBlocksPlaced << " blocks" << std::endl;
+    return waterPositions;
 }
 
 void IslandChunkSystem::cullExposedWater(uint32_t islandID)
 {
     FloatingIsland* island = getIsland(islandID);
     if (!island) return;
+    
+    auto& chunkMap = island->chunks;
+    
+    // Helper lambda: Direct voxel lookup without mutex
+    auto getVoxelDirect = [&](const Vec3& pos) -> uint8_t {
+        int chunkX = static_cast<int>(std::floor(pos.x / VoxelChunk::SIZE));
+        int chunkY = static_cast<int>(std::floor(pos.y / VoxelChunk::SIZE));
+        int chunkZ = static_cast<int>(std::floor(pos.z / VoxelChunk::SIZE));
+        Vec3 chunkCoord(chunkX, chunkY, chunkZ);
+        
+        auto it = chunkMap.find(chunkCoord);
+        if (it == chunkMap.end() || !it->second) return 0;
+        
+        int localX = static_cast<int>(std::floor(pos.x)) - (chunkX * VoxelChunk::SIZE);
+        int localY = static_cast<int>(std::floor(pos.y)) - (chunkY * VoxelChunk::SIZE);
+        int localZ = static_cast<int>(std::floor(pos.z)) - (chunkZ * VoxelChunk::SIZE);
+        
+        return it->second->getVoxel(localX, localY, localZ);
+    };
     
     static const Vec3 neighbors[6] = {
         Vec3(1, 0, 0), Vec3(-1, 0, 0),
@@ -1058,7 +1193,7 @@ void IslandChunkSystem::cullExposedWater(uint32_t islandID)
                         
                         const Vec3& delta = neighbors[i];
                         Vec3 neighborPos = worldPos + delta;
-                        uint8_t neighborBlock = getBlockIDInIsland(islandID, neighborPos);
+                        uint8_t neighborBlock = getVoxelDirect(neighborPos);
                         if (neighborBlock == BlockID::AIR)
                         {
                             hasExposedLeak = true;

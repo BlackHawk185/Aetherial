@@ -541,8 +541,6 @@ void InstancedQuadRenderer::registerChunk(VoxelChunk* chunk, const glm::mat4& tr
     if (it != m_chunkToIndex.end())
     {
         m_chunks[it->second].transform = transform;
-        std::cout << "[RENDERER] Updated transform for existing chunk " << chunk 
-                  << " at index " << it->second << std::endl;
         return;
     }
     
@@ -558,9 +556,6 @@ void InstancedQuadRenderer::registerChunk(VoxelChunk* chunk, const glm::mat4& tr
     
     m_chunks.push_back(entry);
     m_chunkToIndex[chunk] = index;
-    
-    std::cout << "[RENDERER] Registered new chunk " << chunk << " at index " << index 
-              << ". Total chunks: " << m_chunks.size() << std::endl;
 }
 
 void InstancedQuadRenderer::registerChunkWithSize(VoxelChunk* chunk, const glm::mat4& transform, size_t estimatedQuads)
@@ -646,12 +641,6 @@ void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
     
     size_t newQuadCount = mesh->quads.size();
     
-    std::cout << "[GPU UPDATE] Chunk " << entry.chunk << ": newQuadCount=" << newQuadCount 
-              << ", lastUploaded=" << entry.lastUploadedCount 
-              << ", needsUpload=" << mesh->needsGPUUpload 
-              << ", allocatedSlots=" << entry.allocatedSlots 
-              << ", baseInstance=" << entry.baseInstance << std::endl;
-    
     // Upload if count changed OR if upload was explicitly requested
     if (newQuadCount != entry.lastUploadedCount || mesh->needsGPUUpload) {
         // Check if we need to allocate or reallocate space
@@ -660,11 +649,6 @@ void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
             entry.allocatedSlots = calculateChunkSlots(newQuadCount);
             entry.baseInstance = m_persistentQuadUsed;
             m_persistentQuadUsed += entry.allocatedSlots;
-            
-            std::cout << "[GPU ALLOC] Chunk " << entry.chunk 
-                      << " allocated at baseInstance=" << entry.baseInstance 
-                      << ", slots=" << entry.allocatedSlots 
-                      << ", totalUsed=" << m_persistentQuadUsed << std::endl;
         } 
         else if (newQuadCount > entry.allocatedSlots) {
             // REALLOCATION NEEDED: Chunk grew beyond padding

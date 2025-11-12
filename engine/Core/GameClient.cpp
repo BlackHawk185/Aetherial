@@ -218,10 +218,7 @@ bool GameClient::update(float deltaTime)
     // Process mesh generation queue (processes up to 128 chunks per frame for faster updates)
     if (g_greedyMeshQueue)
     {
-        int processed = g_greedyMeshQueue->processQueue(128);
-        if (processed > 0) {
-            std::cout << "[GAME CLIENT] Processed " << processed << " mesh(es) this frame" << std::endl;
-        }
+        g_greedyMeshQueue->processQueue(128);
     } else {
         static bool warnedOnce = false;
         if (!warnedOnce) {
@@ -291,7 +288,7 @@ void GameClient::shutdown()
     // Disconnect from game state
     m_clientWorld = nullptr;
 
-    // Cleanup renderers (unique_ptr handles deletion automatically)
+    // Cleanup renderers
     if (g_instancedQuadRenderer)
     {
         g_instancedQuadRenderer->shutdown();
@@ -419,9 +416,14 @@ bool GameClient::initializeGraphics()
     if (!g_textureManager)
     {
         g_textureManager = new TextureManager();
+        if (!g_textureManager->initialize())
+        {
+            std::cerr << "❌ Failed to initialize TextureManager!" << std::endl;
+            return false;
+        }
     }
     
-    // Initialize instanced quad renderer (99.4% memory reduction vs per-vertex approach)
+    // Initialize MDI quad renderer (greedy meshing + multi-draw indirect)
     g_instancedQuadRenderer = std::make_unique<InstancedQuadRenderer>();
     if (!g_instancedQuadRenderer->initialize())
     {
@@ -429,7 +431,7 @@ bool GameClient::initializeGraphics()
         g_instancedQuadRenderer.reset();
         return false;
     }
-    std::cout << "✅ InstancedQuadRenderer initialized - shared unit quad ready!" << std::endl;
+    std::cout << "✅ InstancedQuadRenderer initialized - MDI rendering ready!" << std::endl;
 
     // Initialize light map system (must happen before renderers that use it)
     // 4 cascades: 2 for sun (near+far), 2 for moon (near+far)
@@ -1329,7 +1331,7 @@ void GameClient::syncPhysicsToChunks()
             // Use helper to compute chunk transform
             glm::mat4 chunkTransform = island.getChunkTransform(chunkCoord);
             
-            // === UPDATE INSTANCED RENDERER (voxel chunks) ===
+            // === UPDATE CHUNK QUAD RENDERER (voxel chunks) ===
             g_instancedQuadRenderer->updateChunkTransform(chunk.get(), chunkTransform);
             
             // === UPDATE GLB MODEL RENDERER (only for chunks with OBJ instances) ===
@@ -1448,29 +1450,19 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
 
     if (chunk)
     {
-        std::cout << "[CHUNK LOAD] Received chunk (" << chunkCoord.x << "," << chunkCoord.y << "," << chunkCoord.z 
-                  << ") for island " << islandID << ", data size: " << dataSize << " bytes" << std::endl;
-        
         // Apply the voxel data directly
         chunk->setRawVoxelData(voxelData, dataSize);
-        std::cout << "[CHUNK LOAD] Voxel data applied to chunk" << std::endl;
         
         // Register chunk with renderer
         if (g_instancedQuadRenderer) {
             glm::mat4 chunkTransform = island->getChunkTransform(chunkCoord);
             g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
-            std::cout << "[CHUNK LOAD] Chunk registered with renderer" << std::endl;
-        } else {
-            std::cout << "[CHUNK LOAD] ERROR: No renderer available!" << std::endl;
         }
         
         // Queue mesh generation for entire chunk
         if (g_greedyMeshQueue)
         {
             g_greedyMeshQueue->queueChunkMesh(chunk);
-            std::cout << "[CHUNK LOAD] Chunk queued for meshing" << std::endl;
-        } else {
-            std::cout << "[CHUNK LOAD] ERROR: No mesh queue available!" << std::endl;
         }
     }
     else
