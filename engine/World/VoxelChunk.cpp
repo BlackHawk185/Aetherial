@@ -4,10 +4,12 @@
 
 #include "../Time/DayNightController.h"  // For dynamic sun direction
 #include "../Rendering/GPUMeshQueue.h"  // For region-based remeshing queue (greedy meshing)
+#include "../Rendering/InstancedQuadRenderer.h"  // For GPU upload
 
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -23,14 +25,9 @@ VoxelChunk::VoxelChunk()
 {
     // Initialize voxel data to empty (0 = air)
     std::fill(voxels.begin(), voxels.end(), 0);
-    meshDirty = true;
     
     // Initialize render mesh with empty shared_ptr
     renderMesh = std::make_shared<VoxelMesh>();
-    
-    // Initialize region dirty flags to false
-    m_regionDirtyFlags.fill(false);
-    m_dirtyRegions.clear();
 }
 
 VoxelChunk::~VoxelChunk()
@@ -51,27 +48,121 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
     if (x < 0 || x >= SIZE || y < 0 || y >= SIZE || z < 0 || z >= SIZE)
         return;
     
-    uint8_t oldType = voxels[x + y * SIZE + z * SIZE * SIZE];
+    int voxelIdx = x + y * SIZE + z * SIZE * SIZE;
+    uint8_t oldType = voxels[voxelIdx];
     if (oldType == type) return; // No change
     
-    voxels[x + y * SIZE + z * SIZE * SIZE] = type;
+    voxels[voxelIdx] = type;
     
-    // Mark region dirty for remeshing (new region-based system)
-    if (m_incrementalUpdatesEnabled) {
-        // Mark the region containing this voxel as dirty
-        markRegionDirtyAtVoxel(x, y, z);
-        
-        // Queue dirty regions for remeshing (callback will fire after remesh completes)
-        processDirtyRegions();
-        
-        // NOTE: Callback is NOT called here - it will be called by GreedyMeshQueue
-        // after the mesh is actually regenerated to avoid 1-frame lag
-    } else {
-        // Incremental updates not enabled yet - mark dirty and trigger full regeneration
-        meshDirty = true;
-        if (m_meshUpdateCallback) {
-            m_meshUpdateCallback(this);
+    // Track OBJ-type blocks (instanced models like grass, water)
+    auto& registry = BlockTypeRegistry::getInstance();
+    const BlockTypeInfo* oldBlockInfo = registry.getBlockType(oldType);
+    const BlockTypeInfo* newBlockInfo = registry.getBlockType(type);
+    
+    // Remove old OBJ instance if it was an OBJ block
+    if (oldBlockInfo && oldBlockInfo->renderType == BlockRenderType::OBJ) {
+        auto it = m_modelInstances.find(oldType);
+        if (it != m_modelInstances.end()) {
+            auto& instances = it->second;
+            Vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+            instances.erase(std::remove(instances.begin(), instances.end(), pos), instances.end());
         }
+    }
+    
+    // Add new OBJ instance if it's an OBJ block
+    if (newBlockInfo && newBlockInfo->renderType == BlockRenderType::OBJ) {
+        Vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+        m_modelInstances[type].push_back(pos);
+    }
+    
+    // CLIENT ONLY: Use explosion system for instant mesh updates
+    if (m_isClientChunk)
+    {
+        auto mesh = getRenderMesh();
+        if (!mesh)
+        {
+            // No mesh yet - queue for initial generation
+            if (g_greedyMeshQueue) {
+                g_greedyMeshQueue->queueChunkMesh(this);
+            }
+            return;
+        }
+        
+        // Find and explode ALL quads covering this voxel (check all 6 face directions)
+        for (int face = 0; face < 6; ++face)
+        {
+            uint32_t key = voxelIdx * 6 + face;
+            auto it = mesh->voxelFaceToQuadIndex.find(key);
+            if (it != mesh->voxelFaceToQuadIndex.end())
+            {
+                explodeQuad(it->second);
+                mesh->voxelFaceToQuadIndex.erase(it);
+            }
+        }
+        
+        // If placing a block, add new faces
+        if (type != 0)  // 0 = air
+        {
+            addSimpleFacesForVoxel(x, y, z);
+        }
+        
+        // CRITICAL: Update neighboring voxels - they may now have exposed faces
+        // When we break/place a block, the 6 adjacent voxels may need new faces added
+        static const int dx[6] = { 0,  0,  0,  0, -1,  1};
+        static const int dy[6] = {-1,  1,  0,  0,  0,  0};
+        static const int dz[6] = { 0,  0, -1,  1,  0,  0};
+        
+        for (int face = 0; face < 6; ++face)
+        {
+            int nx = x + dx[face];
+            int ny = y + dy[face];
+            int nz = z + dz[face];
+            
+            // Skip out of bounds
+            if (nx < 0 || nx >= SIZE || ny < 0 || ny >= SIZE || nz < 0 || nz >= SIZE)
+                continue;
+            
+            // If neighbor is solid, it might need a new face toward this voxel
+            if (isVoxelSolid(nx, ny, nz))
+            {
+                // Opposite face direction (face toward the modified voxel)
+                int oppositeFace = face ^ 1; // 0<->1, 2<->3, 4<->5
+                
+                // Check if that face is now exposed
+                if (isFaceExposed(nx, ny, nz, oppositeFace))
+                {
+                    int neighborIdx = nx + ny * SIZE + nz * SIZE * SIZE;
+                    
+                    // Explode the quad on this specific face direction for the neighbor
+                    if (!mesh->isExploded[neighborIdx])
+                    {
+                        uint32_t neighborKey = neighborIdx * 6 + oppositeFace;
+                        auto it = mesh->voxelFaceToQuadIndex.find(neighborKey);
+                        if (it != mesh->voxelFaceToQuadIndex.end())
+                        {
+                            explodeQuad(it->second);
+                            mesh->voxelFaceToQuadIndex.erase(it);
+                        }
+                    }
+                    
+                    // Add a 1x1 face for this exposed direction
+                    uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
+                    uint8_t neighborBlockType = getVoxel(nx, ny, nz);
+                    addQuad(mesh->quads, static_cast<float>(nx), static_cast<float>(ny),
+                           static_cast<float>(nz), oppositeFace, 1, 1, neighborBlockType);
+                    
+                    // Add to tracking map (voxelIdx * 6 + faceDir)
+                    uint32_t neighborKey = neighborIdx * 6 + oppositeFace;
+                    mesh->voxelFaceToQuadIndex[neighborKey] = newQuadIdx;
+                    mesh->isExploded[neighborIdx] = true;
+                }
+            }
+        }
+        
+        mesh->needsGPUUpload = true;
+        
+        // Upload to GPU immediately
+        uploadMeshToGPU();
     }
 }
 
@@ -82,7 +173,6 @@ void VoxelChunk::setVoxelDataDirect(int x, int y, int z, uint8_t type)
         return;
     
     voxels[x + y * SIZE + z * SIZE * SIZE] = type;
-    meshDirty = true;  // Mark dirty for consistency, but no mesh generation happens
 }
 
 void VoxelChunk::setRawVoxelData(const uint8_t* data, uint32_t size)
@@ -94,7 +184,25 @@ void VoxelChunk::setRawVoxelData(const uint8_t* data, uint32_t size)
         return;
     }
     std::copy(data, data + size, voxels.begin());
-    meshDirty = true;
+    
+    // Scan for OBJ-type blocks (instanced models) and populate m_modelInstances
+    m_modelInstances.clear();
+    auto& registry = BlockTypeRegistry::getInstance();
+    
+    for (int z = 0; z < SIZE; ++z) {
+        for (int y = 0; y < SIZE; ++y) {
+            for (int x = 0; x < SIZE; ++x) {
+                uint8_t blockType = getVoxel(x, y, z);
+                if (blockType == BlockID::AIR) continue;
+                
+                const BlockTypeInfo* blockInfo = registry.getBlockType(blockType);
+                if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
+                    Vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+                    m_modelInstances[blockType].push_back(pos);
+                }
+            }
+        }
+    }
 }
 
 void VoxelChunk::setIslandContext(uint32_t islandID, const Vec3& chunkCoord)
@@ -129,188 +237,196 @@ void VoxelChunk::generateMesh(bool generateLighting)
         renderMesh = std::make_shared<VoxelMesh>();
     }
     
-    // Queue all regions for meshing through the unified queue system
+    // Queue entire chunk for meshing
     if (g_greedyMeshQueue) {
-        for (int i = 0; i < ChunkConfig::TOTAL_REGIONS; ++i) {
-            g_greedyMeshQueue->queueRegionMesh(this, i);
-        }
-    }
-    
-    meshDirty = false;
-    
-    // Enable incremental updates after first full mesh generation (client-only)
-    if (m_isClientChunk) {
-        m_incrementalUpdatesEnabled = true;
+        g_greedyMeshQueue->queueChunkMesh(this);
     }
 }
 
-// Generate mesh for a single region only (partial update)
-// Returns quads for this region - caller must merge into renderMesh (thread-safe)
-std::vector<QuadFace> VoxelChunk::generateMeshForRegion(int regionIndex)
+// Greedy meshing for a single face direction
+void VoxelChunk::greedyMeshFace(std::vector<QuadFace>& quads, int face)
 {
-    PROFILE_SCOPE("VoxelChunk::generateMeshForRegion");
+    // Face directions: 0=-Y, 1=+Y, 2=-Z, 3=+Z, 4=-X, 5=+X
+    // Process each face direction with proper axis mapping
     
-    std::vector<QuadFace> newQuads;
+    // Simpler approach: iterate through each voxel position and build greedy rectangles
+    // Use a visited mask to track which faces have been merged
+    std::vector<bool> visited(SIZE * SIZE * SIZE, false);
     
-    if (regionIndex < 0 || regionIndex >= ChunkConfig::TOTAL_REGIONS) {
-        std::cerr << "⚠️  Invalid region index: " << regionIndex << std::endl;
-        return newQuads;
-    }
-    
-    // Calculate region boundaries
-    int rx = regionIndex % ChunkConfig::REGIONS_PER_AXIS;
-    int ry = (regionIndex / ChunkConfig::REGIONS_PER_AXIS) % ChunkConfig::REGIONS_PER_AXIS;
-    int rz = regionIndex / (ChunkConfig::REGIONS_PER_AXIS * ChunkConfig::REGIONS_PER_AXIS);
-    
-    int minX = rx * ChunkConfig::REGION_SIZE;
-    int minY = ry * ChunkConfig::REGION_SIZE;
-    int minZ = rz * ChunkConfig::REGION_SIZE;
-    
-    int maxX = std::min(minX + ChunkConfig::REGION_SIZE, SIZE);
-    int maxY = std::min(minY + ChunkConfig::REGION_SIZE, SIZE);
-    int maxZ = std::min(minZ + ChunkConfig::REGION_SIZE, SIZE);
-    
-    // Early exit: Check if region has ANY solid voxels before doing expensive greedy meshing
-    bool hasAnySolidVoxels = false;
-    for (int z = minZ; z < maxZ && !hasAnySolidVoxels; ++z) {
-        for (int y = minY; y < maxY && !hasAnySolidVoxels; ++y) {
-            for (int x = minX; x < maxX && !hasAnySolidVoxels; ++x) {
-                if (isVoxelSolid(x, y, z)) {
-                    hasAnySolidVoxels = true;
+    for (int z = 0; z < SIZE; ++z)
+    {
+        for (int y = 0; y < SIZE; ++y)
+        {
+            for (int x = 0; x < SIZE; ++x)
+            {
+                if (!isVoxelSolid(x, y, z)) continue;
+                if (!isFaceExposed(x, y, z, face)) continue;
+                
+                int idx = x + y * SIZE + z * SIZE * SIZE;
+                if (visited[idx]) continue;
+                
+                uint8_t blockType = getVoxel(x, y, z);
+                
+                // Determine merge dimensions based on face direction
+                int width = 1;
+                int height = 1;
+                
+                // Expand width (horizontal for this face)
+                if (face == 0 || face == 1) // Y faces: expand in X direction
+                {
+                    while (x + width < SIZE)
+                    {
+                        int checkIdx = (x + width) + y * SIZE + z * SIZE * SIZE;
+                        if (visited[checkIdx]) break;
+                        if (!isVoxelSolid(x + width, y, z)) break;
+                        if (getVoxel(x + width, y, z) != blockType) break;
+                        if (!isFaceExposed(x + width, y, z, face)) break;
+                        ++width;
+                    }
+                    
+                    // Expand height (Z direction)
+                    bool canExpand = true;
+                    while (z + height < SIZE && canExpand)
+                    {
+                        for (int dx = 0; dx < width; ++dx)
+                        {
+                            int checkIdx = (x + dx) + y * SIZE + (z + height) * SIZE * SIZE;
+                            if (visited[checkIdx] ||
+                                !isVoxelSolid(x + dx, y, z + height) ||
+                                getVoxel(x + dx, y, z + height) != blockType ||
+                                !isFaceExposed(x + dx, y, z + height, face))
+                            {
+                                canExpand = false;
+                                break;
+                            }
+                        }
+                        if (canExpand) ++height;
+                    }
                 }
+                else if (face == 2 || face == 3) // Z faces: expand in X direction
+                {
+                    while (x + width < SIZE)
+                    {
+                        int checkIdx = (x + width) + y * SIZE + z * SIZE * SIZE;
+                        if (visited[checkIdx]) break;
+                        if (!isVoxelSolid(x + width, y, z)) break;
+                        if (getVoxel(x + width, y, z) != blockType) break;
+                        if (!isFaceExposed(x + width, y, z, face)) break;
+                        ++width;
+                    }
+                    
+                    // Expand height (Y direction)
+                    bool canExpand = true;
+                    while (y + height < SIZE && canExpand)
+                    {
+                        for (int dx = 0; dx < width; ++dx)
+                        {
+                            int checkIdx = (x + dx) + (y + height) * SIZE + z * SIZE * SIZE;
+                            if (visited[checkIdx] ||
+                                !isVoxelSolid(x + dx, y + height, z) ||
+                                getVoxel(x + dx, y + height, z) != blockType ||
+                                !isFaceExposed(x + dx, y + height, z, face))
+                            {
+                                canExpand = false;
+                                break;
+                            }
+                        }
+                        if (canExpand) ++height;
+                    }
+                }
+                else // X faces: expand in Z direction
+                {
+                    while (z + width < SIZE)
+                    {
+                        int checkIdx = x + y * SIZE + (z + width) * SIZE * SIZE;
+                        if (visited[checkIdx]) break;
+                        if (!isVoxelSolid(x, y, z + width)) break;
+                        if (getVoxel(x, y, z + width) != blockType) break;
+                        if (!isFaceExposed(x, y, z + width, face)) break;
+                        ++width;
+                    }
+                    
+                    // Expand height (Y direction)
+                    bool canExpand = true;
+                    while (y + height < SIZE && canExpand)
+                    {
+                        for (int dz = 0; dz < width; ++dz)
+                        {
+                            int checkIdx = x + (y + height) * SIZE + (z + dz) * SIZE * SIZE;
+                            if (visited[checkIdx] ||
+                                !isVoxelSolid(x, y + height, z + dz) ||
+                                getVoxel(x, y + height, z + dz) != blockType ||
+                                !isFaceExposed(x, y + height, z + dz, face))
+                            {
+                                canExpand = false;
+                                break;
+                            }
+                        }
+                        if (canExpand) ++height;
+                    }
+                }
+                
+                // Mark merged area as visited
+                if (face == 0 || face == 1) // Y faces
+                {
+                    for (int dz = 0; dz < height; ++dz)
+                        for (int dx = 0; dx < width; ++dx)
+                            visited[(x + dx) + y * SIZE + (z + dz) * SIZE * SIZE] = true;
+                }
+                else if (face == 2 || face == 3) // Z faces
+                {
+                    for (int dy = 0; dy < height; ++dy)
+                        for (int dx = 0; dx < width; ++dx)
+                            visited[(x + dx) + (y + dy) * SIZE + z * SIZE * SIZE] = true;
+                }
+                else // X faces
+                {
+                    for (int dy = 0; dy < height; ++dy)
+                        for (int dz = 0; dz < width; ++dz)
+                            visited[x + (y + dy) * SIZE + (z + dz) * SIZE * SIZE] = true;
+                }
+                
+                // Add merged quad
+                addQuad(quads, static_cast<float>(x), static_cast<float>(y),
+                       static_cast<float>(z), face, width, height, blockType);
             }
         }
     }
+}
+
+// Generate mesh for entire chunk - GREEDY MESHING with voxel-to-quad tracking
+std::vector<QuadFace> VoxelChunk::generateFullChunkMesh()
+{
+    PROFILE_SCOPE("VoxelChunk::generateFullChunkMesh");
     
-    if (!hasAnySolidVoxels) {
-        return newQuads;  // Empty region - no quads needed
+    auto startTime = std::chrono::high_resolution_clock::now();
+    
+    std::vector<QuadFace> quads;
+    quads.reserve(15000); // Pre-allocate for greedy meshing
+    
+    // Quick check: is chunk completely empty?
+    bool hasAnyVoxel = false;
+    for (int i = 0; i < VOLUME && !hasAnyVoxel; ++i) {
+        if (voxels[i] != 0) hasAnyVoxel = true;
     }
     
-    // Generate new quads for this region using greedy meshing (into LOCAL buffer)
+    if (!hasAnyVoxel) {
+        std::cout << "[MESH GEN] Chunk " << this << " is empty, skipping mesh generation" << std::endl;
+        return quads;
+    }
     
-    // Temp bitmask for greedy merging within this region
-    int regionSizeX = maxX - minX;
-    int regionSizeY = maxY - minY;
-    int regionSizeZ = maxZ - minZ;
-    std::vector<bool> merged(regionSizeX * regionSizeY * regionSizeZ, false);
-    
-    // Greedy meshing per face direction
+    // GREEDY MESHING - Process each face direction separately
     for (int face = 0; face < 6; ++face)
     {
-        merged.assign(regionSizeX * regionSizeY * regionSizeZ, false);
-        
-        // Determine sweep axes (same logic as full chunk)
-        int uAxis, vAxis, wAxis;
-        switch (face)
-        {
-            case 0: case 1: uAxis = 0; vAxis = 2; wAxis = 1; break;
-            case 2: case 3: uAxis = 0; vAxis = 1; wAxis = 2; break;
-            case 4: case 5: uAxis = 2; vAxis = 1; wAxis = 0; break;
-            default: continue;
-        }
-        
-        // Sweep through region slices
-        for (int w = 0; w < regionSizeZ; ++w)
-        {
-            for (int v = 0; v < regionSizeY; ++v)
-            {
-                for (int u = 0; u < regionSizeX; ++u)
-                {
-                    // Local region coords
-                    int rx, ry, rz;
-                    if (face <= 1) { rx = u; ry = w; rz = v; }
-                    else if (face <= 3) { rx = u; ry = v; rz = w; }
-                    else { rx = w; ry = v; rz = u; }
-                    
-                    // Global chunk coords
-                    int x = minX + rx;
-                    int y = minY + ry;
-                    int z = minZ + rz;
-                    
-                    int idx = rx + ry * regionSizeX + rz * regionSizeX * regionSizeY;
-                    if (merged[idx]) continue;
-                    if (!isVoxelSolid(x, y, z)) continue;
-                    if (!isFaceExposed(x, y, z, face)) continue;
-                    
-                    uint8_t blockType = getVoxel(x, y, z);
-                    
-                    // Greedy width expansion
-                    int width = 1;
-                    for (int du = u + 1; du < regionSizeX; ++du)
-                    {
-                        int xu = minX + (face <= 1 ? du : (face <= 3 ? du : rx));
-                        int yu = minY + (face <= 1 ? ry : (face <= 3 ? ry : v));
-                        int zu = minZ + (face <= 1 ? v : (face <= 3 ? w : du));
-                        
-                        int idxu = (face <= 1 ? du : (face <= 3 ? du : rx)) +
-                                   (face <= 1 ? ry : (face <= 3 ? ry : v)) * regionSizeX +
-                                   (face <= 1 ? v : (face <= 3 ? w : du)) * regionSizeX * regionSizeY;
-                        
-                        if (xu >= maxX || merged[idxu]) break;
-                        if (!isVoxelSolid(xu, yu, zu)) break;
-                        if (getVoxel(xu, yu, zu) != blockType) break;
-                        if (!isFaceExposed(xu, yu, zu, face)) break;
-                        
-                        width++;
-                    }
-                    
-                    // Greedy height expansion
-                    int height = 1;
-                    bool canExtendHeight = true;
-                    for (int dv = v + 1; dv < regionSizeY && canExtendHeight; ++dv)
-                    {
-                        for (int du = u; du < u + width; ++du)
-                        {
-                            int xv = minX + (face <= 1 ? du : (face <= 3 ? du : rx));
-                            int yv = minY + (face <= 1 ? ry : (face <= 3 ? dv : dv));
-                            int zv = minZ + (face <= 1 ? dv : (face <= 3 ? w : du));
-                            
-                            int idxv = (face <= 1 ? du : (face <= 3 ? du : rx)) +
-                                       (face <= 1 ? ry : (face <= 3 ? dv : dv)) * regionSizeX +
-                                       (face <= 1 ? dv : (face <= 3 ? w : du)) * regionSizeX * regionSizeY;
-                            
-                            if (yv >= maxY || zv >= maxZ || merged[idxv]) {
-                                canExtendHeight = false;
-                                break;
-                            }
-                            if (!isVoxelSolid(xv, yv, zv)) {
-                                canExtendHeight = false;
-                                break;
-                            }
-                            if (getVoxel(xv, yv, zv) != blockType) {
-                                canExtendHeight = false;
-                                break;
-                            }
-                            if (!isFaceExposed(xv, yv, zv, face)) {
-                                canExtendHeight = false;
-                                break;
-                            }
-                        }
-                        if (canExtendHeight) height++;
-                    }
-                    
-                    // Mark merged
-                    for (int dv = 0; dv < height; ++dv)
-                    {
-                        for (int du = 0; du < width; ++du)
-                        {
-                            int idxm = (face <= 1 ? u + du : (face <= 3 ? u + du : rx)) +
-                                       (face <= 1 ? ry : (face <= 3 ? v + dv : v + dv)) * regionSizeX +
-                                       (face <= 1 ? v + dv : (face <= 3 ? w : u + du)) * regionSizeX * regionSizeY;
-                            merged[idxm] = true;
-                        }
-                    }
-                    
-                    // Add merged quad with repeat textures
-                    addQuad(newQuads, static_cast<float>(x), static_cast<float>(y),
-                           static_cast<float>(z), face, width, height, blockType);
-                }
-            }
-        }
+        greedyMeshFace(quads, face);
     }
-    
-    // Return quads - caller will merge into renderMesh on main thread
-    return newQuads;
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+    std::cout << "[MESH GEN] Chunk " << this << " greedy meshed in " << duration.count() 
+              << "ms, generated " << quads.size() << " quads" << std::endl;
+
+    return quads;
 }
 
 int VoxelChunk::calculateLOD(const Vec3& cameraPos) const
@@ -362,6 +478,196 @@ bool VoxelChunk::isFaceExposed(int x, int y, int z, int face) const
     }
     
     return !isVoxelSolid(nx, ny, nz);
+}
+
+// ========================================
+// EXPLOSION SYSTEM - Direct quad manipulation
+// ========================================
+
+// Explode a greedy quad into individual 1x1 faces
+void VoxelChunk::explodeQuad(uint16_t quadIndex)
+{
+    auto mesh = getRenderMesh();
+    if (!mesh || quadIndex >= mesh->quads.size()) return;
+    
+    QuadFace& quad = mesh->quads[quadIndex];
+    
+    int width = static_cast<int>(quad.width);
+    int height = static_cast<int>(quad.height);
+    int face = quad.faceDir;
+    uint8_t blockType = quad.blockType;
+    
+    // Calculate base corner position from center position (reverse of addQuad)
+    int baseX, baseY, baseZ;
+    
+    switch (face)
+    {
+        case 0: // -Y (bottom): width=X, height=Z
+            baseX = static_cast<int>(quad.position.x - width * 0.5f);
+            baseY = static_cast<int>(quad.position.y);
+            baseZ = static_cast<int>(quad.position.z - height * 0.5f);
+            break;
+        case 1: // +Y (top): width=X, height=Z
+            baseX = static_cast<int>(quad.position.x - width * 0.5f);
+            baseY = static_cast<int>(quad.position.y - 1);
+            baseZ = static_cast<int>(quad.position.z - height * 0.5f);
+            break;
+        case 2: // -Z (back): width=X, height=Y
+            baseX = static_cast<int>(quad.position.x - width * 0.5f);
+            baseY = static_cast<int>(quad.position.y - height * 0.5f);
+            baseZ = static_cast<int>(quad.position.z);
+            break;
+        case 3: // +Z (front): width=X, height=Y
+            baseX = static_cast<int>(quad.position.x - width * 0.5f);
+            baseY = static_cast<int>(quad.position.y - height * 0.5f);
+            baseZ = static_cast<int>(quad.position.z - 1);
+            break;
+        case 4: // -X (left): width=Z, height=Y
+            baseX = static_cast<int>(quad.position.x);
+            baseY = static_cast<int>(quad.position.y - height * 0.5f);
+            baseZ = static_cast<int>(quad.position.z - width * 0.5f);
+            break;
+        case 5: // +X (right): width=Z, height=Y
+            baseX = static_cast<int>(quad.position.x - 1);
+            baseY = static_cast<int>(quad.position.y - height * 0.5f);
+            baseZ = static_cast<int>(quad.position.z - width * 0.5f);
+            break;
+        default:
+            return;
+    }
+    
+    // Mark original quad as deleted (set width/height to 0)
+    quad.width = 0;
+    quad.height = 0;
+    
+    // Create 1x1 replacement quads for each voxel that still exists
+    // Iterate based on face direction
+    if (face == 0 || face == 1) // Y faces: width=X, height=Z
+    {
+        for (int dz = 0; dz < height; ++dz)
+        {
+            for (int dx = 0; dx < width; ++dx)
+            {
+                int vx = baseX + dx;
+                int vy = baseY;
+                int vz = baseZ + dz;
+                
+                if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                {
+                    if (isVoxelSolid(vx, vy, vz) && isFaceExposed(vx, vy, vz, face))
+                    {
+                        uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
+                        addQuad(mesh->quads, static_cast<float>(vx), static_cast<float>(vy),
+                               static_cast<float>(vz), face, 1, 1, blockType);
+                        
+                        int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                        uint32_t key = voxelIdx * 6 + face;
+                        mesh->voxelFaceToQuadIndex[key] = newQuadIdx;
+                        mesh->isExploded[voxelIdx] = true;
+                    }
+                }
+            }
+        }
+    }
+    else if (face == 2 || face == 3) // Z faces: width=X, height=Y
+    {
+        for (int dy = 0; dy < height; ++dy)
+        {
+            for (int dx = 0; dx < width; ++dx)
+            {
+                int vx = baseX + dx;
+                int vy = baseY + dy;
+                int vz = baseZ;
+                
+                if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                {
+                    if (isVoxelSolid(vx, vy, vz) && isFaceExposed(vx, vy, vz, face))
+                    {
+                        uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
+                        addQuad(mesh->quads, static_cast<float>(vx), static_cast<float>(vy),
+                               static_cast<float>(vz), face, 1, 1, blockType);
+                        
+                        int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                        uint32_t key = voxelIdx * 6 + face;
+                        mesh->voxelFaceToQuadIndex[key] = newQuadIdx;
+                        mesh->isExploded[voxelIdx] = true;
+                    }
+                }
+            }
+        }
+    }
+    else // X faces: width=Z, height=Y
+    {
+        for (int dy = 0; dy < height; ++dy)
+        {
+            for (int dz = 0; dz < width; ++dz)
+            {
+                int vx = baseX;
+                int vy = baseY + dy;
+                int vz = baseZ + dz;
+                
+                if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                {
+                    if (isVoxelSolid(vx, vy, vz) && isFaceExposed(vx, vy, vz, face))
+                    {
+                        uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
+                        addQuad(mesh->quads, static_cast<float>(vx), static_cast<float>(vy),
+                               static_cast<float>(vz), face, 1, 1, blockType);
+                        
+                        int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                        uint32_t key = voxelIdx * 6 + face;
+                        mesh->voxelFaceToQuadIndex[key] = newQuadIdx;
+                        mesh->isExploded[voxelIdx] = true;
+                    }
+                }
+            }
+        }
+    }
+    
+    mesh->needsGPUUpload = true;
+}
+
+// Add simple 1x1 faces for a newly placed voxel
+void VoxelChunk::addSimpleFacesForVoxel(int x, int y, int z)
+{
+    auto mesh = getRenderMesh();
+    if (!mesh) return;
+    
+    if (!isVoxelSolid(x, y, z)) return;
+    
+    uint8_t blockType = getVoxel(x, y, z);
+    int voxelIdx = x + y * SIZE + z * SIZE * SIZE;
+    
+    // Add 1x1 face for each exposed direction
+    for (int face = 0; face < 6; ++face)
+    {
+        if (isFaceExposed(x, y, z, face))
+        {
+            uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
+            addQuad(mesh->quads, static_cast<float>(x), static_cast<float>(y),
+                   static_cast<float>(z), face, 1, 1, blockType);
+            
+            uint32_t key = voxelIdx * 6 + face;
+            mesh->voxelFaceToQuadIndex[key] = newQuadIdx;
+        }
+    }
+    
+    mesh->isExploded[voxelIdx] = true;
+    mesh->needsGPUUpload = true;
+}
+
+// Upload mesh to GPU immediately
+void VoxelChunk::uploadMeshToGPU()
+{
+    auto mesh = getRenderMesh();
+    if (!mesh || !m_isClientChunk) return;
+    
+    // Trigger GPU upload via renderer
+    extern std::unique_ptr<InstancedQuadRenderer> g_instancedQuadRenderer;
+    if (g_instancedQuadRenderer)
+    {
+        g_instancedQuadRenderer->uploadChunkMesh(this);
+    }
 }
 
 // Model instance management (for BlockRenderType::OBJ blocks)
@@ -429,86 +735,7 @@ void VoxelChunk::addQuad(std::vector<QuadFace>& quads, float x, float y, float z
     quads.push_back(quadFace);
 }
 
-// ========================================
-// REGION-BASED DIRTY TRACKING
-// ========================================
 
-void VoxelChunk::markRegionDirty(int regionIndex)
-{
-    if (regionIndex < 0 || regionIndex >= ChunkConfig::TOTAL_REGIONS)
-        return;
-    
-    if (!m_regionDirtyFlags[regionIndex]) {
-        m_regionDirtyFlags[regionIndex] = true;
-        m_dirtyRegions.push_back(regionIndex);
-    }
-}
-
-void VoxelChunk::markRegionDirtyAtVoxel(int x, int y, int z)
-{
-    if (x < 0 || x >= SIZE || y < 0 || y >= SIZE || z < 0 || z >= SIZE)
-        return;
-    
-    int regionIndex = ChunkConfig::voxelToRegionIndex(x, y, z);
-    markRegionDirty(regionIndex);
-    
-    // Also mark neighbor regions if on boundary
-    // This ensures proper face culling across region boundaries
-    if (x % ChunkConfig::REGION_SIZE == 0 && x > 0) {
-        int neighborIndex = ChunkConfig::voxelToRegionIndex(x - 1, y, z);
-        markRegionDirty(neighborIndex);
-    }
-    if ((x + 1) % ChunkConfig::REGION_SIZE == 0 && x < SIZE - 1) {
-        int neighborIndex = ChunkConfig::voxelToRegionIndex(x + 1, y, z);
-        markRegionDirty(neighborIndex);
-    }
-    
-    if (y % ChunkConfig::REGION_SIZE == 0 && y > 0) {
-        int neighborIndex = ChunkConfig::voxelToRegionIndex(x, y - 1, z);
-        markRegionDirty(neighborIndex);
-    }
-    if ((y + 1) % ChunkConfig::REGION_SIZE == 0 && y < SIZE - 1) {
-        int neighborIndex = ChunkConfig::voxelToRegionIndex(x, y + 1, z);
-        markRegionDirty(neighborIndex);
-    }
-    
-    if (z % ChunkConfig::REGION_SIZE == 0 && z > 0) {
-        int neighborIndex = ChunkConfig::voxelToRegionIndex(x, y, z - 1);
-        markRegionDirty(neighborIndex);
-    }
-    if ((z + 1) % ChunkConfig::REGION_SIZE == 0 && z < SIZE - 1) {
-        int neighborIndex = ChunkConfig::voxelToRegionIndex(x, y, z + 1);
-        markRegionDirty(neighborIndex);
-    }
-}
-
-bool VoxelChunk::isRegionDirty(int regionIndex) const
-{
-    if (regionIndex < 0 || regionIndex >= ChunkConfig::TOTAL_REGIONS)
-        return false;
-    
-    return m_regionDirtyFlags[regionIndex];
-}
-
-void VoxelChunk::clearAllRegionDirtyFlags()
-{
-    m_regionDirtyFlags.fill(false);
-    m_dirtyRegions.clear();
-}
-
-void VoxelChunk::processDirtyRegions()
-{
-    // Queue all dirty regions for remeshing via GreedyMeshQueue
-    // This is called by the renderer callback when mesh changes occur
-    if (!g_greedyMeshQueue) return;
-    
-    for (int regionIndex : m_dirtyRegions) {
-        g_greedyMeshQueue->queueRegionMesh(this, regionIndex);
-    }
-    
-    // Clear dirty flags after queuing
-    clearAllRegionDirtyFlags();
-}
 
 
 

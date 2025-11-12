@@ -62,27 +62,44 @@ void Frustum::extractFromMatrix(const glm::mat4& vp)
 
 bool Frustum::intersectsAABB(const Vec3& minBounds, const Vec3& maxBounds) const
 {
-    // Test AABB against all 6 planes
-    // If AABB is completely outside any plane, it's culled
     for (int i = 0; i < 6; ++i)
     {
         const glm::vec4& plane = m_planes[i];
         
-        // Find the positive vertex (furthest point in direction of plane normal)
         Vec3 positiveVertex(
             plane.x > 0 ? maxBounds.x : minBounds.x,
             plane.y > 0 ? maxBounds.y : minBounds.y,
             plane.z > 0 ? maxBounds.z : minBounds.z
         );
         
-        // If positive vertex is outside plane, AABB is completely outside
         if (distanceToPlane(plane, positiveVertex) < 0)
         {
-            return false;  // AABB is outside this plane
+            return false;
         }
     }
     
-    return true;  // AABB intersects or is inside frustum
+    return true;
+}
+
+bool Frustum::fullyContainsAABB(const Vec3& minBounds, const Vec3& maxBounds) const
+{
+    for (int i = 0; i < 6; ++i)
+    {
+        const glm::vec4& plane = m_planes[i];
+        
+        Vec3 negativeVertex(
+            plane.x > 0 ? minBounds.x : maxBounds.x,
+            plane.y > 0 ? minBounds.y : maxBounds.y,
+            plane.z > 0 ? minBounds.z : maxBounds.z
+        );
+        
+        if (distanceToPlane(plane, negativeVertex) < 0)
+        {
+            return false;
+        }
+    }
+    
+    return true;
 }
 
 bool Frustum::intersectsSphere(const Vec3& center, float radius) const

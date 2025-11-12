@@ -215,10 +215,19 @@ bool GameClient::update(float deltaTime)
         m_networkManager->update();
     }
 
-    // Process mesh generation queue (processes up to 64 regions per frame)
+    // Process mesh generation queue (processes up to 128 chunks per frame for faster updates)
     if (g_greedyMeshQueue)
     {
-        g_greedyMeshQueue->processQueue(64);
+        int processed = g_greedyMeshQueue->processQueue(128);
+        if (processed > 0) {
+            std::cout << "[GAME CLIENT] Processed " << processed << " mesh(es) this frame" << std::endl;
+        }
+    } else {
+        static bool warnedOnce = false;
+        if (!warnedOnce) {
+            std::cout << "[GAME CLIENT] WARNING: No mesh queue available in update loop!" << std::endl;
+            warnedOnce = true;
+        }
     }
 
     // Update client-side physics for smooth island movement
@@ -909,10 +918,9 @@ void GameClient::renderWorld()
         
         glm::mat4 viewProjection = projectionMatrix * viewMatrix;
         
-        // Render voxel quads to G-buffer (frustum culled)
         if (g_instancedQuadRenderer)
         {
-            g_instancedQuadRenderer->renderToGBufferCulled(viewProjection, viewMatrix, visibleChunks);
+            g_instancedQuadRenderer->renderToGBufferCulledMDI(viewProjection, viewMatrix, visibleChunks);
         }
         
         // Render GLB models to G-buffer (frustum culled)
@@ -1116,11 +1124,10 @@ void GameClient::renderShadowPass(const std::vector<VoxelChunk*>& visibleChunks)
             // Begin light map rendering (clears depth buffer, sets up FBO)
             g_shadowMap.begin(cascadeIdx);
             
-            // Render voxels into light map (they block light!) - use frustum culled chunks
             if (g_instancedQuadRenderer)
             {
                 g_instancedQuadRenderer->beginDepthPass(lightVP, cascadeIdx);
-                g_instancedQuadRenderer->renderDepthCulled(visibleChunks);
+                g_instancedQuadRenderer->renderDepthCulledMDI(visibleChunks);
                 g_instancedQuadRenderer->endDepthPass(m_windowWidth, m_windowHeight);
             }
             
@@ -1383,12 +1390,7 @@ void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& p
             // Apply the voxel data directly - this replaces any procedural generation
             chunk->setRawVoxelData(voxelData, dataSize);
             
-            // Queue all regions through unified pipeline
-            if (g_greedyMeshQueue) {
-                g_greedyMeshQueue->queueFullChunkMesh(chunk);
-            }
-            
-            // Register chunk with renderer
+            // Register chunk with renderer (will queue mesh generation)
             registerChunkWithRenderer(chunk, island, originChunk);
         }
         else
@@ -1446,16 +1448,29 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
 
     if (chunk)
     {
+        std::cout << "[CHUNK LOAD] Received chunk (" << chunkCoord.x << "," << chunkCoord.y << "," << chunkCoord.z 
+                  << ") for island " << islandID << ", data size: " << dataSize << " bytes" << std::endl;
+        
         // Apply the voxel data directly
         chunk->setRawVoxelData(voxelData, dataSize);
+        std::cout << "[CHUNK LOAD] Voxel data applied to chunk" << std::endl;
         
-        // IMMEDIATELY register chunk with renderer (callback must be set before any modifications)
-        registerChunkWithRenderer(chunk, island, chunkCoord);
+        // Register chunk with renderer
+        if (g_instancedQuadRenderer) {
+            glm::mat4 chunkTransform = island->getChunkTransform(chunkCoord);
+            g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+            std::cout << "[CHUNK LOAD] Chunk registered with renderer" << std::endl;
+        } else {
+            std::cout << "[CHUNK LOAD] ERROR: No renderer available!" << std::endl;
+        }
         
-        // Queue mesh generation (will update the already-registered chunk)
+        // Queue mesh generation for entire chunk
         if (g_greedyMeshQueue)
         {
-            g_greedyMeshQueue->queueFullChunkMesh(chunk);
+            g_greedyMeshQueue->queueChunkMesh(chunk);
+            std::cout << "[CHUNK LOAD] Chunk queued for meshing" << std::endl;
+        } else {
+            std::cout << "[CHUNK LOAD] ERROR: No mesh queue available!" << std::endl;
         }
     }
     else
@@ -1507,9 +1522,7 @@ void GameClient::handleVoxelChangeReceived(const VoxelChangeUpdate& update)
         m_clientWorld->getIslandSystem()->setVoxelWithMesh(
             update.islandID, update.localPos, update.voxelType);
     }
-    // Incremental updates already handled by setVoxel() - no need to queue mesh generation!
-    // The quad modifications are immediate and GPU upload happens on next render frame.
-
+    
     // **FIXED**: Always force immediate raycast update when server sends voxel changes
     // This ensures block selection is immediately accurate after server updates
     m_inputState.cachedTargetBlock = VoxelRaycaster::raycast(
@@ -1573,6 +1586,7 @@ void GameClient::handleEntityStateUpdate(const EntityStateUpdate& update)
 
                     // Mark for physics update synchronization
                     island->needsPhysicsUpdate = true;
+                    island->invalidateTransform();
                 }
             }
             break;

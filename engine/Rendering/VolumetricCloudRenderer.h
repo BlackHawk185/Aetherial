@@ -64,19 +64,13 @@ private:
     bool createGeometry();
     bool create3DNoiseTexture();
     
-    // Noise cache helpers
-    bool loadNoiseTextureFromCache();
-    bool saveNoiseTextureToCache(const std::vector<unsigned char>& data, int size);
-    std::vector<unsigned char> generateNoiseData(int size);
-    
     void updateUniforms(const glm::vec3& sunDirection, float sunIntensity,
                        const glm::vec3& cameraPosition,
                        const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix,
                        float timeOfDay);
 
-    // Noise generation helpers
+    // CPU-side Perlin noise for shadow map sampling
     float perlinNoise3D(float x, float y, float z);
-    float worleyNoise3D(float x, float y, float z);
 
     // OpenGL objects
     GLuint m_shader = 0;

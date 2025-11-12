@@ -19,6 +19,9 @@ public:
     // Returns true if AABB is fully or partially inside frustum
     bool intersectsAABB(const Vec3& minBounds, const Vec3& maxBounds) const;
     
+    // Test if AABB is fully inside frustum (for early-out optimization)
+    bool fullyContainsAABB(const Vec3& minBounds, const Vec3& maxBounds) const;
+    
     // Test if sphere intersects frustum (for island/cloud culling)
     // Returns true if sphere is fully or partially inside frustum
     bool intersectsSphere(const Vec3& center, float radius) const;

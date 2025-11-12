@@ -1,7 +1,9 @@
 // GreedyMeshQueue.cpp - Multi-threaded region mesh generation
 #include "GPUMeshQueue.h"
+#include "InstancedQuadRenderer.h"
 #include "../Profiling/Profiler.h"
 #include <iostream>
+#include <unordered_set>
 
 // Global instance
 std::unique_ptr<GreedyMeshQueue> g_greedyMeshQueue = nullptr;
@@ -11,7 +13,7 @@ GreedyMeshQueue::GreedyMeshQueue()
     // Spawn worker threads (leave 2 cores for main thread and other work)
     int numThreads = std::max(2, static_cast<int>(std::thread::hardware_concurrency()) - 2);
     
-    std::cout << "[GREEDY MESH] Starting " << numThreads << " worker threads for region meshing" << std::endl;
+    std::cout << "[GREEDY MESH] Starting " << numThreads << " worker threads for chunk meshing" << std::endl;
     
     for (int i = 0; i < numThreads; ++i) {
         m_workers.emplace_back(&GreedyMeshQueue::workerThreadFunc, this);
@@ -34,29 +36,22 @@ GreedyMeshQueue::~GreedyMeshQueue()
     std::cout << "[GREEDY MESH] Shut down " << m_workers.size() << " worker threads" << std::endl;
 }
 
-void GreedyMeshQueue::queueFullChunkMesh(VoxelChunk* chunk)
+void GreedyMeshQueue::queueChunkMesh(VoxelChunk* chunk)
 {
-    if (!chunk) return;
-    
-    // Queue all regions for parallel processing
-    {
-        std::lock_guard<std::mutex> lock(m_jobQueueMutex);
-        for (int i = 0; i < ChunkConfig::TOTAL_REGIONS; ++i) {
-            m_jobQueue.push({chunk, i});
-        }
+    if (!chunk) {
+        std::cout << "[MESH QUEUE] WARNING: Attempted to queue null chunk!" << std::endl;
+        return;
     }
     
-    // Wake up all worker threads
-    m_jobQueueCV.notify_all();
-}
-
-void GreedyMeshQueue::queueRegionMesh(VoxelChunk* chunk, int regionIndex)
-{
-    if (!chunk) return;
-    
     {
         std::lock_guard<std::mutex> lock(m_jobQueueMutex);
-        m_jobQueue.push({chunk, regionIndex});
+        auto result = m_jobQueue.insert(chunk);
+        if (result.second) {
+            std::cout << "[MESH QUEUE] Chunk " << chunk << " queued for meshing. Queue size: " 
+                      << m_jobQueue.size() << std::endl;
+        } else {
+            std::cout << "[MESH QUEUE] Chunk " << chunk << " already in queue (deduplicated)" << std::endl;
+        }
     }
     
     m_jobQueueCV.notify_one();
@@ -68,10 +63,10 @@ int GreedyMeshQueue::processQueue(int maxItemsPerFrame)
     
     int itemsProcessed = 0;
     
-    // Upload completed region meshes to GPU
+    // Process completed chunk meshes and upload to GPU
     while (itemsProcessed < maxItemsPerFrame)
     {
-        RegionMeshResult result;
+        ChunkMeshResult result;
         
         {
             std::lock_guard<std::mutex> lock(m_completedQueueMutex);
@@ -79,11 +74,17 @@ int GreedyMeshQueue::processQueue(int maxItemsPerFrame)
             
             result = std::move(m_completedQueue.front());
             m_completedQueue.pop();
+            std::cout << "[MESH QUEUE] Processing completed mesh for chunk " << result.chunk 
+                      << ". Remaining in queue: " << m_completedQueue.size() << std::endl;
         }
         
-        uploadRegionMesh(result);
+        uploadChunkMesh(result);
         
         itemsProcessed++;
+    }
+    
+    if (itemsProcessed > 0) {
+        std::cout << "[MESH QUEUE] Processed " << itemsProcessed << " mesh(es) this frame" << std::endl;
     }
     
     return itemsProcessed;
@@ -93,7 +94,7 @@ void GreedyMeshQueue::workerThreadFunc()
 {
     while (true)
     {
-        RegionMeshRequest job;
+        VoxelChunk* chunk = nullptr;
         
         // Wait for work
         {
@@ -104,79 +105,187 @@ void GreedyMeshQueue::workerThreadFunc()
             
             if (m_jobQueue.empty()) continue;
             
-            job = std::move(m_jobQueue.front());
-            m_jobQueue.pop();
+            // Pop from set (grab any element)
+            auto it = m_jobQueue.begin();
+            chunk = *it;
+            m_jobQueue.erase(it);
         }
         
-        // Generate mesh for this region (CPU only, no GPU calls)
-        RegionMeshResult result;
-        result.chunk = job.chunk;
-        result.regionIndex = job.regionIndex;
+        std::cout << "[MESH WORKER] Starting mesh generation for chunk " << chunk << std::endl;
         
-        // Call the region meshing function (returns quads in local buffer - thread-safe)
-        result.quads = job.chunk->generateMeshForRegion(job.regionIndex);
+        // Generate mesh for entire chunk
+        ChunkMeshResult result;
+        result.chunk = chunk;
+        result.quads = chunk->generateFullChunkMesh();
         
-        // Only push non-empty regions to completed queue (skip empty regions entirely)
-        if (!result.quads.empty())
+        std::cout << "[MESH WORKER] Completed mesh generation for chunk " << chunk 
+                  << " - Generated " << result.quads.size() << " quads" << std::endl;
+        
+        // Push to completed queue
         {
             std::lock_guard<std::mutex> lock(m_completedQueueMutex);
             m_completedQueue.push(std::move(result));
+            std::cout << "[MESH WORKER] Pushed to completed queue. Completed queue size: " 
+                      << m_completedQueue.size() << std::endl;
         }
     }
 }
 
-void GreedyMeshQueue::uploadRegionMesh(const RegionMeshResult& result)
+void GreedyMeshQueue::uploadChunkMesh(const ChunkMeshResult& result)
 {
-    PROFILE_SCOPE("GreedyMeshQueue::uploadRegionMesh");
+    PROFILE_SCOPE("GreedyMeshQueue::uploadChunkMesh");
     
-    if (!result.chunk || !result.chunk->isClient()) return;
+    if (!result.chunk) {
+        std::cout << "[MESH UPLOAD] ERROR: Null chunk in result!" << std::endl;
+        return;
+    }
+    
+    if (!result.chunk->isClient()) {
+        std::cout << "[MESH UPLOAD] Skipping server-side chunk " << result.chunk << std::endl;
+        return;
+    }
+    
+    std::cout << "[MESH UPLOAD] Uploading mesh for chunk " << result.chunk 
+              << " with " << result.quads.size() << " quads" << std::endl;
     
     // Get or create render mesh
     auto mesh = result.chunk->getRenderMesh();
     if (!mesh) {
         mesh = std::make_shared<VoxelMesh>();
         result.chunk->setRenderMesh(mesh);
+        std::cout << "[MESH UPLOAD] Created new VoxelMesh for chunk" << std::endl;
     }
     
-    // Calculate region boundaries for removal
-    int rx = result.regionIndex % ChunkConfig::REGIONS_PER_AXIS;
-    int ry = (result.regionIndex / ChunkConfig::REGIONS_PER_AXIS) % ChunkConfig::REGIONS_PER_AXIS;
-    int rz = result.regionIndex / (ChunkConfig::REGIONS_PER_AXIS * ChunkConfig::REGIONS_PER_AXIS);
+    // Store quads directly
+    mesh->quads = result.quads;
+    mesh->needsGPUUpload = true;
     
-    int minX = rx * ChunkConfig::REGION_SIZE;
-    int minY = ry * ChunkConfig::REGION_SIZE;
-    int minZ = rz * ChunkConfig::REGION_SIZE;
+    // Populate voxel-to-quad tracking by scanning all quads
+    mesh->voxelFaceToQuadIndex.clear();
+    mesh->isExploded.assign(VoxelChunk::VOLUME, false);
     
-    int maxX = std::min(minX + ChunkConfig::REGION_SIZE, VoxelChunk::SIZE);
-    int maxY = std::min(minY + ChunkConfig::REGION_SIZE, VoxelChunk::SIZE);
-    int maxZ = std::min(minZ + ChunkConfig::REGION_SIZE, VoxelChunk::SIZE);
+    for (size_t quadIdx = 0; quadIdx < mesh->quads.size(); ++quadIdx)
+    {
+        const QuadFace& quad = mesh->quads[quadIdx];
+        int width = static_cast<int>(quad.width);
+        int height = static_cast<int>(quad.height);
+        int face = quad.faceDir;
+        
+        // Calculate base corner position from center (reverse of addQuad logic)
+        int baseX, baseY, baseZ;
+        
+        switch (face)
+        {
+            case 0: // -Y (bottom): width=X, height=Z
+                baseX = static_cast<int>(quad.position.x - width * 0.5f);
+                baseY = static_cast<int>(quad.position.y);
+                baseZ = static_cast<int>(quad.position.z - height * 0.5f);
+                break;
+            case 1: // +Y (top): width=X, height=Z
+                baseX = static_cast<int>(quad.position.x - width * 0.5f);
+                baseY = static_cast<int>(quad.position.y - 1);
+                baseZ = static_cast<int>(quad.position.z - height * 0.5f);
+                break;
+            case 2: // -Z (back): width=X, height=Y
+                baseX = static_cast<int>(quad.position.x - width * 0.5f);
+                baseY = static_cast<int>(quad.position.y - height * 0.5f);
+                baseZ = static_cast<int>(quad.position.z);
+                break;
+            case 3: // +Z (front): width=X, height=Y
+                baseX = static_cast<int>(quad.position.x - width * 0.5f);
+                baseY = static_cast<int>(quad.position.y - height * 0.5f);
+                baseZ = static_cast<int>(quad.position.z - 1);
+                break;
+            case 4: // -X (left): width=Z, height=Y
+                baseX = static_cast<int>(quad.position.x);
+                baseY = static_cast<int>(quad.position.y - height * 0.5f);
+                baseZ = static_cast<int>(quad.position.z - width * 0.5f);
+                break;
+            case 5: // +X (right): width=Z, height=Y
+                baseX = static_cast<int>(quad.position.x - 1);
+                baseY = static_cast<int>(quad.position.y - height * 0.5f);
+                baseZ = static_cast<int>(quad.position.z - width * 0.5f);
+                break;
+            default:
+                continue; // Invalid face direction
+        }
+        
+        // Map all voxels covered by this quad based on face direction
+        if (face == 0 || face == 1) // Y faces: width=X, height=Z
+        {
+            for (int dz = 0; dz < height; ++dz)
+            {
+                for (int dx = 0; dx < width; ++dx)
+                {
+                    int vx = baseX + dx;
+                    int vy = baseY;
+                    int vz = baseZ + dz;
+                    
+                    if (vx >= 0 && vx < VoxelChunk::SIZE && 
+                        vy >= 0 && vy < VoxelChunk::SIZE && 
+                        vz >= 0 && vz < VoxelChunk::SIZE)
+                    {
+                        int voxelIdx = vx + vy * VoxelChunk::SIZE + vz * VoxelChunk::SIZE * VoxelChunk::SIZE;
+                        uint32_t key = voxelIdx * 6 + face;
+                        mesh->voxelFaceToQuadIndex[key] = static_cast<uint16_t>(quadIdx);
+                    }
+                }
+            }
+        }
+        else if (face == 2 || face == 3) // Z faces: width=X, height=Y
+        {
+            for (int dy = 0; dy < height; ++dy)
+            {
+                for (int dx = 0; dx < width; ++dx)
+                {
+                    int vx = baseX + dx;
+                    int vy = baseY + dy;
+                    int vz = baseZ;
+                    
+                    if (vx >= 0 && vx < VoxelChunk::SIZE && 
+                        vy >= 0 && vy < VoxelChunk::SIZE && 
+                        vz >= 0 && vz < VoxelChunk::SIZE)
+                    {
+                        int voxelIdx = vx + vy * VoxelChunk::SIZE + vz * VoxelChunk::SIZE * VoxelChunk::SIZE;
+                        uint32_t key = voxelIdx * 6 + face;
+                        mesh->voxelFaceToQuadIndex[key] = static_cast<uint16_t>(quadIdx);
+                    }
+                }
+            }
+        }
+        else // X faces: width=Z, height=Y
+        {
+            for (int dy = 0; dy < height; ++dy)
+            {
+                for (int dz = 0; dz < width; ++dz)
+                {
+                    int vx = baseX;
+                    int vy = baseY + dy;
+                    int vz = baseZ + dz;
+                    
+                    if (vx >= 0 && vx < VoxelChunk::SIZE && 
+                        vy >= 0 && vy < VoxelChunk::SIZE && 
+                        vz >= 0 && vz < VoxelChunk::SIZE)
+                    {
+                        int voxelIdx = vx + vy * VoxelChunk::SIZE + vz * VoxelChunk::SIZE * VoxelChunk::SIZE;
+                        uint32_t key = voxelIdx * 6 + face;
+                        mesh->voxelFaceToQuadIndex[key] = static_cast<uint16_t>(quadIdx);
+                    }
+                }
+            }
+        }
+    }
     
-    // Remove old quads from this region (main thread only - safe)
-    auto& quads = mesh->quads;
-    quads.erase(
-        std::remove_if(quads.begin(), quads.end(), [&](const QuadFace& quad) {
-            int qx = static_cast<int>(quad.position.x);
-            int qy = static_cast<int>(quad.position.y);
-            int qz = static_cast<int>(quad.position.z);
-            
-            // Adjust for face offset to get actual voxel coords
-            int face = quad.faceDir;
-            if (face == 1) qy--;       // Top face
-            else if (face == 3) qz--;  // Front face
-            else if (face == 5) qx--;  // Right face
-            
-            return (qx >= minX && qx < maxX &&
-                    qy >= minY && qy < maxY &&
-                    qz >= minZ && qz < maxZ);
-        }),
-        quads.end()
-    );
+    std::cout << "[MESH UPLOAD] Stored " << mesh->quads.size() << " quads in mesh, populated tracking" << std::endl;
     
-    // Append new quads from worker thread
-    quads.insert(quads.end(), result.quads.begin(), result.quads.end());
-    
-    // Trigger callback to signal mesh is ready for GPU upload
-    result.chunk->triggerMeshUpdateCallback();
+    // Upload to GPU
+    extern std::unique_ptr<InstancedQuadRenderer> g_instancedQuadRenderer;
+    if (g_instancedQuadRenderer) {
+        g_instancedQuadRenderer->uploadChunkMesh(result.chunk);
+        std::cout << "[MESH UPLOAD] Triggered GPU upload via renderer" << std::endl;
+    } else {
+        std::cout << "[MESH UPLOAD] ERROR: No renderer available for GPU upload!" << std::endl;
+    }
 }
 
 bool GreedyMeshQueue::hasPendingWork() const
@@ -197,9 +306,7 @@ void GreedyMeshQueue::clear()
 {
     {
         std::lock_guard<std::mutex> lock(m_jobQueueMutex);
-        while (!m_jobQueue.empty()) {
-            m_jobQueue.pop();
-        }
+        m_jobQueue.clear();
     }
     
     {

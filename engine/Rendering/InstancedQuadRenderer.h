@@ -5,6 +5,7 @@
 #include <glad/gl.h>
 #include <glm/glm.hpp>
 #include <vector>
+#include <unordered_map>
 #include <cstdint>
 
 class VoxelChunk;
@@ -20,18 +21,21 @@ public:
     
     // Register a chunk for instanced rendering
     void registerChunk(VoxelChunk* chunk, const glm::mat4& transform);
+    void registerChunkWithSize(VoxelChunk* chunk, const glm::mat4& transform, size_t estimatedQuads);
     
     // Update chunk transform (for moving islands)
     void updateChunkTransform(VoxelChunk* chunk, const glm::mat4& transform);
     
-    // Render to G-buffer (deferred rendering - geometry only, lighting applied later)
-    void renderToGBuffer(const glm::mat4& viewProjection, const glm::mat4& view);
-    void renderToGBufferCulled(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks);
+    void uploadChunkMesh(VoxelChunk* chunk);
     
-    // Shadow depth pass (for casting shadows)
+    void renderToGBufferMDI(const glm::mat4& viewProjection, const glm::mat4& view);
+    void renderToGBufferCulledMDI(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks);
+    void renderToGBufferCulledMDI_GPU(const glm::mat4& viewProjection, const glm::mat4& view);
+    
     void beginDepthPass(const glm::mat4& lightVP, int cascadeIndex);
-    void renderDepth();
-    void renderDepthCulled(const std::vector<VoxelChunk*>& visibleChunks);
+    void renderDepthMDI();
+    void renderDepthCulledMDI(const std::vector<VoxelChunk*>& visibleChunks);
+    void renderDepthCulledMDI_GPU(const glm::mat4& viewProjection);
     void endDepthPass(int screenWidth, int screenHeight);
     
     // Clear all registered chunks
@@ -43,14 +47,12 @@ private:
     GLuint m_unitQuadVBO;
     GLuint m_unitQuadEBO;
     
-    // G-buffer shader (deferred rendering - writes geometry data only)
-    GLuint m_gbufferProgram;
-    GLint m_gbuffer_uViewProjection;
-    GLint m_gbuffer_uBlockTextures;
+    GLuint m_gbufferMDIProgram;
+    GLint m_gbufferMDI_uViewProjection;
+    GLint m_gbufferMDI_uBlockTextures;
     
-    // Depth-only shader for shadow map rendering
-    GLuint m_depthProgram;
-    GLint m_depth_uLightVP;
+    GLuint m_depthMDIProgram;
+    GLint m_depthMDI_uLightVP;
     
     // MDI: DrawElementsIndirectCommand structure
     struct DrawElementsIndirectCommand {
@@ -61,26 +63,49 @@ private:
         uint32_t baseInstance;  // Starting instance for this draw
     };
     
-    // Chunk registration
     struct ChunkEntry {
         VoxelChunk* chunk;
         glm::mat4 transform;
         size_t instanceCount;
-        size_t baseInstance;    // Offset into merged instance buffer
-        size_t allocatedSlots;  // Pre-allocated buffer space for this chunk
+        GLuint vbo = 0;
+        size_t lastUploadedCount = 0;
+        uint32_t chunkID = 0;
+        uint32_t baseInstance = 0;  // Offset into unified instance buffer (in quads, not bytes)
+        size_t allocatedSlots = 0;   // Number of slots reserved for this chunk (with padding)
+        bool needsGPUSync = false;
     };
     
     std::vector<ChunkEntry> m_chunks;
+    std::unordered_map<VoxelChunk*, size_t> m_chunkToIndex;
     
-    // MDI buffers
-    GLuint m_globalVAO;              // Single VAO for all chunks
-    GLuint m_globalInstanceVBO;      // Merged instance data for all chunks
-    GLuint m_indirectCommandBuffer;  // GPU buffer for draw commands
-    GLuint m_transformSSBO;          // Chunk transforms for shader lookup
-    GLuint m_blockTextureArray;      // Texture array for all blocks
+    GLuint m_transformSSBO;
+    GLuint m_blockTextureArray;
+    GLuint m_mdiCommandBuffer;
+    GLuint m_mdiInstanceBuffer;
+    GLuint m_mdiVAO;
     
-    bool m_mdiDirty;                 // True when buffers need rebuild
-    size_t m_totalAllocatedInstances; // Total buffer capacity (with padding)
+    // Persistent mapped buffers (GL 4.4+)
+    GLuint m_persistentQuadBuffer;
+    void* m_persistentQuadPtr = nullptr;
+    size_t m_persistentQuadCapacity = 0;
+    size_t m_persistentQuadUsed = 0;  // Track allocated space
+    
+    // Persistent buffers for commands and transforms
+    GLuint m_persistentCommandBuffer;
+    void* m_persistentCommandPtr = nullptr;
+    GLuint m_persistentTransformBuffer;
+    void* m_persistentTransformPtr = nullptr;
+    
+    // VBO pool for reuse
+    std::vector<GLuint> m_freeVBOPool;
+    GLuint allocateVBO(size_t sizeBytes);
+    void freeVBO(GLuint vbo);
+    
+    // GPU frustum culling
+    GLuint m_frustumCullProgram;
+    GLuint m_visibilitySSBO;
+    void createFrustumCullShader();
+    void cullChunksGPU(const glm::mat4& viewProj, std::vector<VoxelChunk*>& outVisible);
     
     // Helper methods
     void createUnitQuad();
@@ -90,10 +115,7 @@ private:
     bool loadBlockTextureArray();  // Load all block textures into texture array
     GLuint compileShader(const char* source, GLenum type);
     void uploadChunkInstances(ChunkEntry& entry);
-    void rebuildMDIBuffers();  // Rebuild merged buffers for MDI (full)
-    void updateSingleChunkGPU(ChunkEntry& entry);  // Partial update for one chunk
-    void rebuildChunk(VoxelChunk* chunk);  // Rebuild specific chunk
-    size_t calculateChunkSlots(size_t quadCount);  // Calculate padded allocation size
+    void updateSingleChunkGPU(ChunkEntry& entry);  // Upload new quads to per-chunk VBO
 };
 
 // Global instance

@@ -102,6 +102,7 @@ std::vector<uint32_t> ConnectivityAnalyzer::splitIslandByConnectivity(
             // Add slight separation velocity
             Vec3 separationDir = (group.centerOfMass - originalIsland->physicsCenter).normalized();
             newIsland->velocity = newIsland->velocity + separationDir * 2.0f;
+            newIsland->invalidateTransform();
         }
         
         newIslandIDs.push_back(newIslandID);
@@ -421,6 +422,7 @@ uint32_t ConnectivityAnalyzer::extractFragmentToNewIsland(IslandChunkSystem* sys
         separationDir = Vec3(1, 0, 0);
     }
     newIsland->velocity = mainIsland->velocity + separationDir * 0.5f;
+    newIsland->invalidateTransform();
     
     std::cout << "🌊 Island split! Fragment with " << fragmentVoxels.size() 
               << " voxels broke off and became island " << newIslandID << std::endl;

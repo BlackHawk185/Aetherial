@@ -662,31 +662,8 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
               << grassPlaced << " grass, " << treesPlaced << " trees)" << std::endl;
     
     // Chunks will be registered with renderer when client receives them via network
-    // (Don't register here - renderer may not exist yet, and this violates separation of concerns)
-    
-    // Queue chunks for mesh generation (if available)
-    auto meshGenStart = std::chrono::high_resolution_clock::now();
-    int chunksQueued = 0;
-    
-    if (g_greedyMeshQueue)
-    {
-        for (auto& [chunkCoord, chunk] : island->chunks)
-        {
-            if (chunk)
-            {
-                g_greedyMeshQueue->queueFullChunkMesh(chunk.get());
-                chunksQueued++;
-            }
-        }
-        
-        auto meshGenEnd = std::chrono::high_resolution_clock::now();
-        auto meshGenDuration = std::chrono::duration_cast<std::chrono::milliseconds>(meshGenEnd - meshGenStart).count();
-        std::cout << "🔄 Mesh Queue: " << meshGenDuration << "ms (" << chunksQueued << " chunks queued)" << std::endl;
-    }
-    else
-    {
-        std::cout << "   └─ Mesh generator not available - meshes will generate on first render" << std::endl;
-    }
+    // (Don't queue mesh generation here - will be done when chunk is registered with renderer)
+    std::cout << "   └─ Island created - mesh generation will happen when chunks are registered with renderer" << std::endl;
     
     auto totalEnd = std::chrono::high_resolution_clock::now();
     auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(totalEnd - startTime).count();
@@ -884,73 +861,60 @@ void IslandChunkSystem::getVisibleChunksFrustum(const Frustum& frustum, std::vec
     PROFILE_SCOPE("FrustumCulling");
     std::lock_guard<std::mutex> lock(m_islandsMutex);
     
-    int totalChunks = 0;
-    int culledChunks = 0;
-    
     for (auto& [islandID, island] : m_islands)
     {
-        // Get island transform for world-space calculations
         glm::mat4 islandTransform = island.getTransformMatrix();
         
         for (auto& [chunkCoord, chunk] : island.chunks)
         {
             if (!chunk) continue;
             
-            totalChunks++;
+            const auto& cachedAABB = chunk->getCachedWorldAABB();
+            Vec3 worldMin, worldMax;
             
-            // Calculate chunk world-space AABB
-            // Chunk is SIZE x SIZE x SIZE at local position (chunkCoord * SIZE)
-            Vec3 localMin = chunkCoord * static_cast<float>(VoxelChunk::SIZE);
-            Vec3 localMax = localMin + Vec3(VoxelChunk::SIZE, VoxelChunk::SIZE, VoxelChunk::SIZE);
-            
-            // Transform local AABB corners to world space
-            glm::vec4 corners[8] = {
-                islandTransform * glm::vec4(localMin.x, localMin.y, localMin.z, 1.0f),
-                islandTransform * glm::vec4(localMax.x, localMin.y, localMin.z, 1.0f),
-                islandTransform * glm::vec4(localMin.x, localMax.y, localMin.z, 1.0f),
-                islandTransform * glm::vec4(localMax.x, localMax.y, localMin.z, 1.0f),
-                islandTransform * glm::vec4(localMin.x, localMin.y, localMax.z, 1.0f),
-                islandTransform * glm::vec4(localMax.x, localMin.y, localMax.z, 1.0f),
-                islandTransform * glm::vec4(localMin.x, localMax.y, localMax.z, 1.0f),
-                islandTransform * glm::vec4(localMax.x, localMax.y, localMax.z, 1.0f)
-            };
-            
-            // Compute axis-aligned bounding box of transformed chunk
-            Vec3 worldMin(corners[0].x, corners[0].y, corners[0].z);
-            Vec3 worldMax = worldMin;
-            
-            for (int i = 1; i < 8; ++i)
+            if (cachedAABB.valid)
             {
-                worldMin.x = std::min(worldMin.x, corners[i].x);
-                worldMin.y = std::min(worldMin.y, corners[i].y);
-                worldMin.z = std::min(worldMin.z, corners[i].z);
-                worldMax.x = std::max(worldMax.x, corners[i].x);
-                worldMax.y = std::max(worldMax.y, corners[i].y);
-                worldMax.z = std::max(worldMax.z, corners[i].z);
-            }
-            
-            // Test against frustum
-            if (frustum.intersectsAABB(worldMin, worldMax))
-            {
-                outChunks.push_back(chunk.get());
+                worldMin = cachedAABB.min;
+                worldMax = cachedAABB.max;
             }
             else
             {
-                culledChunks++;
+                Vec3 localMin = chunkCoord * static_cast<float>(VoxelChunk::SIZE);
+                Vec3 localMax = localMin + Vec3(VoxelChunk::SIZE, VoxelChunk::SIZE, VoxelChunk::SIZE);
+                
+                glm::vec4 corners[8] = {
+                    islandTransform * glm::vec4(localMin.x, localMin.y, localMin.z, 1.0f),
+                    islandTransform * glm::vec4(localMax.x, localMin.y, localMin.z, 1.0f),
+                    islandTransform * glm::vec4(localMin.x, localMax.y, localMin.z, 1.0f),
+                    islandTransform * glm::vec4(localMax.x, localMax.y, localMin.z, 1.0f),
+                    islandTransform * glm::vec4(localMin.x, localMin.y, localMax.z, 1.0f),
+                    islandTransform * glm::vec4(localMax.x, localMin.y, localMax.z, 1.0f),
+                    islandTransform * glm::vec4(localMin.x, localMax.y, localMax.z, 1.0f),
+                    islandTransform * glm::vec4(localMax.x, localMax.y, localMax.z, 1.0f)
+                };
+                
+                worldMin = Vec3(corners[0].x, corners[0].y, corners[0].z);
+                worldMax = worldMin;
+                
+                for (int i = 1; i < 8; ++i)
+                {
+                    worldMin.x = std::min(worldMin.x, corners[i].x);
+                    worldMin.y = std::min(worldMin.y, corners[i].y);
+                    worldMin.z = std::min(worldMin.z, corners[i].z);
+                    worldMax.x = std::max(worldMax.x, corners[i].x);
+                    worldMax.y = std::max(worldMax.y, corners[i].y);
+                    worldMax.z = std::max(worldMax.z, corners[i].z);
+                }
+                
+                chunk->setCachedWorldAABB(worldMin, worldMax);
             }
+            
+            // Frustum culling disabled - always render all chunks
+            //if (frustum.intersectsAABB(worldMin, worldMax))
+            //{
+                outChunks.push_back(chunk.get());
+            //}
         }
-    }
-    
-    // Log culling effectiveness (throttle to once per second)
-    static auto lastLogTime = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration<float>(now - lastLogTime).count() > 1.0f)
-    {
-        if (totalChunks > 0)
-        {
-            // Removed verbose frustum culling logging
-        }
-        lastLogTime = now;
     }
 }
 
@@ -988,10 +952,15 @@ void IslandChunkSystem::updateIslandPhysics(float deltaTime)
             moved = true;
         }
         
-        // Only mark for GPU update if island actually moved
         if (moved)
         {
             island.needsPhysicsUpdate = true;
+            island.invalidateTransform();
+            
+            for (auto& [chunkCoord, chunk] : island.chunks)
+            {
+                if (chunk) chunk->invalidateCachedWorldAABB();
+            }
         }
     }
 }
@@ -1007,8 +976,7 @@ void IslandChunkSystem::placeWaterBasins(uint32_t islandID, const BiomePalette& 
     FloatingIsland* island = getIsland(islandID);
     if (!island) return;
     
-    // Find all surface blocks that could be basin candidates
-    std::vector<Vec3> surfacePositions;
+    int waterBlocksPlaced = 0;
     
     for (auto& [chunkCoord, chunk] : island->chunks)
     {
@@ -1023,100 +991,21 @@ void IslandChunkSystem::placeWaterBasins(uint32_t islandID, const BiomePalette& 
                     uint8_t blockID = chunk->getVoxel(lx, ly, lz);
                     if (blockID != palette.surfaceBlock) continue;
                     
-                    // Check if air above (surface exposed upward)
                     Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(lx, ly, lz);
-                    uint8_t blockAbove = getBlockIDInIsland(islandID, worldPos + Vec3(0, 1, 0));
-                    if (blockAbove == BlockID::AIR)
+                    Vec3 waterPos = worldPos + Vec3(0, 1, 0);
+                    
+                    // Place water one block above surface if air
+                    if (getBlockIDInIsland(islandID, waterPos) == BlockID::AIR)
                     {
-                        surfacePositions.push_back(worldPos);
+                        setBlockIDWithAutoChunk(islandID, waterPos, palette.waterBlock);
+                        waterBlocksPlaced++;
                     }
                 }
             }
         }
     }
     
-    // Track processed positions to avoid duplicate basin detection
-    std::unordered_set<int64_t> processed;
-    auto encodePos = [](const Vec3& p) -> int64_t {
-        return (static_cast<int64_t>(p.x + 32768) << 32) | 
-               (static_cast<int64_t>(p.y + 32768) << 16) | 
-               static_cast<int64_t>(p.z + 32768);
-    };
-    
-    int basinsCreated = 0;
-    int waterBlocksPlaced = 0;
-    
-    // Check each surface position for basin potential
-    for (const Vec3& surfacePos : surfacePositions)
-    {
-        int64_t posKey = encodePos(surfacePos);
-        if (processed.count(posKey)) continue;
-        
-        // Simply try to fill from here - flood fill will determine if it's valid
-        static const Vec3 horizNeighbors[4] = {
-            Vec3(1, 0, 0), Vec3(-1, 0, 0),
-            Vec3(0, 0, 1), Vec3(0, 0, -1)
-        };
-        
-        // Flood-fill horizontally at THIS layer (Y level), then build up layer by layer
-        std::queue<Vec3> fillQueue;
-        std::unordered_set<int64_t> filledThisBasin;
-        std::vector<Vec3> basinPositions;
-        
-        Vec3 startPos = surfacePos + Vec3(0, 1, 0);
-        fillQueue.push(startPos);
-        filledThisBasin.insert(encodePos(startPos));
-        
-        // Determine max water depth for this basin
-        uint32_t depthHash = seed;
-        depthHash ^= static_cast<uint32_t>(surfacePos.x * 374761393.0f);
-        depthHash ^= static_cast<uint32_t>(surfacePos.z * 668265263.0f);
-        float depthRand = (depthHash & 0xFFFF) / 65535.0f;
-        int maxWaterDepth = palette.minWaterDepth + static_cast<int>(depthRand * (palette.maxWaterDepth - palette.minWaterDepth));
-        
-        // Flood fill horizontally on this Y-level
-        while (!fillQueue.empty() && basinPositions.size() < 500)
-        {
-            Vec3 current = fillQueue.front();
-            fillQueue.pop();
-            
-            uint8_t currentBlock = getBlockIDInIsland(islandID, current);
-            if (currentBlock != BlockID::AIR) continue;
-            
-            // Check if there's solid ground below
-            uint8_t blockBelow = getBlockIDInIsland(islandID, current + Vec3(0, -1, 0));
-            if (blockBelow == BlockID::AIR) continue; // Skip if void below
-            
-            // Valid water position
-            basinPositions.push_back(current);
-            processed.insert(encodePos(current));
-            
-            // Expand horizontally on same Y level
-            for (const Vec3& delta : horizNeighbors)
-            {
-                Vec3 neighbor = current + delta;
-                int64_t neighborKey = encodePos(neighbor);
-                if (filledThisBasin.count(neighborKey)) continue;
-                filledThisBasin.insert(neighborKey);
-                fillQueue.push(neighbor);
-            }
-        }
-        
-        // Place water for this basin
-        if (!basinPositions.empty())
-        {
-            for (const Vec3& pos : basinPositions)
-            {
-                setBlockIDWithAutoChunk(islandID, pos, palette.waterBlock);
-                waterBlocksPlaced++;
-            }
-            basinsCreated++;
-        }
-    }
-    
-    std::cout << "   └─ Surface Positions: " << surfacePositions.size() 
-              << ", Basins Created: " << basinsCreated 
-              << ", Initial Water: " << waterBlocksPlaced << " blocks" << std::endl;
+    std::cout << "   └─ Initial Water: " << waterBlocksPlaced << " blocks" << std::endl;
 }
 
 void IslandChunkSystem::cullExposedWater(uint32_t islandID)

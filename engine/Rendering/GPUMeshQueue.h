@@ -1,4 +1,4 @@
-// GPUMeshQueue.h - Multi-threaded region mesh generation queue
+// GPUMeshQueue.h - Multi-threaded chunk mesh generation queue
 // Worker threads generate mesh data, main thread uploads to GPU
 #pragma once
 
@@ -10,20 +10,13 @@
 #include <condition_variable>
 #include <atomic>
 #include <vector>
+#include <unordered_set>
 #include "../World/VoxelChunk.h"
 
-// Region mesh generation request
-struct RegionMeshRequest
+// Chunk mesh generation result
+struct ChunkMeshResult
 {
     VoxelChunk* chunk;
-    int regionIndex;
-};
-
-// Region mesh generation result
-struct RegionMeshResult
-{
-    VoxelChunk* chunk;
-    int regionIndex;
     std::vector<QuadFace> quads;
 };
 
@@ -33,14 +26,11 @@ public:
     GreedyMeshQueue();
     ~GreedyMeshQueue();
     
-    // Queue full chunk mesh generation (queues all regions)
-    void queueFullChunkMesh(VoxelChunk* chunk);
-    
-    // Queue single region mesh generation (for block edits)
-    void queueRegionMesh(VoxelChunk* chunk, int regionIndex);
+    // Queue chunk for meshing
+    void queueChunkMesh(VoxelChunk* chunk);
     
     // Process completed meshes and upload to GPU (call from main thread)
-    // Returns number of regions uploaded
+    // Returns number of chunks uploaded
     int processQueue(int maxItemsPerFrame = 16);
     
     // Check if there are pending work items
@@ -57,19 +47,18 @@ private:
     std::vector<std::thread> m_workers;
     std::atomic<bool> m_shutdownFlag{false};
     
-    // Job queues with synchronization
-    std::queue<RegionMeshRequest> m_jobQueue;
+    std::unordered_set<VoxelChunk*> m_jobQueue;
     mutable std::mutex m_jobQueueMutex;
     std::condition_variable m_jobQueueCV;
     
-    std::queue<RegionMeshResult> m_completedQueue;
+    std::queue<ChunkMeshResult> m_completedQueue;
     mutable std::mutex m_completedQueueMutex;
     
     // Worker thread function
     void workerThreadFunc();
     
-    // Upload completed region mesh to GPU (main thread only)
-    void uploadRegionMesh(const RegionMeshResult& result);
+    // Upload completed chunk mesh to GPU (main thread only)
+    void uploadChunkMesh(const ChunkMeshResult& result);
 };
 
 // Global instance

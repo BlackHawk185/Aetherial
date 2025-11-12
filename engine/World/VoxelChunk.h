@@ -33,9 +33,24 @@ struct QuadFace
 
 struct VoxelMesh
 {
-    // Quad-based mesh for instanced rendering
+    // Direct quad storage - entire chunk meshed as one unit
     std::vector<QuadFace> quads;
-    GLuint instanceVBO = 0;  // Instance buffer for QuadFace data
+    bool needsGPUUpload = false;
+    
+    // Voxel-to-quad reverse mapping for explosion system
+    // Maps (voxelIndex * 6 + faceDir) -> quad index
+    // This allows storing up to 6 quad indices per voxel (one per face direction)
+    std::unordered_map<uint32_t, uint16_t> voxelFaceToQuadIndex;
+    
+    // Track which voxels have been exploded (non-greedy)
+    // Using vector<bool> for space efficiency (1 bit per voxel = 2MB/chunk)
+    std::vector<bool> isExploded;
+    
+    GLuint instanceVBO = 0;  // Per-chunk instance buffer
+    
+    VoxelMesh() {
+        isExploded.resize(ChunkConfig::CHUNK_VOLUME, false);
+    }
 };
 
 class IslandChunkSystem;  // Forward declaration
@@ -56,11 +71,6 @@ class VoxelChunk
     // Set whether this chunk is on the client (needs GPU upload) or server (CPU only)
     void setIsClient(bool isClient) { m_isClientChunk = isClient; }
     bool isClient() const { return m_isClientChunk; }
-    
-    // Event-driven GPU update callback - called after mesh regeneration
-    using MeshUpdateCallback = std::function<void(VoxelChunk*)>;
-    void setMeshUpdateCallback(MeshUpdateCallback callback) { m_meshUpdateCallback = callback; }
-    void triggerMeshUpdateCallback() { if (m_meshUpdateCallback) m_meshUpdateCallback(this); }
 
     // Voxel data access (ID-based - clean and efficient)
     uint8_t getVoxel(int x, int y, int z) const;
@@ -85,45 +95,35 @@ class VoxelChunk
     uint32_t getVoxelDataSize() const { return VOLUME; }
 
     // Mesh generation and management
+    // Generate mesh for entire chunk as single unit
     void generateMesh(bool generateLighting = true);
-    std::vector<QuadFace> generateMeshForRegion(int regionIndex);  // Generate mesh for single region only
+    std::vector<QuadFace> generateFullChunkMesh();
     
-    // Region-based dirty tracking for partial mesh updates
-    void markRegionDirty(int regionIndex);
-    void markRegionDirtyAtVoxel(int x, int y, int z);
-    bool isRegionDirty(int regionIndex) const;
-    void clearAllRegionDirtyFlags();
-    const std::vector<int>& getDirtyRegions() const { return m_dirtyRegions; }
-    void processDirtyRegions();  // Queue dirty regions for remeshing
-    
-    // Control incremental updates (disable during world generation)
-    void enableIncrementalUpdates() { m_incrementalUpdatesEnabled = true; }
-    void disableIncrementalUpdates() { m_incrementalUpdatesEnabled = false; }
-    bool areIncrementalUpdatesEnabled() const { return m_incrementalUpdatesEnabled; }
-
-    // Mesh state
-    bool isDirty() const
-    {
-        return meshDirty;
-    }
+    // Explosion system for direct quad manipulation
+    void explodeQuad(uint16_t quadIndex);
+    void addSimpleFacesForVoxel(int x, int y, int z);
+    void uploadMeshToGPU();
 
     // **LOD AND CULLING SUPPORT**
     int calculateLOD(const Vec3& cameraPos) const;
     bool shouldRender(const Vec3& cameraPos, float maxDistance = 1024.0f) const;
+    
+    // Cached world-space AABB for frustum culling
+    struct WorldAABB {
+        Vec3 min, max;
+        bool valid = false;
+    };
+    void setCachedWorldAABB(const Vec3& min, const Vec3& max) {
+        m_cachedWorldAABB.min = min;
+        m_cachedWorldAABB.max = max;
+        m_cachedWorldAABB.valid = true;
+    }
+    const WorldAABB& getCachedWorldAABB() const { return m_cachedWorldAABB; }
+    void invalidateCachedWorldAABB() { m_cachedWorldAABB.valid = false; }
 
     // Direct mesh access (fast - no atomic overhead)
     std::shared_ptr<VoxelMesh> getRenderMesh() const { return renderMesh; }
     void setRenderMesh(std::shared_ptr<VoxelMesh> newMesh) { renderMesh = newMesh; }
-    bool isMeshDirty() const { return meshDirty; }
-    
-    // Lazy mesh generation - generates mesh on first access if dirty
-    std::shared_ptr<VoxelMesh> getRenderMeshLazy()
-    {
-        if (!renderMesh || meshDirty) {
-            generateMesh(false);  // Generate without lighting (real-time lighting)
-        }
-        return renderMesh;
-    }
 
     // Decorative/model instance positions (generic per block type)
     const std::vector<Vec3>& getModelInstances(uint8_t blockID) const;
@@ -136,31 +136,26 @@ class VoxelChunk
    private:
     std::array<uint8_t, VOLUME> voxels;
     std::shared_ptr<VoxelMesh> renderMesh;  // Direct access (no atomic overhead)
-    bool meshDirty = true;
     
     // Island context for inter-chunk culling
     uint32_t m_islandID = 0;
     Vec3 m_chunkCoord{0, 0, 0};
+    
+    // Cached world-space AABB for frustum culling optimization
+    WorldAABB m_cachedWorldAABB;
 
     // NEW: Per-block-type model instance positions (for BlockRenderType::OBJ blocks)
     // Key: BlockID, Value: list of instance positions within this chunk
     std::unordered_map<uint8_t, std::vector<Vec3>> m_modelInstances;
     
-    // Region-based dirty tracking for partial mesh updates
-    std::array<bool, ChunkConfig::TOTAL_REGIONS> m_regionDirtyFlags;
-    std::vector<int> m_dirtyRegions;  // List of dirty region indices for efficient iteration
-    
-    // Disable incremental updates during bulk operations (world generation)
-    bool m_incrementalUpdatesEnabled = false;
-    
     // Client/Server flag - only client chunks upload to GPU
     bool m_isClientChunk = false;
-    
-    // Event-driven GPU update callback
-    MeshUpdateCallback m_meshUpdateCallback;
 
     // Quad generation helper
     void addQuad(std::vector<QuadFace>& quads, float x, float y, float z, int face, int width, int height, uint8_t blockType);
+    
+    // Greedy meshing per face direction
+    void greedyMeshFace(std::vector<QuadFace>& quads, int face);
     
     bool isVoxelSolid(int x, int y, int z) const;
     

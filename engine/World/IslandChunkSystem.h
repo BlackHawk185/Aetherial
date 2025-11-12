@@ -36,6 +36,10 @@ struct FloatingIsland
     bool isPiloted = false;                                          // Is a player currently piloting this entity?
     uint32_t pilotPlayerID = 0;                                      // Which player is piloting (0 = none)
     
+    // Cached transform matrix (invalidated when position/rotation changes)
+    mutable glm::mat4 m_cachedTransform{1.0f};
+    mutable bool m_transformDirty = true;
+    
     // Fluid system: Water voxels that have been "noticed" by particles and can be tugged awake
     std::unordered_map<uint64_t, SleepingFluidVoxel> sleepingFluidVoxels;  // Position hash -> voxel data
 
@@ -80,19 +84,28 @@ struct FloatingIsland
     
     // Get the complete transformation matrix for this island (position + rotation)
     // This is the single source of truth for how island-space transforms to world-space
-    glm::mat4 getTransformMatrix() const {
-        glm::mat4 transform = glm::mat4(1.0f);
-        
-        // Apply translation (position)
-        transform = glm::translate(transform, glm::vec3(physicsCenter.x, physicsCenter.y, physicsCenter.z));
-        
-        // Apply rotation (Euler angles: yaw, pitch, roll)
-        // Order matters: Y (yaw) -> X (pitch) -> Z (roll) for typical ship-like rotation
-        transform = glm::rotate(transform, rotation.y, glm::vec3(0.0f, 1.0f, 0.0f)); // Yaw
-        transform = glm::rotate(transform, rotation.x, glm::vec3(1.0f, 0.0f, 0.0f)); // Pitch
-        transform = glm::rotate(transform, rotation.z, glm::vec3(0.0f, 0.0f, 1.0f)); // Roll
-        
-        return transform;
+    // CACHED: Only recalculates when position/rotation changes
+    const glm::mat4& getTransformMatrix() const {
+        if (m_transformDirty) {
+            m_cachedTransform = glm::mat4(1.0f);
+            
+            // Apply translation (position)
+            m_cachedTransform = glm::translate(m_cachedTransform, glm::vec3(physicsCenter.x, physicsCenter.y, physicsCenter.z));
+            
+            // Apply rotation (Euler angles: yaw, pitch, roll)
+            // Order matters: Y (yaw) -> X (pitch) -> Z (roll) for typical ship-like rotation
+            m_cachedTransform = glm::rotate(m_cachedTransform, rotation.y, glm::vec3(0.0f, 1.0f, 0.0f)); // Yaw
+            m_cachedTransform = glm::rotate(m_cachedTransform, rotation.x, glm::vec3(1.0f, 0.0f, 0.0f)); // Pitch
+            m_cachedTransform = glm::rotate(m_cachedTransform, rotation.z, glm::vec3(0.0f, 0.0f, 1.0f)); // Roll
+            
+            m_transformDirty = false;
+        }
+        return m_cachedTransform;
+    }
+    
+    // Mark transform as dirty (call when physicsCenter or rotation changes)
+    void invalidateTransform() const {
+        m_transformDirty = true;
     }
     
     // Get the inverse transform matrix (world-space → island-local space)

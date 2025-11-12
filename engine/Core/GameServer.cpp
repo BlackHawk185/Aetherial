@@ -566,6 +566,8 @@ void GameServer::handlePilotingInput(ENetPeer* peer, const PilotingInputMessage&
     island->velocity.x *= dampingFactor;
     island->velocity.y *= dampingFactor;
     island->velocity.z *= dampingFactor;
+    
+    island->invalidateTransform();
 
     // Apply angular damping when no rotation input
     if (input.rotationYaw == 0.0f)

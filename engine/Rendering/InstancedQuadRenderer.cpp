@@ -1,6 +1,7 @@
 // InstancedQuadRenderer.cpp - GPU instanced rendering implementation
 #include "InstancedQuadRenderer.h"
 #include "../World/VoxelChunk.h"
+#include "../Math/Vec3.h"
 #include "TextureManager.h"
 #include "CascadedShadowMap.h"
 #include "../Time/DayNightController.h"
@@ -8,6 +9,15 @@
 
 #include <iostream>
 #include <glm/gtc/type_ptr.hpp>
+
+// MDI command structure
+struct DrawElementsIndirectCommand {
+    uint32_t count;          // 6 (indices per quad)
+    uint32_t instanceCount;  // number of quads in this chunk
+    uint32_t firstIndex;     // always 0 (shared EBO)
+    uint32_t baseVertex;     // always 0
+    uint32_t baseInstance;   // offset into instance data buffer
+};
 
 // Global instance
 std::unique_ptr<InstancedQuadRenderer> g_instancedQuadRenderer;
@@ -23,14 +33,10 @@ extern DayNightController* g_dayNightController;
 // by DeferredLightingPass which samples shadows once for the entire screen.
 // ============================================================================
 
-// Depth-only shader for shadow map rendering - MDI version with SSBO
-static const char* DEPTH_VERTEX_SHADER = R"(
+static const char* DEPTH_VERTEX_SHADER_MDI = R"(
 #version 460 core
 
-// Unit quad vertex attributes
 layout(location = 0) in vec3 aPosition;
-
-// Instance attributes
 layout(location = 1) in vec3 aInstancePosition;
 layout(location = 2) in vec3 aInstanceNormal;
 layout(location = 3) in float aInstanceWidth;
@@ -38,18 +44,15 @@ layout(location = 4) in float aInstanceHeight;
 layout(location = 5) in uint aInstanceBlockType;
 layout(location = 6) in uint aInstanceFaceDir;
 
-// Chunk transforms in SSBO (accessed via gl_DrawID)
-layout(std430, binding = 0) readonly buffer TransformBuffer {
-    mat4 chunkTransforms[];
-};
-
 uniform mat4 uLightVP;
 
+layout(std430, binding = 0) readonly buffer ChunkTransforms {
+    mat4 transforms[];
+};
+
 void main() {
-    // Get this chunk's transform using gl_DrawID
-    mat4 uChunkTransform = chunkTransforms[gl_DrawID];
+    mat4 uChunkTransform = transforms[gl_DrawID];
     
-    // Same rotation logic as forward shader
     vec3 scaledPos = vec3(
         aPosition.x * aInstanceWidth,
         aPosition.y * aInstanceHeight,
@@ -79,14 +82,10 @@ void main() {
 
 static const char* DEPTH_FRAGMENT_SHADER = R"(
 #version 460 core
-
-void main() {
-    // Depth is written automatically - no color output needed
-}
+void main() {}
 )";
 
-// G-Buffer shaders (deferred rendering)
-static const char* GBUFFER_VERTEX_SHADER = R"(
+static const char* GBUFFER_VERTEX_SHADER_MDI = R"(
 #version 460 core
 
 // Unit quad vertex attributes
@@ -100,12 +99,12 @@ layout(location = 4) in float aInstanceHeight;
 layout(location = 5) in uint aInstanceBlockType;
 layout(location = 6) in uint aInstanceFaceDir;
 
-// Chunk transforms in SSBO
-layout(std430, binding = 0) readonly buffer TransformBuffer {
-    mat4 chunkTransforms[];
-};
-
 uniform mat4 uViewProjection;
+
+// SSBO for chunk transforms (indexed by gl_DrawID)
+layout(std430, binding = 0) readonly buffer ChunkTransforms {
+    mat4 transforms[];
+};
 
 out vec2 TexCoord;
 out vec3 Normal;
@@ -114,7 +113,7 @@ flat out uint BlockType;
 flat out uint FaceDir;
 
 void main() {
-    mat4 uChunkTransform = chunkTransforms[gl_DrawID];
+    mat4 uChunkTransform = transforms[gl_DrawID];
     
     // Same vertex transformation as forward pass
     vec3 scaledPos = vec3(
@@ -179,10 +178,77 @@ void main() {
 }
 )";
 
+// GPU Frustum Culling Compute Shader
+static const char* FRUSTUM_CULL_COMPUTE = R"(
+#version 460 core
+layout(local_size_x = 64) in;
+
+struct ChunkAABB {
+    vec3 minBounds;
+    float pad1;
+    vec3 maxBounds;
+    float pad2;
+};
+
+layout(std430, binding = 0) readonly buffer ChunkBounds {
+    ChunkAABB chunks[];
+};
+
+layout(std430, binding = 1) writeonly buffer Visibility {
+    uint visible[];
+};
+
+uniform mat4 uViewProjection;
+
+// Frustum planes extracted from view-projection matrix
+vec4 frustumPlanes[6];
+
+void extractFrustumPlanes() {
+    mat4 vp = uViewProjection;
+    
+    frustumPlanes[0] = vec4(vp[0][3] + vp[0][0], vp[1][3] + vp[1][0], vp[2][3] + vp[2][0], vp[3][3] + vp[3][0]); // Left
+    frustumPlanes[1] = vec4(vp[0][3] - vp[0][0], vp[1][3] - vp[1][0], vp[2][3] - vp[2][0], vp[3][3] - vp[3][0]); // Right
+    frustumPlanes[2] = vec4(vp[0][3] + vp[0][1], vp[1][3] + vp[1][1], vp[2][3] + vp[2][1], vp[3][3] + vp[3][1]); // Bottom
+    frustumPlanes[3] = vec4(vp[0][3] - vp[0][1], vp[1][3] - vp[1][1], vp[2][3] - vp[2][1], vp[3][3] - vp[3][1]); // Top
+    frustumPlanes[4] = vec4(vp[0][3] + vp[0][2], vp[1][3] + vp[1][2], vp[2][3] + vp[2][2], vp[3][3] + vp[3][2]); // Near
+    frustumPlanes[5] = vec4(vp[0][3] - vp[0][2], vp[1][3] - vp[1][2], vp[2][3] - vp[2][2], vp[3][3] - vp[3][2]); // Far
+    
+    for (int i = 0; i < 6; i++) {
+        float len = length(frustumPlanes[i].xyz);
+        frustumPlanes[i] /= len;
+    }
+}
+
+bool testAABB(vec3 minBounds, vec3 maxBounds) {
+    for (int i = 0; i < 6; i++) {
+        vec4 plane = frustumPlanes[i];
+        vec3 positiveVertex = vec3(
+            plane.x > 0.0 ? maxBounds.x : minBounds.x,
+            plane.y > 0.0 ? maxBounds.y : minBounds.y,
+            plane.z > 0.0 ? maxBounds.z : minBounds.z
+        );
+        
+        float dist = dot(plane.xyz, positiveVertex) + plane.w;
+        if (dist < 0.0) return false;
+    }
+    return true;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= chunks.length()) return;
+    
+    extractFrustumPlanes();
+    
+    ChunkAABB chunk = chunks[index];
+    visible[index] = testAABB(chunk.minBounds, chunk.maxBounds) ? 1u : 0u;
+}
+)";
+
 InstancedQuadRenderer::InstancedQuadRenderer()
-    : m_unitQuadVAO(0), m_unitQuadVBO(0), m_unitQuadEBO(0), m_gbufferProgram(0), m_depthProgram(0),
-      m_globalVAO(0), m_globalInstanceVBO(0), m_indirectCommandBuffer(0), m_transformSSBO(0), 
-      m_mdiDirty(false), m_totalAllocatedInstances(0)
+    : m_unitQuadVAO(0), m_unitQuadVBO(0), m_unitQuadEBO(0), m_gbufferMDIProgram(0), m_depthMDIProgram(0),
+      m_transformSSBO(0), m_mdiCommandBuffer(0), m_mdiInstanceBuffer(0), m_mdiVAO(0),
+      m_persistentQuadBuffer(0), m_frustumCullProgram(0), m_visibilitySSBO(0)
 {
 }
 
@@ -193,8 +259,6 @@ InstancedQuadRenderer::~InstancedQuadRenderer()
 
 bool InstancedQuadRenderer::initialize()
 {
-    std::cout << "🎨 Initializing InstancedQuadRenderer..." << std::endl;
-    
     createUnitQuad();
     createGBufferShader();  // For deferred rendering
     createDepthShader();    // For shadow casting
@@ -216,13 +280,66 @@ bool InstancedQuadRenderer::initialize()
         return false;
     }
     
-    // Create global VAO for MDI (will be configured when chunks are registered)
-    glGenVertexArrays(1, &m_globalVAO);
-    glGenBuffers(1, &m_globalInstanceVBO);
-    glGenBuffers(1, &m_indirectCommandBuffer);
     glGenBuffers(1, &m_transformSSBO);
+    glGenBuffers(1, &m_mdiCommandBuffer);
+    glGenBuffers(1, &m_mdiInstanceBuffer);
+    glGenVertexArrays(1, &m_mdiVAO);
     
-    std::cout << "✅ InstancedQuadRenderer initialized with MDI support" << std::endl;
+    // Persistent mapped buffer for quad data (GL 4.4+) - unified for all chunks
+    m_persistentQuadCapacity = 1024 * 1024 * 64; // 64MB for all chunks (512M quads)
+    m_persistentQuadUsed = 0;
+    glGenBuffers(1, &m_persistentQuadBuffer);
+    glBindBuffer(GL_ARRAY_BUFFER, m_persistentQuadBuffer);
+    glBufferStorage(GL_ARRAY_BUFFER, m_persistentQuadCapacity * sizeof(QuadFace), nullptr, 
+                    GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_DYNAMIC_STORAGE_BIT);
+    m_persistentQuadPtr = glMapBufferRange(GL_ARRAY_BUFFER, 0, m_persistentQuadCapacity * sizeof(QuadFace),
+                                           GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_FLUSH_EXPLICIT_BIT);
+    
+    // Persistent mapped buffer for draw commands
+    size_t maxChunks = 4096;  // Support up to 4096 chunks
+    glGenBuffers(1, &m_persistentCommandBuffer);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_persistentCommandBuffer);
+    glBufferStorage(GL_DRAW_INDIRECT_BUFFER, maxChunks * sizeof(DrawElementsIndirectCommand), nullptr,
+                    GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_DYNAMIC_STORAGE_BIT);
+    m_persistentCommandPtr = glMapBufferRange(GL_DRAW_INDIRECT_BUFFER, 0, maxChunks * sizeof(DrawElementsIndirectCommand),
+                                              GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_FLUSH_EXPLICIT_BIT);
+    
+    // Persistent mapped buffer for transforms
+    glGenBuffers(1, &m_persistentTransformBuffer);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_persistentTransformBuffer);
+    glBufferStorage(GL_SHADER_STORAGE_BUFFER, maxChunks * sizeof(glm::mat4), nullptr,
+                    GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_DYNAMIC_STORAGE_BIT);
+    m_persistentTransformPtr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, maxChunks * sizeof(glm::mat4),
+                                                GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_FLUSH_EXPLICIT_BIT);
+    
+    // GPU frustum culling
+    glGenBuffers(1, &m_visibilitySSBO);
+    createFrustumCullShader();
+    
+    // Configure MDI VAO (shared for all chunks)
+    glBindVertexArray(m_mdiVAO);
+    
+    // Bind unit quad vertices (attribute 0)
+    glBindBuffer(GL_ARRAY_BUFFER, m_unitQuadVBO);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+    
+    // Bind element buffer
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_unitQuadEBO);
+    
+    // Instance attributes bound to persistent quad buffer (all chunks in one buffer)
+    glBindBuffer(GL_ARRAY_BUFFER, m_persistentQuadBuffer);
+    
+    size_t offset = 0;
+    glEnableVertexAttribArray(1); glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset); glVertexAttribDivisor(1, 1); offset += sizeof(Vec3);
+    glEnableVertexAttribArray(2); glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset); glVertexAttribDivisor(2, 1); offset += sizeof(Vec3);
+    glEnableVertexAttribArray(3); glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset); glVertexAttribDivisor(3, 1); offset += sizeof(float);
+    glEnableVertexAttribArray(4); glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset); glVertexAttribDivisor(4, 1); offset += sizeof(float);
+    glEnableVertexAttribArray(5); glVertexAttribIPointer(5, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset); glVertexAttribDivisor(5, 1); offset += sizeof(uint8_t);
+    glEnableVertexAttribArray(6); glVertexAttribIPointer(6, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset); glVertexAttribDivisor(6, 1);
+    
+    glBindVertexArray(0);
+    
     return true;
 }
 
@@ -262,71 +379,59 @@ void InstancedQuadRenderer::createUnitQuad()
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     
     glBindVertexArray(0);
-    
-    std::cout << "   ├─ Unit quad created (4 vertices, 6 indices)" << std::endl;
 }
 
 void InstancedQuadRenderer::createDepthShader()
 {
-    GLuint vertexShader = compileShader(DEPTH_VERTEX_SHADER, GL_VERTEX_SHADER);
-    GLuint fragmentShader = compileShader(DEPTH_FRAGMENT_SHADER, GL_FRAGMENT_SHADER);
+    GLuint vertexShaderMDI = compileShader(DEPTH_VERTEX_SHADER_MDI, GL_VERTEX_SHADER);
+    GLuint fragmentShaderMDI = compileShader(DEPTH_FRAGMENT_SHADER, GL_FRAGMENT_SHADER);
     
-    m_depthProgram = glCreateProgram();
-    glAttachShader(m_depthProgram, vertexShader);
-    glAttachShader(m_depthProgram, fragmentShader);
-    glLinkProgram(m_depthProgram);
+    m_depthMDIProgram = glCreateProgram();
+    glAttachShader(m_depthMDIProgram, vertexShaderMDI);
+    glAttachShader(m_depthMDIProgram, fragmentShaderMDI);
+    glLinkProgram(m_depthMDIProgram);
     
-    // Check linking
     GLint success;
-    glGetProgramiv(m_depthProgram, GL_LINK_STATUS, &success);
+    glGetProgramiv(m_depthMDIProgram, GL_LINK_STATUS, &success);
     if (!success) {
         char infoLog[512];
-        glGetProgramInfoLog(m_depthProgram, 512, nullptr, infoLog);
-        std::cerr << "❌ Depth shader linking FAILED:\n" << infoLog << std::endl;
+        glGetProgramInfoLog(m_depthMDIProgram, 512, nullptr, infoLog);
+        std::cerr << "❌ Depth MDI shader linking FAILED:\n" << infoLog << std::endl;
     }
     
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
+    glDeleteShader(vertexShaderMDI);
+    glDeleteShader(fragmentShaderMDI);
     
-    // Get uniform locations (no more uChunkTransform - using SSBO)
-    m_depth_uLightVP = glGetUniformLocation(m_depthProgram, "uLightVP");
-    
-    std::cout << "   └─ Depth shader compiled and linked (MDI + SSBO)" << std::endl;
+    m_depthMDI_uLightVP = glGetUniformLocation(m_depthMDIProgram, "uLightVP");
 }
 
 void InstancedQuadRenderer::createGBufferShader()
 {
-    GLuint vertexShader = compileShader(GBUFFER_VERTEX_SHADER, GL_VERTEX_SHADER);
-    GLuint fragmentShader = compileShader(GBUFFER_FRAGMENT_SHADER, GL_FRAGMENT_SHADER);
+    GLuint vertexShaderMDI = compileShader(GBUFFER_VERTEX_SHADER_MDI, GL_VERTEX_SHADER);
+    GLuint fragmentShaderMDI = compileShader(GBUFFER_FRAGMENT_SHADER, GL_FRAGMENT_SHADER);
     
-    m_gbufferProgram = glCreateProgram();
-    glAttachShader(m_gbufferProgram, vertexShader);
-    glAttachShader(m_gbufferProgram, fragmentShader);
-    glLinkProgram(m_gbufferProgram);
+    m_gbufferMDIProgram = glCreateProgram();
+    glAttachShader(m_gbufferMDIProgram, vertexShaderMDI);
+    glAttachShader(m_gbufferMDIProgram, fragmentShaderMDI);
+    glLinkProgram(m_gbufferMDIProgram);
     
-    // Check linking
     GLint success;
-    glGetProgramiv(m_gbufferProgram, GL_LINK_STATUS, &success);
+    glGetProgramiv(m_gbufferMDIProgram, GL_LINK_STATUS, &success);
     if (!success) {
         char infoLog[512];
-        glGetProgramInfoLog(m_gbufferProgram, 512, nullptr, infoLog);
-        std::cerr << "❌ G-buffer shader linking FAILED:\n" << infoLog << std::endl;
+        glGetProgramInfoLog(m_gbufferMDIProgram, 512, nullptr, infoLog);
+        std::cerr << "❌ G-buffer MDI shader linking FAILED:\n" << infoLog << std::endl;
     }
     
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
+    glDeleteShader(vertexShaderMDI);
+    glDeleteShader(fragmentShaderMDI);
     
-    // Get uniform locations
-    m_gbuffer_uViewProjection = glGetUniformLocation(m_gbufferProgram, "uViewProjection");
-    m_gbuffer_uBlockTextures = glGetUniformLocation(m_gbufferProgram, "uBlockTextures");
-    
-    std::cout << "   └─ G-buffer shader compiled and linked (deferred rendering)" << std::endl;
+    m_gbufferMDI_uViewProjection = glGetUniformLocation(m_gbufferMDIProgram, "uViewProjection");
+    m_gbufferMDI_uBlockTextures = glGetUniformLocation(m_gbufferMDIProgram, "uBlockTextures");
 }
 
 bool InstancedQuadRenderer::loadBlockTextureArray()
 {
-    std::cout << "🎨 Loading block texture array..." << std::endl;
-    
     extern TextureManager* g_textureManager;
     
     // Define all 46 block textures in ID order (matching BlockID enum)
@@ -384,9 +489,7 @@ bool InstancedQuadRenderer::loadBlockTextureArray()
     glBindTexture(GL_TEXTURE_2D_ARRAY, m_blockTextureArray);
     glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, 32, 32, 46);
     
-    // Load and upload each texture directly
     int successCount = 0;
-    int failCount = 0;
     
     for (int i = 0; i < 46; ++i)
     {
@@ -400,17 +503,6 @@ bool InstancedQuadRenderer::loadBlockTextureArray()
                 glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, i, 32, 32, 1, GL_RGBA, GL_UNSIGNED_BYTE, texData.pixels);
                 successCount++;
             }
-            else
-            {
-                std::cerr << "   ⚠️  Layer " << i << " (" << blockTextureFiles[i] << "): Wrong size " 
-                          << texData.width << "x" << texData.height << " (expected 32x32)" << std::endl;
-                failCount++;
-            }
-        }
-        else
-        {
-            std::cerr << "   ❌ Layer " << i << " (" << blockTextureFiles[i] << "): Failed to load" << std::endl;
-            failCount++;
         }
     }
     
@@ -422,13 +514,7 @@ bool InstancedQuadRenderer::loadBlockTextureArray()
     
     glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
     
-    std::cout << "   ✅ Texture array created: " << successCount << "/46 loaded";
-    if (failCount > 0) {
-        std::cout << " (" << failCount << " failed)";
-    }
-    std::cout << std::endl;
-    
-    return successCount > 0; // At least one texture must load
+    return successCount > 0;
 }
 
 GLuint InstancedQuadRenderer::compileShader(const char* source, GLenum type)
@@ -451,48 +537,54 @@ GLuint InstancedQuadRenderer::compileShader(const char* source, GLenum type)
 
 void InstancedQuadRenderer::registerChunk(VoxelChunk* chunk, const glm::mat4& transform)
 {
-    if (!chunk)
+    auto it = m_chunkToIndex.find(chunk);
+    if (it != m_chunkToIndex.end())
     {
-        std::cerr << "⚠️ Attempted to register null chunk!" << std::endl;
+        m_chunks[it->second].transform = transform;
+        std::cout << "[RENDERER] Updated transform for existing chunk " << chunk 
+                  << " at index " << it->second << std::endl;
         return;
     }
     
-    // EVENT-DRIVEN: Set up callback for immediate GPU upload on mesh changes
-    // Do this FIRST before checking if already registered to ensure callback is always set
-    chunk->setMeshUpdateCallback([this](VoxelChunk* modifiedChunk) {
-        // Find the chunk entry
-        for (auto& chunkEntry : m_chunks) {
-            if (chunkEntry.chunk == modifiedChunk) {
-                // Immediate GPU upload (zero latency)
-                this->updateSingleChunkGPU(chunkEntry);
-                return;
-            }
-        }
-    });
+    size_t index = m_chunks.size();
     
-    // Check if chunk is already registered - update instead of duplicate
-    for (auto& entry : m_chunks) {
-        if (entry.chunk == chunk) {
-            entry.transform = transform;
-            m_mdiDirty = true;  // Mark for rebuild
-            return;
-        }
-    }
-    
-    // Not registered yet - create new entry
     ChunkEntry entry;
     entry.chunk = chunk;
     entry.transform = transform;
     entry.instanceCount = 0;
-    entry.baseInstance = 0;  // Will be set during rebuildMDIBuffers
-    
-    // Pre-allocate slots based on expected mesh size (for floating islands, ~5-10% occupancy)
-    // This avoids the "grew beyond padding" warning on first mesh upload
-    size_t expectedQuads = (256 * 256 * 256) / 100;  // Assume ~1% of chunk volume has exposed faces
-    entry.allocatedSlots = calculateChunkSlots(expectedQuads);
+    entry.vbo = 0;
+    entry.lastUploadedCount = 0;
+    entry.chunkID = static_cast<uint32_t>(index);
     
     m_chunks.push_back(entry);
-    m_mdiDirty = true;  // Mark for rebuild
+    m_chunkToIndex[chunk] = index;
+    
+    std::cout << "[RENDERER] Registered new chunk " << chunk << " at index " << index 
+              << ". Total chunks: " << m_chunks.size() << std::endl;
+}
+
+void InstancedQuadRenderer::registerChunkWithSize(VoxelChunk* chunk, const glm::mat4& transform, size_t estimatedQuads)
+{
+    (void)estimatedQuads;
+    
+    auto it = m_chunkToIndex.find(chunk);
+    if (it != m_chunkToIndex.end())
+    {
+        m_chunks[it->second].transform = transform;
+        return;
+    }
+    
+    size_t index = m_chunks.size();
+    
+    ChunkEntry entry;
+    entry.chunk = chunk;
+    entry.transform = transform;
+    entry.instanceCount = 0;
+    entry.vbo = 0;
+    entry.chunkID = static_cast<uint32_t>(index);
+    
+    m_chunks.push_back(entry);
+    m_chunkToIndex[chunk] = index;
 }
 
 void InstancedQuadRenderer::uploadChunkInstances(ChunkEntry& entry)
@@ -512,404 +604,222 @@ void InstancedQuadRenderer::uploadChunkInstances(ChunkEntry& entry)
     }
     
     entry.instanceCount = mesh->quads.size();
-    
-    // Instance data is now managed by rebuildMDIBuffers, not per-chunk
-    m_mdiDirty = true;
 }
 
 void InstancedQuadRenderer::updateChunkTransform(VoxelChunk* chunk, const glm::mat4& transform)
 {
-    for (auto& entry : m_chunks) {
-        if (entry.chunk == chunk) {
-            entry.transform = transform;
-            return;
-        }
+    auto it = m_chunkToIndex.find(chunk);
+    if (it != m_chunkToIndex.end())
+    {
+        m_chunks[it->second].transform = transform;
     }
 }
 
-void InstancedQuadRenderer::rebuildChunk(VoxelChunk* chunk)
+void InstancedQuadRenderer::uploadChunkMesh(VoxelChunk* chunk)
 {
-    for (auto& entry : m_chunks) {
-        if (entry.chunk == chunk) {
-            // Use fast partial update instead of full rebuild
-            updateSingleChunkGPU(entry);
-            return;
-        }
+    auto it = m_chunkToIndex.find(chunk);
+    if (it != m_chunkToIndex.end())
+    {
+        updateSingleChunkGPU(m_chunks[it->second]);
     }
 }
 
-// Calculate padded allocation size for a chunk to allow for growth
-size_t InstancedQuadRenderer::calculateChunkSlots(size_t quadCount)
+
+// Helper: Calculate padded slot allocation for chunk growth
+static size_t calculateChunkSlots(size_t activeQuads)
 {
-    // Allocate 150% of current quad count (rounded up to nearest 256)
-    // This allows for block additions without full buffer rebuild
-    size_t padded = (quadCount * 3) / 2;  // 150%
-    size_t alignment = 256;
-    return ((padded + alignment - 1) / alignment) * alignment;
+    if (activeQuads == 0) return 256;  // Minimum allocation
+    
+    // Add 25% padding, round up to nearest 256
+    size_t withPadding = activeQuads + (activeQuads / 4);
+    return ((withPadding + 255) / 256) * 256;
 }
 
-void InstancedQuadRenderer::rebuildMDIBuffers()
-{
-    if (m_chunks.empty()) return;
-    
-    // 1. Calculate total instance count WITH PADDING for future growth
-    size_t totalActiveInstances = 0;
-    m_totalAllocatedInstances = 0;
-    
-    for (auto& entry : m_chunks) {
-        if (entry.chunk) {
-            // Get existing mesh - don't generate synchronously (async system handles it)
-            auto mesh = entry.chunk->getRenderMesh();
-            if (mesh) {
-                entry.instanceCount = mesh->quads.size();
-                entry.allocatedSlots = calculateChunkSlots(entry.instanceCount);
-                entry.baseInstance = m_totalAllocatedInstances;
-                
-                totalActiveInstances += entry.instanceCount;
-                m_totalAllocatedInstances += entry.allocatedSlots;
-            } else {
-                entry.instanceCount = 0;
-                entry.allocatedSlots = 0;
-            }
-        }
-    }
-    
-    if (totalActiveInstances == 0) return;
-    
-    // 2. Build merged instance buffer with PADDED allocation
-    std::vector<QuadFace> mergedInstances;
-    mergedInstances.resize(m_totalAllocatedInstances);  // Pre-allocate with padding
-    
-    size_t writeOffset = 0;
-    for (const auto& entry : m_chunks) {
-        if (entry.chunk && entry.instanceCount > 0) {
-            // Thread-safe atomic mesh access - no mutex needed!
-            auto mesh = entry.chunk->getRenderMesh();
-            if (mesh && entry.baseInstance == writeOffset) {
-                // Copy active quads
-                std::copy(mesh->quads.begin(), mesh->quads.end(), 
-                         mergedInstances.begin() + writeOffset);
-                writeOffset += entry.allocatedSlots;  // Skip to next chunk's slot
-            }
-        }
-    }
-    
-    // 3. Upload merged instance data to GPU (now with padding for future updates)
-    glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
-    glBufferData(GL_ARRAY_BUFFER, m_totalAllocatedInstances * sizeof(QuadFace), 
-                 mergedInstances.data(), GL_DYNAMIC_DRAW);
-    
-    // 4. Configure global VAO (one-time setup, or when first built)
-    static bool vaoConfigured = false;
-    if (!vaoConfigured) {
-        glBindVertexArray(m_globalVAO);
-        
-        // Bind shared unit quad (vertex attribute 0)
-        glBindBuffer(GL_ARRAY_BUFFER, m_unitQuadVBO);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-        
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_unitQuadEBO);
-        
-        // Bind merged instance buffer
-        glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
-        
-        // Pre-configure all instance vertex attributes (QuadFace: 36 bytes)
-        size_t offset = 0;
-        
-        // Location 1: position (Vec3)
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(1, 1);
-        offset += sizeof(Vec3);
-        
-        // Location 2: normal (Vec3)
-        glEnableVertexAttribArray(2);
-        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(2, 1);
-        offset += sizeof(Vec3);
-        
-        // Location 3: width (float)
-        glEnableVertexAttribArray(3);
-        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(3, 1);
-        offset += sizeof(float);
-        
-        // Location 4: height (float)
-        glEnableVertexAttribArray(4);
-        glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(4, 1);
-        offset += sizeof(float);
-        
-        // Location 5: blockType (uint8_t)
-        glEnableVertexAttribArray(5);
-        glVertexAttribIPointer(5, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(5, 1);
-        offset += sizeof(uint8_t);
-        
-        // Location 6: faceDir (uint8_t)
-        glEnableVertexAttribArray(6);
-        glVertexAttribIPointer(6, 1, GL_UNSIGNED_BYTE, sizeof(QuadFace), (void*)offset);
-        glVertexAttribDivisor(6, 1);
-        
-        glBindVertexArray(0);
-        vaoConfigured = true;
-    }
-    
-    // 5. Build indirect command buffer and transform array (MUST match 1:1)
-    std::vector<DrawElementsIndirectCommand> commands;
-    std::vector<glm::mat4> transforms;
-    commands.reserve(m_chunks.size());
-    transforms.reserve(m_chunks.size());
-    
-    for (const auto& entry : m_chunks) {
-        if (entry.instanceCount > 0) {
-            DrawElementsIndirectCommand cmd;
-            cmd.count = 6;  // Quad indices
-            cmd.instanceCount = static_cast<uint32_t>(entry.instanceCount);
-            cmd.firstIndex = 0;
-            cmd.baseVertex = 0;
-            cmd.baseInstance = static_cast<uint32_t>(entry.baseInstance);
-            commands.push_back(cmd);
-            
-            // CRITICAL: Transform array must match command array 1:1
-            transforms.push_back(entry.transform);
-        }
-    }
-    
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
-    glBufferData(GL_DRAW_INDIRECT_BUFFER, commands.size() * sizeof(DrawElementsIndirectCommand),
-                 commands.data(), GL_DYNAMIC_DRAW);
-    
-    // 6. Upload chunk transforms to SSBO (now matches commands array)
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, transforms.size() * sizeof(glm::mat4),
-                 transforms.data(), GL_DYNAMIC_DRAW);
-    
-    m_mdiDirty = false;
-}
-
-// CRITICAL OPTIMIZATION: Update single chunk without rebuilding entire buffer
+// Update single chunk GPU data
 void InstancedQuadRenderer::updateSingleChunkGPU(ChunkEntry& entry)
 {
-    if (!entry.chunk) return;
-    
-    auto t_start = std::chrono::high_resolution_clock::now();
-    
-    // Get mesh - use lazy generation only if incremental updates aren't enabled yet
-    // This handles the case where a block is modified before async mesh gen completes
     auto mesh = entry.chunk->getRenderMesh();
-    if (!mesh || entry.chunk->isMeshDirty()) {
-        // Mesh not ready or needs regeneration - use lazy generation as fallback
-        mesh = entry.chunk->getRenderMeshLazy();
-    }
     if (!mesh) {
-        return;  // Mesh still not available - skip this update
+        entry.instanceCount = 0;
+        return;  // No mesh yet - workers still processing
     }
     
     size_t newQuadCount = mesh->quads.size();
     
-    auto t_check = std::chrono::high_resolution_clock::now();
+    std::cout << "[GPU UPDATE] Chunk " << entry.chunk << ": newQuadCount=" << newQuadCount 
+              << ", lastUploaded=" << entry.lastUploadedCount 
+              << ", needsUpload=" << mesh->needsGPUUpload 
+              << ", allocatedSlots=" << entry.allocatedSlots 
+              << ", baseInstance=" << entry.baseInstance << std::endl;
     
-    // Check if we can fit within allocated space
-    if (newQuadCount <= entry.allocatedSlots) {
-        // FAST PATH: Partial update with glBufferSubData
-        auto t_upload_start = std::chrono::high_resolution_clock::now();
+    // Upload if count changed OR if upload was explicitly requested
+    if (newQuadCount != entry.lastUploadedCount || mesh->needsGPUUpload) {
+        // Check if we need to allocate or reallocate space
+        if (entry.allocatedSlots == 0) {
+            // FIRST TIME ALLOCATION: Assign baseInstance offset
+            entry.allocatedSlots = calculateChunkSlots(newQuadCount);
+            entry.baseInstance = m_persistentQuadUsed;
+            m_persistentQuadUsed += entry.allocatedSlots;
+            
+            std::cout << "[GPU ALLOC] Chunk " << entry.chunk 
+                      << " allocated at baseInstance=" << entry.baseInstance 
+                      << ", slots=" << entry.allocatedSlots 
+                      << ", totalUsed=" << m_persistentQuadUsed << std::endl;
+        } 
+        else if (newQuadCount > entry.allocatedSlots) {
+            // REALLOCATION NEEDED: Chunk grew beyond padding
+            // TODO: Implement defragmentation or just expand in place if possible
+            std::cout << "[GPU] WARNING: Chunk grew beyond allocated slots, needs rebuild" << std::endl;
+            entry.allocatedSlots = calculateChunkSlots(newQuadCount);
+            // Keep existing baseInstance - will overrun, but at least visible
+        }
         
-        glBindBuffer(GL_ARRAY_BUFFER, m_globalInstanceVBO);
-        glBufferSubData(GL_ARRAY_BUFFER, 
-                       entry.baseInstance * sizeof(QuadFace),
-                       newQuadCount * sizeof(QuadFace),
-                       mesh->quads.data());
-        
-        auto t_upload_end = std::chrono::high_resolution_clock::now();
-        auto t_cmd_start = std::chrono::high_resolution_clock::now();
-        
-        // Update instance count in indirect command buffer
-        size_t chunkIndex = &entry - m_chunks.data();
-        DrawElementsIndirectCommand cmd;
-        cmd.count = 6;
-        cmd.instanceCount = static_cast<uint32_t>(newQuadCount);
-        cmd.firstIndex = 0;
-        cmd.baseVertex = 0;
-        cmd.baseInstance = static_cast<uint32_t>(entry.baseInstance);
-        
-        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
-        glBufferSubData(GL_DRAW_INDIRECT_BUFFER,
-                       chunkIndex * sizeof(DrawElementsIndirectCommand),
-                       sizeof(DrawElementsIndirectCommand),
-                       &cmd);
-        
-        auto t_cmd_end = std::chrono::high_resolution_clock::now();
-        
-        entry.instanceCount = newQuadCount;
-        
-        auto t_end = std::chrono::high_resolution_clock::now();
-        
-        auto check_ms = std::chrono::duration<double, std::milli>(t_check - t_start).count();
-        auto upload_ms = std::chrono::duration<double, std::milli>(t_upload_end - t_upload_start).count();
-        auto cmd_ms = std::chrono::duration<double, std::milli>(t_cmd_end - t_cmd_start).count();
-        auto total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-        
-        // Removed verbose GPU upload logging
-    } else {
-        // SLOW PATH: Chunk grew beyond allocated space - need full rebuild
-        // This is expected on initial load when regions complete before slots are allocated
-        m_mdiDirty = true;
+        // Write data to persistent buffer at chunk's baseInstance offset
+        if (newQuadCount > 0 && m_persistentQuadPtr && entry.baseInstance < m_persistentQuadCapacity) {
+            QuadFace* dest = static_cast<QuadFace*>(m_persistentQuadPtr) + entry.baseInstance;
+            memcpy(dest, mesh->quads.data(), newQuadCount * sizeof(QuadFace));
+            
+            // Flush the written range
+            glBindBuffer(GL_ARRAY_BUFFER, m_persistentQuadBuffer);
+            glFlushMappedBufferRange(GL_ARRAY_BUFFER,
+                                     entry.baseInstance * sizeof(QuadFace),
+                                     newQuadCount * sizeof(QuadFace));
+        }
+        mesh->needsGPUUpload = false;
     }
+    
+    entry.instanceCount = newQuadCount;
+    entry.lastUploadedCount = newQuadCount;
 }
 
-void InstancedQuadRenderer::renderToGBuffer(const glm::mat4& viewProjection, const glm::mat4& view)
+void InstancedQuadRenderer::renderToGBufferMDI(const glm::mat4& viewProjection, const glm::mat4& view)
 {
-    (void)view;  // Not needed for G-buffer pass
+    (void)view;
     
-    if (m_chunks.empty())
-        return;
+    PROFILE_SCOPE("QuadRenderer_GBuffer_MDI");
     
-    // Enable face culling
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
+    if (m_chunks.empty() || !m_persistentCommandPtr || !m_persistentTransformPtr) return;
     
-    glUseProgram(m_gbufferProgram);
-    glUniformMatrix4fv(m_gbuffer_uViewProjection, 1, GL_FALSE, glm::value_ptr(viewProjection));
+    // Write draw commands and transforms directly to persistent buffers
+    DrawElementsIndirectCommand* cmdPtr = static_cast<DrawElementsIndirectCommand*>(m_persistentCommandPtr);
+    glm::mat4* transformPtr = static_cast<glm::mat4*>(m_persistentTransformPtr);
     
-    // Bind texture array
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, m_blockTextureArray);
-    glUniform1i(m_gbuffer_uBlockTextures, 0);
-    
-    // Rebuild MDI buffers if dirty
-    if (m_mdiDirty) {
-        rebuildMDIBuffers();
-    }
-    
-    // Count non-empty draws
     size_t drawCount = 0;
     for (const auto& entry : m_chunks) {
-        if (entry.instanceCount > 0) drawCount++;
+        if (entry.instanceCount == 0) continue;
+        
+        cmdPtr[drawCount].count = 6;
+        cmdPtr[drawCount].instanceCount = entry.instanceCount;
+        cmdPtr[drawCount].firstIndex = 0;
+        cmdPtr[drawCount].baseVertex = 0;  // Always 0 for unit quad
+        cmdPtr[drawCount].baseInstance = entry.baseInstance;  // Offset into instance buffer
+        
+        transformPtr[drawCount] = entry.transform;
+        drawCount++;
     }
     
-    if (drawCount == 0) {
-        return;
-    }
+    if (drawCount == 0) return;
     
-    // Update transforms
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
-    glm::mat4* mappedTransforms = (glm::mat4*)glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_WRITE_ONLY);
-    if (mappedTransforms) {
-        size_t index = 0;
-        for (const auto& entry : m_chunks) {
-            if (entry.instanceCount > 0) {
-                mappedTransforms[index++] = entry.transform;
-            }
-        }
-        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-    }
+    // Flush persistent buffers
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_persistentCommandBuffer);
+    glFlushMappedBufferRange(GL_DRAW_INDIRECT_BUFFER, 0, drawCount * sizeof(DrawElementsIndirectCommand));
     
-    // Bind global VAO and transform SSBO
-    glBindVertexArray(m_globalVAO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_transformSSBO);
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_persistentTransformBuffer);
+    glFlushMappedBufferRange(GL_SHADER_STORAGE_BUFFER, 0, drawCount * sizeof(glm::mat4));
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_persistentTransformBuffer);
     
-    // SINGLE MDI CALL - writes to G-buffer
-    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
-                                static_cast<GLsizei>(drawCount), 0);
-    
-    glBindVertexArray(0);
-}
-
-void InstancedQuadRenderer::renderToGBufferCulled(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks)
-{
-    PROFILE_SCOPE("QuadRenderer_GBuffer");
-    (void)view;  // Not needed for G-buffer pass
-    
-    if (m_chunks.empty() || visibleChunks.empty())
-        return;
-    
-    // Enable face culling
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
-    
-    glUseProgram(m_gbufferProgram);
-    glUniformMatrix4fv(m_gbuffer_uViewProjection, 1, GL_FALSE, glm::value_ptr(viewProjection));
+    // Use MDI shader
+    glUseProgram(m_gbufferMDIProgram);
+    glUniformMatrix4fv(m_gbufferMDI_uViewProjection, 1, GL_FALSE, glm::value_ptr(viewProjection));
     
     // Bind texture array
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D_ARRAY, m_blockTextureArray);
-    glUniform1i(m_gbuffer_uBlockTextures, 0);
+    glUniform1i(m_gbufferMDI_uBlockTextures, 0);
     
-    // Rebuild MDI buffers if dirty
-    if (m_mdiDirty) {
-        rebuildMDIBuffers();
-    }
-    
-    // Build list of visible chunk entries and transforms
-    std::vector<const ChunkEntry*> visibleEntries;
-    std::vector<glm::mat4> transforms;
-    visibleEntries.reserve(visibleChunks.size());
-    transforms.reserve(visibleChunks.size());
-    
-    {
-        PROFILE_SCOPE("FindVisibleChunks");
-        for (VoxelChunk* chunk : visibleChunks) {
-            // Find chunk in our registered list
-            for (const auto& entry : m_chunks) {
-                if (entry.chunk == chunk && entry.instanceCount > 0) {
-                    visibleEntries.push_back(&entry);
-                    transforms.push_back(entry.transform);
-                    break;
-                }
-            }
-        }
-    }
-    
-    if (visibleEntries.empty()) return;
-    
-    // Build draw commands for visible chunks
-    std::vector<DrawElementsIndirectCommand> commands;
-    commands.reserve(visibleEntries.size());
-    
-    {
-        PROFILE_SCOPE("UploadGPUData");
-        // Upload transforms for visible chunks
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
-        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, transforms.size() * sizeof(glm::mat4), transforms.data());
-        
-        for (size_t i = 0; i < visibleEntries.size(); ++i) {
-            const ChunkEntry* entry = visibleEntries[i];
-            commands.push_back({
-                6,                                    // count (6 indices per quad)
-                static_cast<uint32_t>(entry->instanceCount),  // instanceCount
-                0,                                    // firstIndex
-                0,                                    // baseVertex
-                static_cast<uint32_t>(entry->baseInstance)    // baseInstance
-            });
-        }
-        
-        // Upload culled draw commands
-        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
-        glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0, commands.size() * sizeof(DrawElementsIndirectCommand), commands.data());
-    }
-    
-    {
-        PROFILE_SCOPE("ActualGPUDraw");
-        // Bind global VAO and transform SSBO
-        glBindVertexArray(m_globalVAO);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_transformSSBO);
-        
-        // SINGLE MDI CALL with only visible chunks
-        glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
-                                    static_cast<GLsizei>(commands.size()), 0);
-    }
-    
+    // Bind MDI VAO and render
+    glBindVertexArray(m_mdiVAO);
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, drawCount, 0);
     glBindVertexArray(0);
+}
+
+void InstancedQuadRenderer::renderToGBufferCulledMDI(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks)
+{
+    (void)view;
+    
+    PROFILE_SCOPE("QuadRenderer_GBuffer_MDI_Culled");
+    
+    if (visibleChunks.empty() || !m_persistentCommandPtr || !m_persistentTransformPtr) return;
+    
+    // Write draw commands and transforms directly to persistent buffers for visible chunks only
+    DrawElementsIndirectCommand* cmdPtr = static_cast<DrawElementsIndirectCommand*>(m_persistentCommandPtr);
+    glm::mat4* transformPtr = static_cast<glm::mat4*>(m_persistentTransformPtr);
+    
+    size_t drawCount = 0;
+    for (VoxelChunk* visChunk : visibleChunks) {
+        auto it = m_chunkToIndex.find(visChunk);
+        if (it == m_chunkToIndex.end()) continue;
+        
+        const auto& entry = m_chunks[it->second];
+        if (entry.instanceCount == 0) continue;
+        
+        cmdPtr[drawCount].count = 6;
+        cmdPtr[drawCount].instanceCount = entry.instanceCount;
+        cmdPtr[drawCount].firstIndex = 0;
+        cmdPtr[drawCount].baseVertex = 0;  // Always 0 for unit quad
+        cmdPtr[drawCount].baseInstance = entry.baseInstance;  // Offset into instance buffer
+        
+        transformPtr[drawCount] = entry.transform;
+        drawCount++;
+    }
+    
+    if (drawCount == 0) return;
+    
+    // Flush persistent buffers
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_persistentCommandBuffer);
+    glFlushMappedBufferRange(GL_DRAW_INDIRECT_BUFFER, 0, drawCount * sizeof(DrawElementsIndirectCommand));
+    
+    glFlushMappedBufferRange(GL_SHADER_STORAGE_BUFFER, 0, drawCount * sizeof(glm::mat4));
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_persistentTransformBuffer);
+    
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    
+    // Use MDI shader
+    glUseProgram(m_gbufferMDIProgram);
+    glUniformMatrix4fv(m_gbufferMDI_uViewProjection, 1, GL_FALSE, glm::value_ptr(viewProjection));
+    
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_blockTextureArray);
+    glUniform1i(m_gbufferMDI_uBlockTextures, 0);
+    
+    glBindVertexArray(m_mdiVAO);
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, drawCount, 0);
+    glBindVertexArray(0);
+}
+
+void InstancedQuadRenderer::renderToGBufferCulledMDI_GPU(const glm::mat4& viewProjection, const glm::mat4& view)
+{
+    (void)view;
+    
+    PROFILE_SCOPE("QuadRenderer_GBuffer_MDI_GPU_Culled");
+    
+    std::vector<VoxelChunk*> visibleChunks;
+    cullChunksGPU(viewProjection, visibleChunks);
+    
+    renderToGBufferCulledMDI(viewProjection, view, visibleChunks);
 }
 
 void InstancedQuadRenderer::clear()
 {
-    // No per-chunk VAOs/VBOs to delete - just clear the list
+    for (auto& entry : m_chunks) {
+        if (entry.vbo != 0) {
+            freeVBO(entry.vbo);
+        }
+    }
+    
     m_chunks.clear();
-    m_mdiDirty = true;  // Mark for rebuild
+    m_chunkToIndex.clear();
 }
 
 void InstancedQuadRenderer::shutdown()
@@ -932,19 +842,10 @@ void InstancedQuadRenderer::shutdown()
     }
     
     // Delete MDI buffers
-    if (m_globalVAO != 0) {
-        glDeleteVertexArrays(1, &m_globalVAO);
-        m_globalVAO = 0;
-    }
-    
-    if (m_globalInstanceVBO != 0) {
-        glDeleteBuffers(1, &m_globalInstanceVBO);
-        m_globalInstanceVBO = 0;
-    }
-    
-    if (m_indirectCommandBuffer != 0) {
-        glDeleteBuffers(1, &m_indirectCommandBuffer);
-        m_indirectCommandBuffer = 0;
+    for (auto& chunk : m_chunks) {
+        if (chunk.vbo != 0) {
+            glDeleteBuffers(1, &chunk.vbo);
+        }
     }
     
     if (m_transformSSBO != 0) {
@@ -952,139 +853,267 @@ void InstancedQuadRenderer::shutdown()
         m_transformSSBO = 0;
     }
     
-    if (m_gbufferProgram != 0) {
-        glDeleteProgram(m_gbufferProgram);
-        m_gbufferProgram = 0;
+    if (m_gbufferMDIProgram != 0) {
+        glDeleteProgram(m_gbufferMDIProgram);
+        m_gbufferMDIProgram = 0;
     }
     
-    if (m_depthProgram != 0) {
-        glDeleteProgram(m_depthProgram);
-        m_depthProgram = 0;
+    if (m_depthMDIProgram != 0) {
+        glDeleteProgram(m_depthMDIProgram);
+        m_depthMDIProgram = 0;
     }
+    
+    if (m_persistentQuadBuffer != 0) {
+        if (m_persistentQuadPtr) {
+            glBindBuffer(GL_ARRAY_BUFFER, m_persistentQuadBuffer);
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+            m_persistentQuadPtr = nullptr;
+        }
+        glDeleteBuffers(1, &m_persistentQuadBuffer);
+        m_persistentQuadBuffer = 0;
+    }
+    
+    if (m_persistentCommandBuffer != 0) {
+        if (m_persistentCommandPtr) {
+            glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_persistentCommandBuffer);
+            glUnmapBuffer(GL_DRAW_INDIRECT_BUFFER);
+            m_persistentCommandPtr = nullptr;
+        }
+        glDeleteBuffers(1, &m_persistentCommandBuffer);
+        m_persistentCommandBuffer = 0;
+    }
+    
+    if (m_persistentTransformBuffer != 0) {
+        if (m_persistentTransformPtr) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_persistentTransformBuffer);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+            m_persistentTransformPtr = nullptr;
+        }
+        glDeleteBuffers(1, &m_persistentTransformBuffer);
+        m_persistentTransformBuffer = 0;
+    }
+    
+    if (m_frustumCullProgram != 0) {
+        glDeleteProgram(m_frustumCullProgram);
+        m_frustumCullProgram = 0;
+    }
+    
+    if (m_visibilitySSBO != 0) {
+        glDeleteBuffers(1, &m_visibilitySSBO);
+        m_visibilitySSBO = 0;
+    }
+    
+    for (GLuint vbo : m_freeVBOPool) {
+        glDeleteBuffers(1, &vbo);
+    }
+    m_freeVBOPool.clear();
 }
 
 // ========== SHADOW DEPTH PASS METHODS ==========
 
 void InstancedQuadRenderer::beginDepthPass(const glm::mat4& lightVP, int /*cascadeIndex*/)
 {
-    if (m_depthProgram == 0) return;  // Not initialized
-    
-    // Shadow map begin() already called by GameClient - just set shader uniforms
-    glUseProgram(m_depthProgram);
-    if (m_depth_uLightVP != -1) {
-        glUniformMatrix4fv(m_depth_uLightVP, 1, GL_FALSE, glm::value_ptr(lightVP));
-    }
+    glUseProgram(m_depthMDIProgram);
+    glUniformMatrix4fv(m_depthMDI_uLightVP, 1, GL_FALSE, glm::value_ptr(lightVP));
 }
 
-void InstancedQuadRenderer::renderDepth()
+void InstancedQuadRenderer::renderDepthMDI()
 {
-    if (m_depthProgram == 0 || m_chunks.empty()) return;
+    PROFILE_SCOPE("QuadRenderer_Depth_MDI");
     
-    // Rebuild MDI buffers if dirty
-    if (m_mdiDirty) {
-        rebuildMDIBuffers();
-    }
+    if (m_chunks.empty() || !m_persistentCommandPtr || !m_persistentTransformPtr) return;
     
-    // Count non-empty draws
+    // Write draw commands and transforms directly to persistent buffers
+    DrawElementsIndirectCommand* cmdPtr = static_cast<DrawElementsIndirectCommand*>(m_persistentCommandPtr);
+    glm::mat4* transformPtr = static_cast<glm::mat4*>(m_persistentTransformPtr);
+    
     size_t drawCount = 0;
     for (const auto& entry : m_chunks) {
-        if (entry.instanceCount > 0) drawCount++;
+        if (entry.instanceCount == 0) continue;
+        
+        cmdPtr[drawCount].count = 6;
+        cmdPtr[drawCount].instanceCount = entry.instanceCount;
+        cmdPtr[drawCount].firstIndex = 0;
+        cmdPtr[drawCount].baseVertex = 0;  // Always 0 for unit quad
+        cmdPtr[drawCount].baseInstance = entry.baseInstance;  // Offset into instance buffer
+        
+        transformPtr[drawCount] = entry.transform;
+        drawCount++;
     }
     
-    if (drawCount == 0) {
-        return;
-    }
+    if (drawCount == 0) return;
     
-    // Update transforms every frame (islands are moving!)
-    std::vector<glm::mat4> transforms;
-    transforms.reserve(drawCount);
-    for (const auto& entry : m_chunks) {
-        if (entry.instanceCount > 0) {
-            transforms.push_back(entry.transform);
-        }
-    }
+    // Flush persistent buffers
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_persistentCommandBuffer);
+    glFlushMappedBufferRange(GL_DRAW_INDIRECT_BUFFER, 0, drawCount * sizeof(DrawElementsIndirectCommand));
     
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, transforms.size() * sizeof(glm::mat4), transforms.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_persistentTransformBuffer);
+    glFlushMappedBufferRange(GL_SHADER_STORAGE_BUFFER, 0, drawCount * sizeof(glm::mat4));
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_persistentTransformBuffer);
     
-    // Bind global VAO and transform SSBO
-    glBindVertexArray(m_globalVAO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_transformSSBO);
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
-    
-    // SINGLE MDI CALL FOR ALL CHUNKS! (shadows)
-    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
-                                static_cast<GLsizei>(drawCount), 0);
-    
+    // Render
+    glBindVertexArray(m_mdiVAO);
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, drawCount, 0);
     glBindVertexArray(0);
 }
 
-void InstancedQuadRenderer::renderDepthCulled(const std::vector<VoxelChunk*>& visibleChunks)
+void InstancedQuadRenderer::renderDepthCulledMDI(const std::vector<VoxelChunk*>& visibleChunks)
 {
-    if (m_depthProgram == 0 || m_chunks.empty() || visibleChunks.empty()) return;
+    PROFILE_SCOPE("QuadRenderer_Depth_MDI_Culled");
     
-    // Rebuild MDI buffers if dirty
-    if (m_mdiDirty) {
-        rebuildMDIBuffers();
+    if (visibleChunks.empty() || !m_persistentCommandPtr || !m_persistentTransformPtr) return;
+    
+    // Write draw commands and transforms directly to persistent buffers for visible chunks only
+    DrawElementsIndirectCommand* cmdPtr = static_cast<DrawElementsIndirectCommand*>(m_persistentCommandPtr);
+    glm::mat4* transformPtr = static_cast<glm::mat4*>(m_persistentTransformPtr);
+    
+    size_t drawCount = 0;
+    for (VoxelChunk* visChunk : visibleChunks) {
+        auto it = m_chunkToIndex.find(visChunk);
+        if (it == m_chunkToIndex.end()) continue;
+        
+        const auto& entry = m_chunks[it->second];
+        if (entry.instanceCount == 0) continue;
+        
+        cmdPtr[drawCount].count = 6;
+        cmdPtr[drawCount].instanceCount = entry.instanceCount;
+        cmdPtr[drawCount].firstIndex = 0;
+        cmdPtr[drawCount].baseVertex = 0;  // Always 0 for unit quad
+        cmdPtr[drawCount].baseInstance = entry.baseInstance;  // Offset into instance buffer
+        
+        transformPtr[drawCount] = entry.transform;
+        drawCount++;
     }
     
-    // Build list of visible chunk entries and transforms
-    std::vector<const ChunkEntry*> visibleEntries;
-    std::vector<glm::mat4> transforms;
-    visibleEntries.reserve(visibleChunks.size());
-    transforms.reserve(visibleChunks.size());
+    if (drawCount == 0) return;
     
-    for (VoxelChunk* chunk : visibleChunks) {
-        // Find chunk in our registered list
-        for (const auto& entry : m_chunks) {
-            if (entry.chunk == chunk && entry.instanceCount > 0) {
-                visibleEntries.push_back(&entry);
-                transforms.push_back(entry.transform);
-                break;
-            }
-        }
-    }
+    // Flush persistent buffers
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_persistentCommandBuffer);
+    glFlushMappedBufferRange(GL_DRAW_INDIRECT_BUFFER, 0, drawCount * sizeof(DrawElementsIndirectCommand));
     
-    if (visibleEntries.empty()) return;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_persistentTransformBuffer);
+    glFlushMappedBufferRange(GL_SHADER_STORAGE_BUFFER, 0, drawCount * sizeof(glm::mat4));
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_persistentTransformBuffer);
     
-    // Upload transforms for visible chunks
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_transformSSBO);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, transforms.size() * sizeof(glm::mat4), transforms.data());
-    
-    // Build draw commands for visible chunks only
-    std::vector<DrawElementsIndirectCommand> commands;
-    commands.reserve(visibleEntries.size());
-    
-    for (size_t i = 0; i < visibleEntries.size(); ++i) {
-        const ChunkEntry* entry = visibleEntries[i];
-        commands.push_back({
-            6,                                    // count (6 indices per quad)
-            static_cast<uint32_t>(entry->instanceCount),  // instanceCount
-            0,                                    // firstIndex
-            0,                                    // baseVertex
-            static_cast<uint32_t>(entry->baseInstance)    // baseInstance
-        });
-    }
-    
-    // Upload culled draw commands
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_indirectCommandBuffer);
-    glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0, commands.size() * sizeof(DrawElementsIndirectCommand), commands.data());
-    
-    // Bind and draw
-    glBindVertexArray(m_globalVAO);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_transformSSBO);
-    
-    // MDI call with only visible chunks
-    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, 
-                                static_cast<GLsizei>(commands.size()), 0);
-    
+    // Render
+    glBindVertexArray(m_mdiVAO);
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, drawCount, 0);
     glBindVertexArray(0);
+}
+
+void InstancedQuadRenderer::renderDepthCulledMDI_GPU(const glm::mat4& viewProjection)
+{
+    PROFILE_SCOPE("QuadRenderer_Depth_MDI_GPU_Culled");
+    
+    std::vector<VoxelChunk*> visibleChunks;
+    cullChunksGPU(viewProjection, visibleChunks);
+    
+    renderDepthCulledMDI(visibleChunks);
 }
 
 void InstancedQuadRenderer::endDepthPass(int screenWidth, int screenHeight)
 {
-    // Shadow map end() will be called by GameClient after all depth rendering
     (void)screenWidth;
     (void)screenHeight;
+}
+
+void InstancedQuadRenderer::createFrustumCullShader()
+{
+    GLuint compute = compileShader(FRUSTUM_CULL_COMPUTE, GL_COMPUTE_SHADER);
+    m_frustumCullProgram = glCreateProgram();
+    glAttachShader(m_frustumCullProgram, compute);
+    glLinkProgram(m_frustumCullProgram);
+    
+    GLint success;
+    glGetProgramiv(m_frustumCullProgram, GL_LINK_STATUS, &success);
+    if (!success) {
+        char log[512];
+        glGetProgramInfoLog(m_frustumCullProgram, 512, nullptr, log);
+        std::cerr << "Frustum cull shader link failed: " << log << std::endl;
+    }
+    
+    glDeleteShader(compute);
+}
+
+void InstancedQuadRenderer::cullChunksGPU(const glm::mat4& viewProj, std::vector<VoxelChunk*>& outVisible)
+{
+    if (m_chunks.empty()) return;
+    
+    struct ChunkAABB {
+        glm::vec3 minBounds;
+        float pad1;
+        glm::vec3 maxBounds;
+        float pad2;
+    };
+    
+    std::vector<ChunkAABB> aabbs;
+    aabbs.reserve(m_chunks.size());
+    
+    for (const auto& entry : m_chunks) {
+        const auto& cachedAABB = entry.chunk->getCachedWorldAABB();
+        ChunkAABB aabb;
+        aabb.minBounds = glm::vec3(cachedAABB.min.x, cachedAABB.min.y, cachedAABB.min.z);
+        aabb.maxBounds = glm::vec3(cachedAABB.max.x, cachedAABB.max.y, cachedAABB.max.z);
+        aabbs.push_back(aabb);
+    }
+    
+    GLuint aabbBuffer;
+    glGenBuffers(1, &aabbBuffer);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, aabbBuffer);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, aabbs.size() * sizeof(ChunkAABB), aabbs.data(), GL_STREAM_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, aabbBuffer);
+    
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_visibilitySSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, m_chunks.size() * sizeof(uint32_t), nullptr, GL_STREAM_READ);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_visibilitySSBO);
+    
+    glUseProgram(m_frustumCullProgram);
+    GLint loc = glGetUniformLocation(m_frustumCullProgram, "uViewProjection");
+    glUniformMatrix4fv(loc, 1, GL_FALSE, glm::value_ptr(viewProj));
+    
+    glDispatchCompute((m_chunks.size() + 63) / 64, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    
+    std::vector<uint32_t> visibility(m_chunks.size());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_visibilitySSBO);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, visibility.size() * sizeof(uint32_t), visibility.data());
+    
+    outVisible.clear();
+    for (size_t i = 0; i < m_chunks.size(); i++) {
+        if (visibility[i] != 0) {
+            outVisible.push_back(m_chunks[i].chunk);
+        }
+    }
+    
+    glDeleteBuffers(1, &aabbBuffer);
+}
+
+GLuint InstancedQuadRenderer::allocateVBO(size_t sizeBytes)
+{
+    if (!m_freeVBOPool.empty()) {
+        GLuint vbo = m_freeVBOPool.back();
+        m_freeVBOPool.pop_back();
+        
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        GLint currentSize = 0;
+        glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &currentSize);
+        
+        if (static_cast<size_t>(currentSize) >= sizeBytes) {
+            return vbo;
+        }
+        
+        glDeleteBuffers(1, &vbo);
+    }
+    
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeBytes, nullptr, GL_DYNAMIC_DRAW);
+    return vbo;
+}
+
+void InstancedQuadRenderer::freeVBO(GLuint vbo)
+{
+    m_freeVBOPool.push_back(vbo);
 }
 

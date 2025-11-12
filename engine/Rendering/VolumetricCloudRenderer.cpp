@@ -9,6 +9,7 @@
 #include <cmath>
 #include <algorithm>
 #include <fstream>
+#include <fstream>
 #include <filesystem>
 
 // Global cloud renderer instance
@@ -207,17 +208,9 @@ void main() {
     
     const char* kFS = cloudFS.c_str();
 
-    // Hash function for noise generation
+    // Hash function for Perlin noise (used in CPU shadow sampling)
     float hash(float n) {
         return glm::fract(sin(n) * 43758.5453123f);
-    }
-
-    // 3D hash for Worley noise
-    glm::vec3 hash3(glm::vec3 p) {
-        p = glm::vec3(glm::dot(p, glm::vec3(127.1f, 311.7f, 74.7f)),
-                      glm::dot(p, glm::vec3(269.5f, 183.3f, 246.1f)),
-                      glm::dot(p, glm::vec3(113.5f, 271.9f, 124.6f)));
-        return glm::fract(glm::sin(p) * 43758.5453123f);
     }
 }
 
@@ -341,33 +334,39 @@ bool VolumetricCloudRenderer::createGeometry() {
 }
 
 bool VolumetricCloudRenderer::create3DNoiseTexture() {
-    const int size = EngineParameters::Clouds::NOISE_TEXTURE_SIZE;
+    const int expectedSize = EngineParameters::Clouds::NOISE_TEXTURE_SIZE;
+    const char* texturePath = "assets/textures/cloud_noise_3d.bin";
+    
+    // Load pre-generated texture
+    std::ifstream file(texturePath, std::ios::binary);
+    if (!file) {
+        std::cerr << "❌ Failed to open cloud noise texture: " << texturePath << std::endl;
+        return false;
+    }
+    
+    // Read header
+    char magic[4];
+    file.read(magic, 4);
+    if (std::string(magic, 4) != "CN3D") {
+        std::cerr << "❌ Invalid cloud noise texture format" << std::endl;
+        return false;
+    }
+    
+    uint32_t size;
+    file.read(reinterpret_cast<char*>(&size), sizeof(uint32_t));
+    if (size != expectedSize) {
+        std::cerr << "❌ Cloud noise texture size mismatch: expected " << expectedSize 
+                  << ", got " << size << std::endl;
+        return false;
+    }
+    
+    // Read texture data
     std::vector<unsigned char> noiseData(size * size * size);
+    file.read(reinterpret_cast<char*>(noiseData.data()), noiseData.size());
     
-    std::cout << "Generating " << size << "^3 cloud noise texture..." << std::endl;
-    
-    // Generate 3D Perlin-Worley noise
-    for (int z = 0; z < size; z++) {
-        for (int y = 0; y < size; y++) {
-            for (int x = 0; x < size; x++) {
-                float nx = float(x) / float(size);
-                float ny = float(y) / float(size);
-                float nz = float(z) / float(size);
-                
-                // Perlin noise component
-                float perlin = perlinNoise3D(nx * 4.0f, ny * 4.0f, nz * 4.0f);
-                
-                // Worley noise component
-                float worley = worleyNoise3D(nx * 2.0f, ny * 2.0f, nz * 2.0f);
-                
-                // Combine (Perlin-Worley hybrid)
-                float noise = perlin * 0.6f + worley * 0.4f;
-                noise = std::clamp(noise, 0.0f, 1.0f);
-                
-                int index = x + y * size + z * size * size;
-                noiseData[index] = static_cast<unsigned char>(noise * 255.0f);
-            }
-        }
+    if (!file) {
+        std::cerr << "❌ Failed to read cloud noise texture data" << std::endl;
+        return false;
     }
     
     // Create 3D texture
@@ -384,7 +383,7 @@ bool VolumetricCloudRenderer::create3DNoiseTexture() {
     
     glBindTexture(GL_TEXTURE_3D, 0);
     
-    std::cout << "Cloud noise texture generated successfully" << std::endl;
+    std::cout << "✓ Loaded " << size << "^3 cloud noise texture" << std::endl;
     return true;
 }
 
@@ -423,30 +422,6 @@ float VolumetricCloudRenderer::perlinNoise3D(float x, float y, float z) {
     float nxy1 = glm::mix(nx01, nx11, v);
     
     return glm::mix(nxy0, nxy1, w);
-}
-
-float VolumetricCloudRenderer::worleyNoise3D(float x, float y, float z) {
-    // Simplified Worley (cellular) noise
-    glm::vec3 point(x, y, z);
-    glm::vec3 cell = glm::floor(point);
-    glm::vec3 frac = glm::fract(point);
-    
-    float minDist = 1.0f;
-    
-    // Check neighboring cells
-    for (int dz = -1; dz <= 1; dz++) {
-        for (int dy = -1; dy <= 1; dy++) {
-            for (int dx = -1; dx <= 1; dx++) {
-                glm::vec3 neighbor = cell + glm::vec3(dx, dy, dz);
-                glm::vec3 feature = hash3(neighbor);
-                glm::vec3 diff = (neighbor + feature) - point;
-                float dist = glm::length(diff);
-                minDist = std::min(minDist, dist);
-            }
-        }
-    }
-    
-    return 1.0f - minDist; // Invert so higher = more solid
 }
 
 void VolumetricCloudRenderer::render(const glm::vec3& sunDirection, float sunIntensity,
