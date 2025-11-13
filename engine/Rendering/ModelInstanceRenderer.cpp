@@ -14,9 +14,19 @@
 
 // Global instance
 std::unique_ptr<ModelInstanceRenderer> g_modelRenderer = nullptr;
-extern ShadowMap g_shadowMap;
+extern LightMap g_lightMap;
 
 namespace {
+    // ========== GPU OCCLUSION CULLING COMPUTE SHADER ==========
+    // DISABLED: CPU readback is slower than just rendering everything
+    // For 8K shadow maps, better to render extra geometry than stall pipeline
+    // GBuffer culling works best with GPU-driven rendering (indirect draw with GPU compaction)
+    static const char* kOcclusionCullCS = R"GLSL(
+#version 460 core
+layout(local_size_x = 64) in;
+void main() {}
+)GLSL";
+
     // ========== DEPTH SHADERS (for shadow map rendering) ==========
     static const char* kDepthVS = R"GLSL(
 #version 460 core
@@ -233,24 +243,12 @@ uniform int uNumCascades;         // Number of cascades (typically 2)
 
 out vec4 FragColor;
 
-// Poisson disk with 32 samples for high-quality soft shadows (match voxel shader)
-const vec2 POISSON[32] = vec2[32](
+// Poisson disk with 8 samples for optimized soft shadows
+const vec2 POISSON[8] = vec2[8](
     vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725),
     vec2(-0.09418410, -0.92938870), vec2(0.34495938, 0.29387760),
     vec2(-0.91588581, 0.45771432), vec2(-0.81544232, -0.87912464),
-    vec2(-0.38277543, 0.27676845), vec2(0.97484398, 0.75648379),
-    vec2(0.44323325, -0.97511554), vec2(0.53742981, -0.47373420),
-    vec2(-0.26496911, -0.41893023), vec2(0.79197514, 0.19090188),
-    vec2(-0.24188840, 0.99706507), vec2(-0.81409955, 0.91437590),
-    vec2(0.19984126, 0.78641367), vec2(0.14383161, -0.14100790),
-    vec2(-0.52748980, -0.18467720), vec2(0.64042155, 0.55584620),
-    vec2(-0.58689597, 0.67128760), vec2(0.24767240, -0.51805620),
-    vec2(-0.09192791, -0.54150760), vec2(0.89877152, -0.24330990),
-    vec2(0.33697340, 0.90091330), vec2(-0.41818693, -0.85628360),
-    vec2(0.69197035, -0.06798679), vec2(-0.97010720, 0.16373110),
-    vec2(0.06372385, 0.37408390), vec2(-0.63902735, -0.56419730),
-    vec2(0.56546623, 0.25234550), vec2(-0.23892370, 0.51662970),
-    vec2(0.13814290, 0.98162460), vec2(-0.46671060, 0.16780830)
+    vec2(-0.38277543, 0.27676845), vec2(0.97484398, 0.75648379)
 );
 
 // Cascade split: hard cutoff at 128 blocks (no blending)
@@ -273,16 +271,16 @@ float sampleCascadePCF(int cascadeIndex, vec3 worldPos, float bias) {
     
     float current = proj.z - bias;
     
-    float baseRadius = 2048.0;
+    float baseRadius = 64.0;
     float radiusScale = (cascadeIndex == 0) ? 1.0 : 0.125;
     float radius = baseRadius * radiusScale * uShadowTexel;
     
     float sum = 0.0;
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < 8; ++i) {
         vec2 offset = POISSON[i] * radius;
         sum += texture(uShadowMap, vec4(proj.xy + offset, cascadeIndex, current));
     }
-    return sum / 64.0;
+    return sum / 8.0;
 }
 
 float sampleShadowPCF(float bias)
@@ -561,11 +559,49 @@ GLuint ModelInstanceRenderer::compileShaderForBlock(uint8_t blockID) {
 }
 
 bool ModelInstanceRenderer::initialize() {
-    // Shaders are now compiled lazily per-block type
+    // Compile occlusion culling compute shader
+    GLuint cs = Compile(GL_COMPUTE_SHADER, kOcclusionCullCS);
+    if (cs) {
+        m_occlusionCullProgram = glCreateProgram();
+        glAttachShader(m_occlusionCullProgram, cs);
+        glLinkProgram(m_occlusionCullProgram);
+        glDeleteShader(cs);
+        
+        GLint success;
+        glGetProgramiv(m_occlusionCullProgram, GL_LINK_STATUS, &success);
+        if (!success) {
+            char log[512];
+            glGetProgramInfoLog(m_occlusionCullProgram, 512, nullptr, log);
+            std::cerr << "❌ Occlusion cull compute shader link failed: " << log << std::endl;
+            glDeleteProgram(m_occlusionCullProgram);
+            m_occlusionCullProgram = 0;
+        } else {
+            std::cout << "✅ GPU occlusion culling compute shader compiled" << std::endl;
+        }
+    }
+    
+    // Create GPU buffers for culling
+    glGenBuffers(1, &m_visibilityBuffer);
+    glGenBuffers(1, &m_culledInstanceBuffer);
+    
     return true;
 }
 
 void ModelInstanceRenderer::shutdown() {
+    // Clean up occlusion culling resources
+    if (m_occlusionCullProgram) {
+        glDeleteProgram(m_occlusionCullProgram);
+        m_occlusionCullProgram = 0;
+    }
+    if (m_visibilityBuffer) {
+        glDeleteBuffers(1, &m_visibilityBuffer);
+        m_visibilityBuffer = 0;
+    }
+    if (m_culledInstanceBuffer) {
+        glDeleteBuffers(1, &m_culledInstanceBuffer);
+        m_culledInstanceBuffer = 0;
+    }
+    
     // Clean up all instance buffers and their VAOs
     for (auto& kv : m_chunkInstances) {
         if (kv.second.instanceVBO) glDeleteBuffers(1, &kv.second.instanceVBO);
@@ -602,6 +638,10 @@ void ModelInstanceRenderer::shutdown() {
     
     // Clean up depth shader
     if (m_depthProgram) { glDeleteProgram(m_depthProgram); m_depthProgram = 0; }
+    
+    // Clean up light depth MDI buffers
+    if (m_lightDepthCommandBuffer) { glDeleteBuffers(1, &m_lightDepthCommandBuffer); m_lightDepthCommandBuffer = 0; }
+    if (m_lightDepthInstanceBuffer) { glDeleteBuffers(1, &m_lightDepthInstanceBuffer); m_lightDepthInstanceBuffer = 0; }
 }
 
 bool ModelInstanceRenderer::loadModel(uint8_t blockID, const std::string& path) {
@@ -865,129 +905,7 @@ void ModelInstanceRenderer::updateModelMatrix(uint8_t blockID, VoxelChunk* chunk
     ensureChunkInstancesUploaded(blockID, chunk);
 }
 
-void ModelInstanceRenderer::renderToGBuffer(const glm::mat4& view, const glm::mat4& proj) {
-    // Disable culling for foliage rendering
-    GLboolean wasCull = glIsEnabled(GL_CULL_FACE);
-    if (wasCull) glDisable(GL_CULL_FACE);
-    
-    // Extract camera position for distance culling
-    glm::mat4 invView = glm::inverse(view);
-    glm::vec3 cameraPos = glm::vec3(invView[3]);
-    const float maxRenderDistance = 512.0f;
-    const float maxRenderDistanceSq = maxRenderDistance * maxRenderDistance;
-    
-    // Iterate through each block type
-    for (const auto& [blockID, model] : m_models) {
-        if (!model.valid) continue;
-        
-        // Skip water - it's rendered in the transparent forward pass
-        if (blockID == 45) continue;  // BlockID::WATER
-        
-        // Get or compile G-buffer shader for this block type
-        GLuint shader = 0;
-        auto shaderIt = m_gbufferShaders.find(blockID);
-        if (shaderIt == m_gbufferShaders.end()) {
-            // Get block-specific vertex shader (water, wind, or static)
-            const char* vertexShader = kVS_Static;
-            if (blockID == 45) {  // BlockID::WATER
-                vertexShader = kVS_Water;
-            } else if (blockID == 102) {  // BlockID::DECOR_GRASS
-                vertexShader = kVS_Wind;
-            }
-            
-            GLuint vsShader = Compile(GL_VERTEX_SHADER, vertexShader);
-            GLuint fsShader = Compile(GL_FRAGMENT_SHADER, kGBuffer_FS);
-            if (vsShader && fsShader) {
-                shader = Link(vsShader, fsShader);
-                glDeleteShader(vsShader);
-                glDeleteShader(fsShader);
-                m_gbufferShaders[blockID] = shader;
-            } else {
-                continue;
-            }
-        } else {
-            shader = shaderIt->second;
-        }
-        
-        if (!shader) continue;
-        
-        // Bind shader
-        glUseProgram(shader);
-        
-        // Set uniforms
-        int loc_View = glGetUniformLocation(shader, "uView");
-        int loc_Proj = glGetUniformLocation(shader, "uProjection");
-        int loc_Model = glGetUniformLocation(shader, "uModel");
-        int loc_Time = glGetUniformLocation(shader, "uTime");
-        int loc_Texture = glGetUniformLocation(shader, "uGrassTexture");
-        int loc_MaterialType = glGetUniformLocation(shader, "uMaterialType");
-        
-        glUniformMatrix4fv(loc_View, 1, GL_FALSE, &view[0][0]);
-        glUniformMatrix4fv(loc_Proj, 1, GL_FALSE, &proj[0][0]);
-        glUniform1f(loc_Time, m_time);
-        
-        // Set material type: 0=textured, 1=water
-        int materialType = (blockID == 45) ? 1 : 0;  // BlockID::WATER = 45
-        if (loc_MaterialType != -1) {
-            glUniform1i(loc_MaterialType, materialType);
-        }
-        
-        // Bind texture - CRITICAL: Must bind before rendering or will sample wrong texture!
-        GLuint tex = 0;
-        if (blockID == 102 && m_engineGrassTex) {
-            tex = m_engineGrassTex;
-        } else {
-            auto texIt = m_albedoTextures.find(blockID);
-            if (texIt != m_albedoTextures.end()) {
-                tex = texIt->second;
-            }
-        }
-        
-        // Fallback: If no texture found, use a default texture (prevents sampling voxel array)
-        if (!tex) {
-            static GLuint fallbackTex = 0;
-            if (!fallbackTex) {
-                // Load fallback texture once (iron_block.png)
-                if (!g_textureManager) g_textureManager = new TextureManager();
-                fallbackTex = g_textureManager->getTexture("iron_block.png");
-            }
-            tex = fallbackTex;
-        }
-        
-        if (tex && loc_Texture >= 0) {
-            glActiveTexture(GL_TEXTURE5);
-            glBindTexture(GL_TEXTURE_2D, tex);
-            glUniform1i(loc_Texture, 5);
-        }
-        
-        // Render all chunks with this block type
-        for (auto& [key, buf] : m_chunkInstances) {
-            if (key.second != blockID) continue;
-            if (buf.count == 0 || !buf.isUploaded) continue;
-            
-            // Distance culling
-            glm::vec3 chunkPos = glm::vec3(buf.modelMatrix[3]);
-            glm::vec3 delta = cameraPos - chunkPos;
-            float distanceSq = glm::dot(delta, delta);
-            if (distanceSq > maxRenderDistanceSq) continue;
-            
-            // Set model matrix
-            glUniformMatrix4fv(loc_Model, 1, GL_FALSE, &buf.modelMatrix[0][0]);
-            
-            // Render instances
-            for (size_t i = 0; i < buf.vaos.size() && i < model.primitives.size(); ++i) {
-                glBindVertexArray(buf.vaos[i]);
-                glDrawElementsInstanced(GL_TRIANGLES, model.primitives[i].indexCount, GL_UNSIGNED_INT, 0, buf.count);
-            }
-        }
-    }
-    
-    // Cleanup
-    glBindVertexArray(0);
-    if (wasCull) glEnable(GL_CULL_FACE);
-}
-
-void ModelInstanceRenderer::renderToGBufferCulled(const glm::mat4& view, const glm::mat4& proj, const std::vector<VoxelChunk*>& visibleChunks) {
+void ModelInstanceRenderer::renderToGBufferVisible(const glm::mat4& view, const glm::mat4& proj, const std::vector<VoxelChunk*>& visibleChunks) {
     PROFILE_SCOPE("ModelRenderer_GBuffer");
     if (visibleChunks.empty()) return;
     
@@ -1087,7 +1005,11 @@ void ModelInstanceRenderer::renderToGBufferCulled(const glm::mat4& view, const g
             glUniform1i(loc_Texture, 5);
         }
         
-        // Render only chunks in visible set
+        // Collect all instances for this block type globally (with frustum culling)
+        std::vector<float> globalInstanceData;
+        GLsizei totalInstances = 0;
+        glm::mat4 identityMatrix = glm::mat4(1.0f);
+        
         for (auto& [key, buf] : m_chunkInstances) {
             if (key.second != blockID) continue;
             if (buf.count == 0 || !buf.isUploaded) continue;
@@ -1101,14 +1023,70 @@ void ModelInstanceRenderer::renderToGBufferCulled(const glm::mat4& view, const g
             float distanceSq = glm::dot(delta, delta);
             if (distanceSq > maxRenderDistanceSq) continue;
             
-            // Set model matrix
-            glUniformMatrix4fv(loc_Model, 1, GL_FALSE, &buf.modelMatrix[0][0]);
+            // Read back instance data and transform to world space
+            std::vector<float> chunkData(buf.count * 4);
+            glBindBuffer(GL_ARRAY_BUFFER, buf.instanceVBO);
+            glGetBufferSubData(GL_ARRAY_BUFFER, 0, chunkData.size() * sizeof(float), chunkData.data());
             
-            // Render instances
-            for (size_t i = 0; i < buf.vaos.size() && i < model.primitives.size(); ++i) {
-                glBindVertexArray(buf.vaos[i]);
-                glDrawElementsInstanced(GL_TRIANGLES, model.primitives[i].indexCount, GL_UNSIGNED_INT, 0, buf.count);
+            // Transform instances to world space
+            for (GLsizei i = 0; i < buf.count; ++i) {
+                glm::vec3 localPos(chunkData[i*4], chunkData[i*4+1], chunkData[i*4+2]);
+                glm::vec4 worldPos = buf.modelMatrix * glm::vec4(localPos, 1.0f);
+                globalInstanceData.push_back(worldPos.x);
+                globalInstanceData.push_back(worldPos.y);
+                globalInstanceData.push_back(worldPos.z);
+                globalInstanceData.push_back(chunkData[i*4+3]); // phase
             }
+            totalInstances += buf.count;
+        }
+        
+        if (totalInstances == 0) continue;
+        
+        // Upload global instance buffer
+        static GLuint globalInstanceVBO = 0;
+        if (globalInstanceVBO == 0) {
+            glGenBuffers(1, &globalInstanceVBO);
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, globalInstanceVBO);
+        glBufferData(GL_ARRAY_BUFFER, globalInstanceData.size() * sizeof(float), globalInstanceData.data(), GL_STREAM_DRAW);
+        
+        // Use identity matrix since instances are already in world space
+        glUniformMatrix4fv(loc_Model, 1, GL_FALSE, &identityMatrix[0][0]);
+        
+        // Render all instances with a single draw call per primitive
+        for (size_t i = 0; i < model.primitives.size(); ++i) {
+            // Create temporary VAO for global rendering
+            static std::vector<GLuint> globalVAOs;
+            if (globalVAOs.size() <= i) {
+                globalVAOs.resize(i + 1, 0);
+            }
+            if (globalVAOs[i] == 0) {
+                glGenVertexArrays(1, &globalVAOs[i]);
+            }
+            
+            const auto& prim = model.primitives[i];
+            glBindVertexArray(globalVAOs[i]);
+            
+            // Bind model vertex/index buffers
+            glBindBuffer(GL_ARRAY_BUFFER, prim.vbo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, prim.ebo);
+            
+            // Setup vertex attributes: pos(3), normal(3), uv(2)
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(float)*8, (void*)0);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(float)*8, (void*)(sizeof(float)*3));
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(float)*8, (void*)(sizeof(float)*6));
+            
+            // Bind global instance buffer
+            glBindBuffer(GL_ARRAY_BUFFER, globalInstanceVBO);
+            glEnableVertexAttribArray(4);
+            glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, sizeof(float)*4, (void*)0);
+            glVertexAttribDivisor(4, 1);
+            
+            // Single draw call for all instances
+            glDrawElementsInstanced(GL_TRIANGLES, prim.indexCount, GL_UNSIGNED_INT, 0, totalInstances);
         }
     }
     
@@ -1117,10 +1095,18 @@ void ModelInstanceRenderer::renderToGBufferCulled(const glm::mat4& view, const g
     if (wasCull) glEnable(GL_CULL_FACE);
 }
 
-// ========== SHADOW PASS METHODS ==========
+// ========== LIGHT DEPTH PASS ==========
 
-void ModelInstanceRenderer::beginDepthPass(const glm::mat4& lightVP, int cascadeIndex)
+void ModelInstanceRenderer::renderLightDepthMDI(const glm::mat4& lightVP, const std::vector<VoxelChunk*>& visibleChunks,
+                                                GLuint gbufferPositionTex, const glm::mat4& viewProj, const glm::vec3& cameraPos)
 {
+    PROFILE_SCOPE("Models_LightDepth_MDI");
+    
+    if (m_chunkInstances.empty() || visibleChunks.empty()) return;
+    
+    // Build set of visible chunks for fast lookup (same as GBuffer pass)
+    std::unordered_set<VoxelChunk*> visibleSet(visibleChunks.begin(), visibleChunks.end());
+    
     // Compile depth shader if not already done
     if (m_depthProgram == 0) {
         GLuint vs = Compile(GL_VERTEX_SHADER, kDepthVS);
@@ -1138,57 +1124,65 @@ void ModelInstanceRenderer::beginDepthPass(const glm::mat4& lightVP, int cascade
         }
     }
     
-    if (m_depthProgram == 0) return;  // Failed to compile
+    if (m_depthProgram == 0) return;
     
-    // Shadow map begin() already called by GameClient - just set shader uniforms
+    // Create light depth buffers if needed
+    if (m_lightDepthCommandBuffer == 0) {
+        glGenBuffers(1, &m_lightDepthCommandBuffer);
+        glGenBuffers(1, &m_lightDepthInstanceBuffer);
+    }
     
     glUseProgram(m_depthProgram);
-    if (m_depth_uLightVP != -1) {
-        glUniformMatrix4fv(m_depth_uLightVP, 1, GL_FALSE, &lightVP[0][0]);
-    }
-    if (m_depth_uTime != -1) {
-        glUniform1f(m_depth_uTime, m_time);  // Apply wind animation to shadows
-    }
-}
-
-void ModelInstanceRenderer::renderDepth()
-{
-    if (m_depthProgram == 0) return;  // Not initialized
+    if (m_depth_uLightVP != -1) glUniformMatrix4fv(m_depth_uLightVP, 1, GL_FALSE, &lightVP[0][0]);
+    if (m_depth_uTime != -1) glUniform1f(m_depth_uTime, m_time);
     
-    // Render all uploaded instances into shadow map
+    // NEW APPROACH: Render per-chunk with GPU transform (no CPU readback!)
+    // Group chunks by block type for efficient VAO binding
+    std::unordered_map<uint8_t, std::vector<std::pair<VoxelChunk*, ChunkInstanceBuffer*>>> chunksByType;
+    
     for (auto& [key, buf] : m_chunkInstances) {
         auto [chunk, blockID] = key;
+        if (buf.count == 0 || !buf.isUploaded) continue;
         
-        if (buf.count == 0) continue;
+        // Skip chunks outside camera frustum
+        if (visibleSet.find(chunk) == visibleSet.end()) continue;
         
-        // Find model GPU data
+        chunksByType[blockID].emplace_back(chunk, &buf);
+    }
+    
+    // Render each block type
+    for (auto& [blockID, chunks] : chunksByType) {
         auto modelIt = m_models.find(blockID);
         if (modelIt == m_models.end()) continue;
         
-        // Use stored model matrix from forward pass
-        glm::mat4 model = buf.modelMatrix;
+        const auto& model = modelIt->second;
+        if (!model.valid || model.primitives.empty()) continue;
         
-        if (m_depth_uModel != -1) {
-            glUniformMatrix4fv(m_depth_uModel, 1, GL_FALSE, &model[0][0]);
-        }
-        
-        // Culling already disabled by CascadedShadowMap::begin() - don't touch it
-        
-        // Render instanced models using per-chunk VAOs
-        for (size_t i = 0; i < buf.vaos.size() && i < modelIt->second.primitives.size(); ++i) {
-            glBindVertexArray(buf.vaos[i]);
-            glDrawElementsInstanced(GL_TRIANGLES, modelIt->second.primitives[i].indexCount, GL_UNSIGNED_INT, 0, buf.count);
-            glBindVertexArray(0);
+        // Render each chunk for this block type
+        for (auto& [chunk, buf] : chunks) {
+            // Set chunk transform (GPU does instance position transform!)
+            if (m_depth_uModel != -1) {
+                glUniformMatrix4fv(m_depth_uModel, 1, GL_FALSE, &buf->modelMatrix[0][0]);
+            }
+            
+            // Render all primitives with this chunk's instances
+            for (size_t primIdx = 0; primIdx < model.primitives.size(); ++primIdx) {
+                const auto& prim = model.primitives[primIdx];
+                
+                // Get or create VAO for this primitive
+                if (buf->vaos.size() <= primIdx || buf->vaos[primIdx] == 0) {
+                    // VAO not created yet - shouldn't happen, but handle gracefully
+                    continue;
+                }
+                
+                GLuint vao = buf->vaos[primIdx];
+                glBindVertexArray(vao);
+                glDrawElementsInstanced(GL_TRIANGLES, prim.indexCount, GL_UNSIGNED_INT, 0, buf->count);
+            }
         }
     }
-}
-
-void ModelInstanceRenderer::endDepthPass(int screenWidth, int screenHeight)
-{
-    // Shadow map end() will be called by GameClient after all depth rendering
-    // This method exists for API consistency but doesn't need to do anything
-    (void)screenWidth;
-    (void)screenHeight;
+    
+    glBindVertexArray(0);
 }
 
 // ========== TRANSPARENT WATER FORWARD PASS ==========
@@ -1263,24 +1257,88 @@ void ModelInstanceRenderer::renderWaterTransparent(const glm::mat4& view, const 
     glUniform1f(loc_MoonIntensity, moonIntensity);
     glUniform3fv(loc_CameraPos, 1, &cameraPos[0]);
     
-    // Render all water instances
+    // Collect all water instances globally
+    std::vector<float> globalWaterData;
+    GLsizei totalWaterInstances = 0;
+    glm::mat4 identityMatrix = glm::mat4(1.0f);
+    
     for (auto& [key, buf] : m_chunkInstances) {
         auto [chunk, blockID] = key;
         if (blockID != waterBlockID) continue;
         if (buf.count == 0 || !buf.isUploaded) continue;
         
-        // Set model matrix (stored in buffer)
-        if (loc_Model != -1) {
-            glUniformMatrix4fv(loc_Model, 1, GL_FALSE, &buf.modelMatrix[0][0]);
+        // Read back instance data and transform to world space
+        std::vector<float> chunkData(buf.count * 4);
+        glBindBuffer(GL_ARRAY_BUFFER, buf.instanceVBO);
+        glGetBufferSubData(GL_ARRAY_BUFFER, 0, chunkData.size() * sizeof(float), chunkData.data());
+        
+        // Transform instances to world space
+        for (GLsizei i = 0; i < buf.count; ++i) {
+            glm::vec3 localPos(chunkData[i*4], chunkData[i*4+1], chunkData[i*4+2]);
+            glm::vec4 worldPos = buf.modelMatrix * glm::vec4(localPos, 1.0f);
+            globalWaterData.push_back(worldPos.x);
+            globalWaterData.push_back(worldPos.y);
+            globalWaterData.push_back(worldPos.z);
+            globalWaterData.push_back(chunkData[i*4+3]); // phase
+        }
+        totalWaterInstances += buf.count;
+    }
+    
+    if (totalWaterInstances == 0) {
+        glDisable(GL_CULL_FACE);
+        return;
+    }
+    
+    // Upload global water instance buffer
+    static GLuint globalWaterVBO = 0;
+    if (globalWaterVBO == 0) {
+        glGenBuffers(1, &globalWaterVBO);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, globalWaterVBO);
+    glBufferData(GL_ARRAY_BUFFER, globalWaterData.size() * sizeof(float), globalWaterData.data(), GL_STREAM_DRAW);
+    
+    // Use identity matrix since instances are already in world space
+    if (loc_Model != -1) {
+        glUniformMatrix4fv(loc_Model, 1, GL_FALSE, &identityMatrix[0][0]);
+    }
+    
+    // Render all water instances with a single draw call per primitive
+    for (size_t i = 0; i < modelIt->second.primitives.size(); ++i) {
+        // Create temporary VAO for global water rendering
+        static std::vector<GLuint> globalWaterVAOs;
+        if (globalWaterVAOs.size() <= i) {
+            globalWaterVAOs.resize(i + 1, 0);
+        }
+        if (globalWaterVAOs[i] == 0) {
+            glGenVertexArrays(1, &globalWaterVAOs[i]);
         }
         
-        // Render instanced water
-        for (size_t i = 0; i < buf.vaos.size() && i < modelIt->second.primitives.size(); ++i) {
-            glBindVertexArray(buf.vaos[i]);
-            glDrawElementsInstanced(GL_TRIANGLES, modelIt->second.primitives[i].indexCount, GL_UNSIGNED_INT, 0, buf.count);
-            glBindVertexArray(0);
-        }
+        const auto& prim = modelIt->second.primitives[i];
+        glBindVertexArray(globalWaterVAOs[i]);
+        
+        // Bind model vertex/index buffers
+        glBindBuffer(GL_ARRAY_BUFFER, prim.vbo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, prim.ebo);
+        
+        // Setup vertex attributes: pos(3), normal(3), uv(2)
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(float)*8, (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(float)*8, (void*)(sizeof(float)*3));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(float)*8, (void*)(sizeof(float)*6));
+        
+        // Bind global instance buffer
+        glBindBuffer(GL_ARRAY_BUFFER, globalWaterVBO);
+        glEnableVertexAttribArray(4);
+        glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, sizeof(float)*4, (void*)0);
+        glVertexAttribDivisor(4, 1);
+        
+        // Single draw call for all water instances
+        glDrawElementsInstanced(GL_TRIANGLES, prim.indexCount, GL_UNSIGNED_INT, 0, totalWaterInstances);
     }
+    
+    glBindVertexArray(0);
     
     // Restore culling state
     glDisable(GL_CULL_FACE);

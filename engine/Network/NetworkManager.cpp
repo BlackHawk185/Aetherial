@@ -7,6 +7,7 @@
 #include "NetworkMessages.h"
 
 #include "../Physics/PhysicsSystem.h"
+#include "../Profiling/Profiler.h"
 
 NetworkManager::NetworkManager() : isNetworkingEnabled(false)
 {
@@ -174,6 +175,8 @@ void NetworkManager::leaveServer()
 
 void NetworkManager::update()
 {
+    PROFILE_SCOPE("NetworkManager::update");
+    
     if (server && server->isRunning())
     {
         server->update();

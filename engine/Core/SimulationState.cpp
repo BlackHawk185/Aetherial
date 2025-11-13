@@ -4,6 +4,7 @@
 #include "../World/BlockType.h"
 #include "../World/VoronoiIslandPlacer.h"
 #include "../World/VoxelChunk.h"
+#include "../Profiling/Profiler.h"
 #include <iostream>
 #include <random>
 #include <future>
@@ -63,6 +64,8 @@ void SimulationState::shutdown()
 
 void SimulationState::updateSimulation(float deltaTime)
 {
+    PROFILE_SCOPE("SimulationState::updateSimulation");
+    
     if (!m_initialized)
     {
         return;
@@ -77,6 +80,8 @@ void SimulationState::updateSimulation(float deltaTime)
 
 void SimulationState::updatePhysics(float deltaTime, PhysicsSystem* physics)
 {
+    PROFILE_SCOPE("SimulationState::updatePhysics");
+    
     if (!m_initialized || !physics)
     {
         return;
@@ -128,9 +133,9 @@ void SimulationState::createDefaultWorld()
     // World generation config
     struct WorldGenConfig {
         uint32_t worldSeed;
-        float regionSize = 3000.0f;
+        float regionSize = 2500.0f;
         float voronoiCellSizeMin = 1000.0f;   // Min Voronoi cell size (determines spacing & island size)
-        float voronoiCellSizeMax = 2000.0f;  // Max Voronoi cell size (variation in spacing & size)
+        float voronoiCellSizeMax = 1500.0f;  // Max Voronoi cell size (variation in spacing & size)
         float islandToVoronoiCellRatio = 0.75f;  // Island radius = 35% of cell size (30-40% with noise)
     } config;
     config.worldSeed = randomSeed;

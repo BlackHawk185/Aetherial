@@ -205,7 +205,7 @@ private:
     /**
      * Render shadow depth pass for cascaded shadow mapping
      */
-    void renderShadowPass(const std::vector<VoxelChunk*>& visibleChunks);
+    void renderLightDepthPass(const std::vector<VoxelChunk*>& visibleChunks);
     
     /**
      * Handle received world state from server

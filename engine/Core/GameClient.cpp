@@ -44,7 +44,7 @@
 
 // External systems
 extern TimeEffects* g_timeEffects;
-extern ShadowMap g_shadowMap;
+extern LightMap g_lightMap;
 
 GameClient::GameClient()
 {
@@ -435,7 +435,7 @@ bool GameClient::initializeGraphics()
 
     // Initialize light map system (must happen before renderers that use it)
     // 4 cascades: 2 for sun (near+far), 2 for moon (near+far)
-    if (!g_shadowMap.initialize(8192, 4))
+    if (!g_lightMap.initialize(8192, 4))
     {
         std::cerr << "❌ Failed to initialize light map system!" << std::endl;
         return false;
@@ -885,7 +885,10 @@ void GameClient::renderWorld()
     }
     
     // Sync island physics to chunk transforms (updates GLB instances)
-    syncPhysicsToChunks();
+    {
+        PROFILE_SCOPE("syncPhysicsToChunks");
+        syncPhysicsToChunks();
+    }
 
     // Get camera matrices once
     float aspect = (float)m_windowWidth / (float)m_windowHeight;
@@ -901,13 +904,6 @@ void GameClient::renderWorld()
     {
         PROFILE_SCOPE("FrustumCull");
         m_clientWorld->getIslandSystem()->getVisibleChunksFrustum(frustum, visibleChunks);
-    }
-    
-    // Light depth pass (throttled - only update every Nth frame for performance)
-    m_frameCounter++;
-    if (m_frameCounter % m_shadowUpdateInterval == 0)
-    {
-        renderShadowPass(visibleChunks);
     }
 
     // === DEFERRED RENDERING PIPELINE ===
@@ -928,10 +924,18 @@ void GameClient::renderWorld()
         // Render GLB models to G-buffer (frustum culled)
         if (g_modelRenderer)
         {
-            g_modelRenderer->renderToGBufferCulled(viewMatrix, projectionMatrix, visibleChunks);
+            g_modelRenderer->renderToGBufferVisible(viewMatrix, projectionMatrix, visibleChunks);
         }
         
         g_gBuffer.unbind();
+    }
+    
+    // 2. Light Depth Pass: Render shadow maps (uses GBuffer for occlusion culling)
+    // Throttled - only update every Nth frame for performance
+    m_frameCounter++;
+    if (m_frameCounter % m_shadowUpdateInterval == 0)
+    {
+        renderLightDepthPass(visibleChunks);
     }
     
     // Get shared data for lighting and sky rendering
@@ -946,14 +950,14 @@ void GameClient::renderWorld()
     const Vec3& camPos = m_playerController.getCamera().position;
     glm::vec3 cameraPosGLM(camPos.x, camPos.y, camPos.z);
 
-    // 2. Lighting Pass: Read G-buffer, apply light maps, output to HDR framebuffer
+    // 3. Lighting Pass: Read G-buffer, apply light maps, output to HDR framebuffer
     {
         PROFILE_SCOPE("Deferred_Lighting_Pass");
         
         // Update cascade data in deferred lighting pass (4 cascades: 2 sun + 2 moon)
-        for (int i = 0; i < g_shadowMap.getNumCascades(); ++i)
+        for (int i = 0; i < g_lightMap.getNumCascades(); ++i)
         {
-            const CascadeData& cascade = g_shadowMap.getCascade(i);
+            const CascadeData& cascade = g_lightMap.getCascade(i);
             g_deferredLighting.setCascadeData(i, cascade.viewProj, cascade.splitDistance, cascade.orthoSize);
         }
         
@@ -1057,16 +1061,22 @@ void GameClient::renderWorld()
     }
 }
 
-void GameClient::renderShadowPass(const std::vector<VoxelChunk*>& visibleChunks)
+void GameClient::renderLightDepthPass(const std::vector<VoxelChunk*>& visibleChunks)
 {
-    PROFILE_SCOPE("GameClient::renderLightPass");
+    PROFILE_SCOPE("GameClient::renderLightDepthPass");
+    
+    // Get camera matrices for GBuffer culling
+    float aspect = (float)m_windowWidth / (float)m_windowHeight;
+    glm::mat4 projectionMatrix = m_playerController.getCamera().getProjectionMatrix(aspect);
+    glm::mat4 viewMatrix = m_playerController.getCamera().getViewMatrix();
+    glm::mat4 viewProj = projectionMatrix * viewMatrix;
     
     // Get sun and moon directions from DayNightController
     Vec3 sunDir = m_dayNightController ? m_dayNightController->getSunDirection() : Vec3(-0.3f, -1.0f, -0.2f).normalized();
     Vec3 moonDir = m_dayNightController ? m_dayNightController->getMoonDirection() : Vec3(0.3f, -1.0f, 0.2f).normalized();
     glm::vec3 camPos(m_playerController.getCamera().position.x, m_playerController.getCamera().position.y, m_playerController.getCamera().position.z);
     
-    int numCascades = g_shadowMap.getNumCascades();  // Should be 4: 2 sun + 2 moon
+    int numCascades = g_lightMap.getNumCascades();
     
     // Cascade configuration
     const float cascade0Split = 128.0f;   // Near cascade max distance
@@ -1103,11 +1113,9 @@ void GameClient::renderShadowPass(const std::vector<VoxelChunk*>& visibleChunks)
         glm::mat4 lightProj = glm::ortho(-orthoSize, orthoSize, -orthoSize, orthoSize, nearPlane, farPlane);
         
         // Snap to texel grid to prevent light map shimmering
-        // IMPORTANT: Use far cascade's texel size for all cascades so they snap to the same grid
-        // This prevents cascade transition artifacts
         glm::vec4 centerLS = lightView * glm::vec4(lightTarget, 1.0f);
-        int smWidth = g_shadowMap.getSize();
-        float texelSize = (2.0f * farOrthoSize) / float(smWidth);  // Use far cascade size for consistent snapping
+        int smWidth = g_lightMap.getSize();
+        float texelSize = (2.0f * farOrthoSize) / float(smWidth);
         glm::vec2 snapped = glm::floor(glm::vec2(centerLS.x, centerLS.y) / texelSize) * texelSize;
         glm::vec2 delta = snapped - glm::vec2(centerLS.x, centerLS.y);
         glm::mat4 snapMat = glm::translate(glm::mat4(1.0f), glm::vec3(-delta.x, -delta.y, 0.0f));
@@ -1118,30 +1126,30 @@ void GameClient::renderShadowPass(const std::vector<VoxelChunk*>& visibleChunks)
         cascadeData.viewProj = lightVP;
         cascadeData.splitDistance = splitDistance;
         cascadeData.orthoSize = orthoSize;
-        g_shadowMap.setCascadeData(cascadeIdx, cascadeData);
+        g_lightMap.setCascadeData(cascadeIdx, cascadeData);
         
         // Render light depth pass for this cascade
         if (m_windowWidth > 0 && m_windowHeight > 0)
         {
-            // Begin light map rendering (clears depth buffer, sets up FBO)
-            g_shadowMap.begin(cascadeIdx);
+            g_lightMap.bindForRendering(cascadeIdx);
             
             if (g_instancedQuadRenderer)
             {
-                g_instancedQuadRenderer->beginDepthPass(lightVP, cascadeIdx);
-                g_instancedQuadRenderer->renderDepthCulledMDI(visibleChunks);
-                g_instancedQuadRenderer->endDepthPass(m_windowWidth, m_windowHeight);
+                g_instancedQuadRenderer->renderLightDepthMDI(lightVP, visibleChunks,
+                                                            g_gBuffer.getPositionTexture(), viewProj);
             }
             
-            // Render GLB models into light map
-            if (g_modelRenderer) {
-                g_modelRenderer->beginDepthPass(lightVP, cascadeIdx);
-                g_modelRenderer->renderDepth();
-                g_modelRenderer->endDepthPass(m_windowWidth, m_windowHeight);
+            if (g_modelRenderer)
+            {
+                // GBuffer occlusion cull to only render camera-visible models
+                glm::vec3 cameraPosGLM(m_playerController.getCamera().position.x,
+                                      m_playerController.getCamera().position.y,
+                                      m_playerController.getCamera().position.z);
+                g_modelRenderer->renderLightDepthMDI(lightVP, visibleChunks, 
+                                                    g_gBuffer.getPositionTexture(), viewProj, cameraPosGLM);
             }
             
-            // End light map rendering (restores viewport/framebuffer)
-            g_shadowMap.end(m_windowWidth, m_windowHeight);
+            g_lightMap.unbindAfterRendering(m_windowWidth, m_windowHeight);
         }
     }
     
@@ -1153,7 +1161,7 @@ void GameClient::renderShadowPass(const std::vector<VoxelChunk*>& visibleChunks)
     glm::vec3 sunDirVec(sunDir.x, sunDir.y, sunDir.z);
     if (g_modelRenderer)
     {
-        g_modelRenderer->setLightingData(g_shadowMap.getCascade(0).viewProj, sunDirVec);
+        g_modelRenderer->setLightingData(g_lightMap.getCascade(0).viewProj, sunDirVec);
     }
 }
 

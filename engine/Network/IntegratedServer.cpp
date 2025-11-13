@@ -4,6 +4,7 @@
 
 #include "VoxelCompression.h"
 #include "pch.h"
+#include "../Profiling/Profiler.h"
 
 IntegratedServer::IntegratedServer() : host(nullptr), nextSequenceNumber(0) {}
 
@@ -55,6 +56,8 @@ void IntegratedServer::stopServer()
 
 void IntegratedServer::update()
 {
+    PROFILE_SCOPE("IntegratedServer::update");
+    
     if (!host)
         return;
 

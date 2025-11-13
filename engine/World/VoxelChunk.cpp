@@ -228,8 +228,6 @@ bool VoxelChunk::isVoxelSolid(int x, int y, int z) const
 
 void VoxelChunk::generateMesh(bool generateLighting)
 {
-    PROFILE_SCOPE("VoxelChunk::generateMesh");
-    
     (void)generateLighting; // Parameter kept for API compatibility but unused (real-time lighting only)
     
     // Initialize mesh if needed
@@ -397,8 +395,6 @@ void VoxelChunk::greedyMeshFace(std::vector<QuadFace>& quads, int face)
 // Generate mesh for entire chunk - GREEDY MESHING with voxel-to-quad tracking
 std::vector<QuadFace> VoxelChunk::generateFullChunkMesh()
 {
-    PROFILE_SCOPE("VoxelChunk::generateFullChunkMesh");
-    
     auto startTime = std::chrono::high_resolution_clock::now();
     
     std::vector<QuadFace> quads;

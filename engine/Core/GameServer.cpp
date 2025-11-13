@@ -275,6 +275,8 @@ void GameServer::processTick(float deltaTime)
 
 void GameServer::processQueuedCommands()
 {
+    PROFILE_SCOPE("GameServer::processQueuedCommands");
+    
     // Process voxel changes - copy to avoid iterator invalidation
     std::vector<VoxelChangeCommand> voxelChanges;
     voxelChanges.swap(m_pendingVoxelChanges);  // Fast swap, clears original
@@ -582,6 +584,8 @@ void GameServer::handlePilotingInput(ENetPeer* peer, const PilotingInputMessage&
 
 void GameServer::broadcastIslandStates()
 {
+    PROFILE_SCOPE("GameServer::broadcastIslandStates");
+    
     if (!m_serverWorld || !m_networkManager)
     {
         return;

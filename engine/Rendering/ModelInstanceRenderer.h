@@ -65,14 +65,12 @@ public:
     // Recalculate lighting for all models if dirty
     void updateLightingIfNeeded();
 
-    // Shadow pass methods (matches MDIRenderer API)
-    void beginDepthPass(const glm::mat4& lightVP, int cascadeIndex = 0);
-    void renderDepth();
-    void endDepthPass(int screenWidth, int screenHeight);
+    // Light depth pass - batched MDI rendering (GBuffer occlusion culled)
+    void renderLightDepthMDI(const glm::mat4& lightVP, const std::vector<VoxelChunk*>& visibleChunks, 
+                            GLuint gbufferPositionTex, const glm::mat4& viewProj, const glm::vec3& cameraPos);
     
     // G-buffer rendering (deferred rendering - writes geometry data only)
-    void renderToGBuffer(const glm::mat4& view, const glm::mat4& proj);
-    void renderToGBufferCulled(const glm::mat4& view, const glm::mat4& proj, const std::vector<VoxelChunk*>& visibleChunks);
+    void renderToGBufferVisible(const glm::mat4& view, const glm::mat4& proj, const std::vector<VoxelChunk*>& visibleChunks);
     
     // Forward transparent water rendering (after deferred lighting)
     void renderWaterTransparent(const glm::mat4& view, const glm::mat4& proj,
@@ -102,7 +100,25 @@ private:
     GLuint m_depthProgram = 0;
     int m_depth_uLightVP = -1;
     int m_depth_uModel = -1;
-    int m_depth_uTime = -1;  // Wind animation in shadow pass
+    int m_depth_uTime = -1;
+    
+    // GPU occlusion culling compute shader
+    GLuint m_occlusionCullProgram = 0;
+    GLuint m_visibilityBuffer = 0;  // SSBO for per-instance visibility flags
+    GLuint m_culledInstanceBuffer = 0;  // Compacted list of visible instances
+    
+    // Light depth MDI buffers for batched rendering
+    struct LightDepthDrawCommand {
+        uint32_t count;
+        uint32_t instanceCount;
+        uint32_t firstIndex;
+        uint32_t baseVertex;
+        uint32_t baseInstance;
+    };
+    GLuint m_lightDepthCommandBuffer = 0;
+    GLuint m_lightDepthInstanceBuffer = 0;
+    std::vector<LightDepthDrawCommand> m_lightDepthCommands;
+    std::vector<float> m_lightDepthInstanceData;
 
     // Shadow/lighting (shared with MDIRenderer)
     glm::mat4 m_lightVP;

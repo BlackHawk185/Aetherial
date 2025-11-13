@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "VoxelCompression.h"
+#include "../Profiling/Profiler.h"
 
 NetworkClient::NetworkClient() : client(nullptr), serverConnection(nullptr), nextSequenceNumber(0)
 {
@@ -104,6 +105,8 @@ void NetworkClient::disconnect()
 
 void NetworkClient::update()
 {
+    PROFILE_SCOPE("NetworkClient::update");
+    
     if (!client)
         return;
 

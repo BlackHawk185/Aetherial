@@ -23,7 +23,7 @@ struct DrawElementsIndirectCommand {
 std::unique_ptr<InstancedQuadRenderer> g_instancedQuadRenderer;
 
 // External globals
-extern ShadowMap g_shadowMap;
+extern LightMap g_lightMap;
 extern DayNightController* g_dayNightController;
 
 // ============================================================================
@@ -893,67 +893,29 @@ void InstancedQuadRenderer::shutdown()
     m_freeVBOPool.clear();
 }
 
-// ========== SHADOW DEPTH PASS METHODS ==========
+// ========== LIGHT DEPTH PASS ==========
 
-void InstancedQuadRenderer::beginDepthPass(const glm::mat4& lightVP, int /*cascadeIndex*/)
+void InstancedQuadRenderer::renderLightDepthMDI(const glm::mat4& lightVP, const std::vector<VoxelChunk*>& visibleChunks,
+                                               GLuint gbufferPositionTex, const glm::mat4& viewProj)
 {
-    glUseProgram(m_depthMDIProgram);
-    glUniformMatrix4fv(m_depthMDI_uLightVP, 1, GL_FALSE, glm::value_ptr(lightVP));
-}
-
-void InstancedQuadRenderer::renderDepthMDI()
-{
-    PROFILE_SCOPE("QuadRenderer_Depth_MDI");
-    
-    if (m_chunks.empty() || !m_persistentCommandPtr || !m_persistentTransformPtr) return;
-    
-    // Write draw commands and transforms directly to persistent buffers
-    DrawElementsIndirectCommand* cmdPtr = static_cast<DrawElementsIndirectCommand*>(m_persistentCommandPtr);
-    glm::mat4* transformPtr = static_cast<glm::mat4*>(m_persistentTransformPtr);
-    
-    size_t drawCount = 0;
-    for (const auto& entry : m_chunks) {
-        if (entry.instanceCount == 0) continue;
-        
-        cmdPtr[drawCount].count = 6;
-        cmdPtr[drawCount].instanceCount = entry.instanceCount;
-        cmdPtr[drawCount].firstIndex = 0;
-        cmdPtr[drawCount].baseVertex = 0;  // Always 0 for unit quad
-        cmdPtr[drawCount].baseInstance = entry.baseInstance;  // Offset into instance buffer
-        
-        transformPtr[drawCount] = entry.transform;
-        drawCount++;
-    }
-    
-    if (drawCount == 0) return;
-    
-    // Flush persistent buffers
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_persistentCommandBuffer);
-    glFlushMappedBufferRange(GL_DRAW_INDIRECT_BUFFER, 0, drawCount * sizeof(DrawElementsIndirectCommand));
-    
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_persistentTransformBuffer);
-    glFlushMappedBufferRange(GL_SHADER_STORAGE_BUFFER, 0, drawCount * sizeof(glm::mat4));
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_persistentTransformBuffer);
-    
-    // Render
-    glBindVertexArray(m_mdiVAO);
-    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, drawCount, 0);
-    glBindVertexArray(0);
-}
-
-void InstancedQuadRenderer::renderDepthCulledMDI(const std::vector<VoxelChunk*>& visibleChunks)
-{
-    PROFILE_SCOPE("QuadRenderer_Depth_MDI_Culled");
+    PROFILE_SCOPE("Voxels_LightDepth_MDI");
     
     if (visibleChunks.empty() || !m_persistentCommandPtr || !m_persistentTransformPtr) return;
     
-    // Write draw commands and transforms directly to persistent buffers for visible chunks only
+    // For voxel quads, chunk-level culling is sufficient
+    // GBuffer occlusion culling at per-quad level would be expensive and provide minimal benefit
+    // since chunks are dense and if visible, most quads are visible
+    // The frustum culling from visibleChunks is already optimal
+    
+    glUseProgram(m_depthMDIProgram);
+    glUniformMatrix4fv(m_depthMDI_uLightVP, 1, GL_FALSE, glm::value_ptr(lightVP));
+    
     DrawElementsIndirectCommand* cmdPtr = static_cast<DrawElementsIndirectCommand*>(m_persistentCommandPtr);
     glm::mat4* transformPtr = static_cast<glm::mat4*>(m_persistentTransformPtr);
     
     size_t drawCount = 0;
-    for (VoxelChunk* visChunk : visibleChunks) {
-        auto it = m_chunkToIndex.find(visChunk);
+    for (VoxelChunk* chunk : visibleChunks) {
+        auto it = m_chunkToIndex.find(chunk);
         if (it == m_chunkToIndex.end()) continue;
         
         const auto& entry = m_chunks[it->second];
@@ -962,8 +924,8 @@ void InstancedQuadRenderer::renderDepthCulledMDI(const std::vector<VoxelChunk*>&
         cmdPtr[drawCount].count = 6;
         cmdPtr[drawCount].instanceCount = entry.instanceCount;
         cmdPtr[drawCount].firstIndex = 0;
-        cmdPtr[drawCount].baseVertex = 0;  // Always 0 for unit quad
-        cmdPtr[drawCount].baseInstance = entry.baseInstance;  // Offset into instance buffer
+        cmdPtr[drawCount].baseVertex = 0;
+        cmdPtr[drawCount].baseInstance = entry.baseInstance;
         
         transformPtr[drawCount] = entry.transform;
         drawCount++;
@@ -971,7 +933,6 @@ void InstancedQuadRenderer::renderDepthCulledMDI(const std::vector<VoxelChunk*>&
     
     if (drawCount == 0) return;
     
-    // Flush persistent buffers
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, m_persistentCommandBuffer);
     glFlushMappedBufferRange(GL_DRAW_INDIRECT_BUFFER, 0, drawCount * sizeof(DrawElementsIndirectCommand));
     
@@ -979,26 +940,9 @@ void InstancedQuadRenderer::renderDepthCulledMDI(const std::vector<VoxelChunk*>&
     glFlushMappedBufferRange(GL_SHADER_STORAGE_BUFFER, 0, drawCount * sizeof(glm::mat4));
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, m_persistentTransformBuffer);
     
-    // Render
     glBindVertexArray(m_mdiVAO);
     glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, drawCount, 0);
     glBindVertexArray(0);
-}
-
-void InstancedQuadRenderer::renderDepthCulledMDI_GPU(const glm::mat4& viewProjection)
-{
-    PROFILE_SCOPE("QuadRenderer_Depth_MDI_GPU_Culled");
-    
-    std::vector<VoxelChunk*> visibleChunks;
-    cullChunksGPU(viewProjection, visibleChunks);
-    
-    renderDepthCulledMDI(visibleChunks);
-}
-
-void InstancedQuadRenderer::endDepthPass(int screenWidth, int screenHeight)
-{
-    (void)screenWidth;
-    (void)screenHeight;
 }
 
 void InstancedQuadRenderer::createFrustumCullShader()

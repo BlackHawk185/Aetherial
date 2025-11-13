@@ -211,8 +211,6 @@ VoxelChunk* IslandChunkSystem::getChunkFromIsland(uint32_t islandID, const Vec3&
 
 void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_t seed, float radius, BiomeType biome)
 {
-    PROFILE_SCOPE("IslandChunkSystem::generateFloatingIslandOrganic");
-    
     auto startTime = std::chrono::high_resolution_clock::now();
     
     FloatingIsland* island = getIsland(islandID);
@@ -1229,6 +1227,8 @@ void IslandChunkSystem::getVisibleChunksFrustum(const Frustum& frustum, std::vec
 
 void IslandChunkSystem::updateIslandPhysics(float deltaTime)
 {
+    PROFILE_SCOPE("IslandChunkSystem::updateIslandPhysics");
+    
     std::lock_guard<std::mutex> lock(m_islandsMutex);
     for (auto& [id, island] : m_islands)
     {

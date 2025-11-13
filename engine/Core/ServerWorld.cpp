@@ -2,6 +2,7 @@
 #include "pch.h"
 #include "ServerWorld.h"
 #include "../World/BlockType.h"
+#include "../Profiling/Profiler.h"
 #include <iostream>
 
 // External global systems
@@ -70,6 +71,8 @@ void ServerWorld::update(float deltaTime)
 
 void ServerWorld::updatePhysics(float deltaTime, PhysicsSystem* physics)
 {
+    PROFILE_SCOPE("ServerWorld::updatePhysics");
+    
     if (!m_initialized)
     {
         return;
@@ -81,6 +84,8 @@ void ServerWorld::updatePhysics(float deltaTime, PhysicsSystem* physics)
 
 void ServerWorld::updateSimulation(float deltaTime)
 {
+    PROFILE_SCOPE("ServerWorld::updateSimulation");
+    
     if (!m_initialized)
     {
         return;
@@ -92,6 +97,8 @@ void ServerWorld::updateSimulation(float deltaTime)
 
 void ServerWorld::updateIslandActivation(const Vec3& playerPosition)
 {
+    PROFILE_SCOPE("ServerWorld::updateIslandActivation");
+    
     if (!m_initialized)
     {
         return;

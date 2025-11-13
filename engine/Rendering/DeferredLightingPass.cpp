@@ -8,6 +8,8 @@
 #include <iostream>
 #include <string>
 
+extern LightMap g_lightMap;
+
 DeferredLightingPass g_deferredLighting;
 
 namespace {
@@ -468,7 +470,7 @@ void DeferredLightingPass::render(const glm::vec3& sunDirection, const glm::vec3
     
     // Bind light map (4 cascades: sun near, sun far, moon near, moon far)
     glActiveTexture(GL_TEXTURE5);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, g_shadowMap.getDepthTexture());
+    glBindTexture(GL_TEXTURE_2D_ARRAY, g_lightMap.getDepthTexture());
     if (m_loc_lightMap >= 0) glUniform1i(m_loc_lightMap, 5);
     
     // Set lighting uniforms
@@ -477,9 +479,9 @@ void DeferredLightingPass::render(const glm::vec3& sunDirection, const glm::vec3
     if (m_loc_sunIntensity >= 0) glUniform1f(m_loc_sunIntensity, sunIntensity);
     if (m_loc_moonIntensity >= 0) glUniform1f(m_loc_moonIntensity, moonIntensity);
     if (m_loc_cameraPos >= 0) glUniform3fv(m_loc_cameraPos, 1, &cameraPosition[0]);
-    if (m_loc_numCascades >= 0) glUniform1i(m_loc_numCascades, g_shadowMap.getNumCascades());
+    if (m_loc_numCascades >= 0) glUniform1i(m_loc_numCascades, g_lightMap.getNumCascades());
     
-    float lightTexel = 1.0f / static_cast<float>(g_shadowMap.getSize());
+    float lightTexel = 1.0f / static_cast<float>(g_lightMap.getSize());
     if (m_loc_lightTexel >= 0) glUniform1f(m_loc_lightTexel, lightTexel);
     
     // Set cascade matrices (4 cascades)

@@ -6,11 +6,11 @@ using GLuint = unsigned int;
 
 struct CascadeData {
     glm::mat4 viewProj;
-    float splitDistance;  // Far plane of this cascade
-    float orthoSize;      // Size of orthographic projection
+    float splitDistance;
+    float orthoSize;
 };
 
-class ShadowMap {
+class LightMap {
 public:
     bool initialize(int size = 16384, int numCascades = 2);
     void shutdown();
@@ -19,13 +19,11 @@ public:
     int getNumCascades() const { return m_numCascades; }
     bool resize(int newSize);
 
-    void begin(int cascadeIndex = 0);
-    void end(int screenWidth, int screenHeight);
+    void bindForRendering(int cascadeIndex);
+    void unbindAfterRendering(int screenWidth, int screenHeight);
 
     GLuint getDepthTexture() const { return m_depthTex; }
-    GLuint getDepthTexture(int cascadeIndex) const;
     
-    // Get cascade data for rendering
     const CascadeData& getCascade(int index) const { return m_cascades[index]; }
     void setCascadeData(int index, const CascadeData& data) { m_cascades[index] = data; }
 
@@ -33,8 +31,8 @@ private:
     int m_size = 0;
     int m_numCascades = 2;
     GLuint m_fbo = 0;
-    GLuint m_depthTex = 0;  // Array texture for all cascades
+    GLuint m_depthTex = 0;
     std::vector<CascadeData> m_cascades;
 };
 
-extern ShadowMap g_shadowMap;
+extern LightMap g_lightMap;

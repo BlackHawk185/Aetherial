@@ -32,11 +32,9 @@ public:
     void renderToGBufferCulledMDI(const glm::mat4& viewProjection, const glm::mat4& view, const std::vector<VoxelChunk*>& visibleChunks);
     void renderToGBufferCulledMDI_GPU(const glm::mat4& viewProjection, const glm::mat4& view);
     
-    void beginDepthPass(const glm::mat4& lightVP, int cascadeIndex);
-    void renderDepthMDI();
-    void renderDepthCulledMDI(const std::vector<VoxelChunk*>& visibleChunks);
-    void renderDepthCulledMDI_GPU(const glm::mat4& viewProjection);
-    void endDepthPass(int screenWidth, int screenHeight);
+    // Light depth pass - batched MDI rendering
+    void renderLightDepthMDI(const glm::mat4& lightVP, const std::vector<VoxelChunk*>& visibleChunks,
+                            GLuint gbufferPositionTex, const glm::mat4& viewProj);
     
     // Clear all registered chunks
     void clear();
