@@ -18,6 +18,7 @@
 #include "TreeGenerator.h"
 #include "../Rendering/GPUMeshQueue.h"
 #include "../Profiling/Profiler.h"
+#include "../libs/FastNoiseSIMD/FastNoiseSIMD.h"
 #include "../Rendering/InstancedQuadRenderer.h"
 #include "../Rendering/ModelInstanceRenderer.h"
 #include "../Culling/Frustum.h"
@@ -264,21 +265,166 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     const char* thresholdEnv = std::getenv("NOISE_THRESHOLD");
     if (thresholdEnv) densityThreshold = std::stof(thresholdEnv);
     
-    // Setup single noise generator (optimized: one noise call instead of two)
-    FastNoiseLite noise3D;
-    noise3D.SetNoiseType(FastNoiseLite::NoiseType_Perlin);
-    noise3D.SetSeed(seed);
-    noise3D.SetFrequency(noise3DFrequency);
-    noise3D.SetFractalType(FastNoiseLite::FractalType_FBm);
-    noise3D.SetFractalOctaves(fractalOctaves);
-    noise3D.SetFractalLacunarity(2.0f);
-    noise3D.SetFractalGain(fractalGain);
-    
     auto voxelGenStart = std::chrono::high_resolution_clock::now();
     
-    // **BULK DENSITY-BASED GENERATION**
-    // Place all voxels based on density threshold - connectivity handled by later satellite culling
+    // **PRE-GENERATE NOISE MAP**
+    // Generate 3D noise grid for entire island bounds ONCE instead of per-voxel lookups
     int islandHeight = static_cast<int>(radius * baseHeightRatio);
+    
+    // Sample every other block (2x2x2 grid) for 8x memory reduction + 8x faster generation
+    // Trilinear interpolation fills in the gaps with imperceptible quality loss
+    constexpr int NOISE_SAMPLE_RATE = 2;
+    int gridSizeX = (static_cast<int>(radius) * 2) / NOISE_SAMPLE_RATE;
+    int gridSizeY = (islandHeight * 2) / NOISE_SAMPLE_RATE;
+    int gridSizeZ = (static_cast<int>(radius) * 2) / NOISE_SAMPLE_RATE;
+    
+    // Offset to handle negative coordinates
+    int gridOffsetX = gridSizeX / 2;
+    int gridOffsetY = gridSizeY / 2;
+    int gridOffsetZ = gridSizeZ / 2;
+    
+    auto noiseMapStart = std::chrono::high_resolution_clock::now();
+    
+    // Use uint8_t (0-255) instead of float to save 4x memory
+    std::vector<uint8_t> noiseMap(gridSizeX * gridSizeY * gridSizeZ);
+    
+    std::cout << "   └─ Allocating Noise Map: " << gridSizeX << "x" << gridSizeY << "x" << gridSizeZ
+              << " (" << (noiseMap.size() / (1024 * 1024)) << " MB)" << std::endl;
+    
+    // Use FastNoiseSIMD for SIMD-accelerated noise generation (4-8x faster)
+    FastNoiseSIMD* simdNoise = FastNoiseSIMD::NewFastNoiseSIMD(seed);
+    simdNoise->SetNoiseType(FastNoiseSIMD::PerlinFractal);
+    simdNoise->SetFrequency(noise3DFrequency);
+    simdNoise->SetFractalType(FastNoiseSIMD::FBM);
+    simdNoise->SetFractalOctaves(fractalOctaves);
+    simdNoise->SetFractalLacunarity(2.0f);
+    simdNoise->SetFractalGain(fractalGain);
+    
+    // Generate noise for the entire grid with SIMD acceleration
+    int totalSamples = gridSizeX * gridSizeY * gridSizeZ;
+    std::vector<float> noiseValues(totalSamples);
+    simdNoise->FillNoiseSet(noiseValues.data(),
+                            -gridOffsetX * NOISE_SAMPLE_RATE,
+                            -gridOffsetY * NOISE_SAMPLE_RATE,
+                            -gridOffsetZ * NOISE_SAMPLE_RATE,
+                            gridSizeX, gridSizeY, gridSizeZ,
+                            static_cast<float>(NOISE_SAMPLE_RATE));
+    
+    // Quantize to uint8
+    for (int gz = 0; gz < gridSizeZ; ++gz) {
+        for (int gy = 0; gy < gridSizeY; ++gy) {
+            for (int gx = 0; gx < gridSizeX; ++gx) {
+                int srcIdx = gx + gy * gridSizeX + gz * gridSizeX * gridSizeY;
+                float noise = (noiseValues[srcIdx] + 1.0f) * 0.5f; // Normalize to [0, 1]
+                noiseMap[srcIdx] = static_cast<uint8_t>(noise * 255.0f);
+            }
+        }
+    }
+    
+    delete simdNoise;
+    
+    auto noiseMapEnd = std::chrono::high_resolution_clock::now();
+    auto noiseMapDuration = std::chrono::duration_cast<std::chrono::milliseconds>(noiseMapEnd - noiseMapStart).count();
+    std::cout << "   └─ Noise Map Generated: " << noiseMapDuration << "ms (" 
+              << noiseMap.size() << " samples)" << std::endl;
+    
+    // Pre-computed lookup table for uint8 -> float conversion (1KB, eliminates division)
+    static constexpr float UINT8_TO_FLOAT[256] = {
+        0.0f, 0.003921569f, 0.007843138f, 0.011764706f, 0.015686275f, 0.019607844f, 0.023529412f, 0.02745098f,
+        0.03137255f, 0.03529412f, 0.039215688f, 0.043137256f, 0.047058824f, 0.050980393f, 0.05490196f, 0.05882353f,
+        0.0627451f, 0.06666667f, 0.07058824f, 0.07450981f, 0.078431375f, 0.08235294f, 0.08627451f, 0.09019608f,
+        0.09411765f, 0.09803922f, 0.101960786f, 0.105882354f, 0.10980392f, 0.11372549f, 0.11764706f, 0.12156863f,
+        0.1254902f, 0.12941177f, 0.13333334f, 0.13725491f, 0.14117648f, 0.14509805f, 0.14901961f, 0.15294118f,
+        0.15686275f, 0.16078432f, 0.16470589f, 0.16862746f, 0.17254902f, 0.1764706f, 0.18039216f, 0.18431373f,
+        0.1882353f, 0.19215687f, 0.19607843f, 0.2f, 0.20392157f, 0.20784314f, 0.21176471f, 0.21568628f,
+        0.21960784f, 0.22352941f, 0.22745098f, 0.23137255f, 0.23529412f, 0.23921569f, 0.24313726f, 0.24705882f,
+        0.2509804f, 0.25490198f, 0.25882354f, 0.2627451f, 0.26666668f, 0.27058825f, 0.27450982f, 0.2784314f,
+        0.28235295f, 0.28627452f, 0.2901961f, 0.29411766f, 0.29803923f, 0.3019608f, 0.30588236f, 0.30980393f,
+        0.3137255f, 0.31764707f, 0.32156864f, 0.3254902f, 0.32941177f, 0.33333334f, 0.3372549f, 0.34117648f,
+        0.34509805f, 0.34901962f, 0.3529412f, 0.35686275f, 0.36078432f, 0.3647059f, 0.36862746f, 0.37254903f,
+        0.3764706f, 0.38039216f, 0.38431373f, 0.3882353f, 0.39215687f, 0.39607844f, 0.4f, 0.40392157f,
+        0.40784314f, 0.4117647f, 0.41568628f, 0.41960785f, 0.42352942f, 0.427451f, 0.43137255f, 0.43529412f,
+        0.4392157f, 0.44313726f, 0.44705883f, 0.4509804f, 0.45490196f, 0.45882353f, 0.4627451f, 0.46666667f,
+        0.47058824f, 0.4745098f, 0.47843137f, 0.48235294f, 0.4862745f, 0.49019608f, 0.49411765f, 0.49803922f,
+        0.5019608f, 0.5058824f, 0.50980395f, 0.5137255f, 0.5176471f, 0.52156866f, 0.5254902f, 0.5294118f,
+        0.53333336f, 0.5372549f, 0.5411765f, 0.54509807f, 0.54901963f, 0.5529412f, 0.5568628f, 0.56078434f,
+        0.5647059f, 0.5686275f, 0.57254905f, 0.5764706f, 0.5803922f, 0.58431375f, 0.5882353f, 0.5921569f,
+        0.59607846f, 0.6f, 0.6039216f, 0.60784316f, 0.6117647f, 0.6156863f, 0.61960787f, 0.62352943f,
+        0.627451f, 0.6313726f, 0.63529414f, 0.6392157f, 0.6431373f, 0.64705884f, 0.6509804f, 0.654902f,
+        0.65882355f, 0.6627451f, 0.6666667f, 0.67058825f, 0.6745098f, 0.6784314f, 0.68235296f, 0.6862745f,
+        0.6901961f, 0.69411767f, 0.69803923f, 0.7019608f, 0.7058824f, 0.70980394f, 0.7137255f, 0.7176471f,
+        0.72156864f, 0.7254902f, 0.7294118f, 0.73333335f, 0.7372549f, 0.7411765f, 0.74509805f, 0.7490196f,
+        0.7529412f, 0.75686276f, 0.7607843f, 0.7647059f, 0.76862746f, 0.772549f, 0.7764706f, 0.78039217f,
+        0.78431374f, 0.7882353f, 0.7921569f, 0.79607844f, 0.8f, 0.8039216f, 0.80784315f, 0.8117647f,
+        0.8156863f, 0.81960785f, 0.8235294f, 0.827451f, 0.83137256f, 0.8352941f, 0.8392157f, 0.84313726f,
+        0.8470588f, 0.8509804f, 0.85490197f, 0.85882354f, 0.8627451f, 0.8666667f, 0.87058824f, 0.8745098f,
+        0.8784314f, 0.88235295f, 0.8862745f, 0.8901961f, 0.89411765f, 0.8980392f, 0.9019608f, 0.90588236f,
+        0.9098039f, 0.9137255f, 0.91764706f, 0.92156863f, 0.9254902f, 0.9294118f, 0.93333334f, 0.9372549f,
+        0.9411765f, 0.94509804f, 0.9490196f, 0.9529412f, 0.95686275f, 0.9607843f, 0.9647059f, 0.96862745f,
+        0.972549f, 0.9764706f, 0.98039216f, 0.98431373f, 0.9882353f, 0.99215686f, 0.99607843f, 1.0f
+    };
+    
+    // Lambda to sample from pre-generated noise map with trilinear interpolation
+    auto sampleNoise = [&](float x, float y, float z) -> float {
+        // Convert to grid space (account for sample rate)
+        float gxf = (x / NOISE_SAMPLE_RATE) + gridOffsetX;
+        float gyf = (y / NOISE_SAMPLE_RATE) + gridOffsetY;
+        float gzf = (z / NOISE_SAMPLE_RATE) + gridOffsetZ;
+        
+        // Get integer coordinates and fractional parts for interpolation
+        int gx0 = static_cast<int>(std::floor(gxf));
+        int gy0 = static_cast<int>(std::floor(gyf));
+        int gz0 = static_cast<int>(std::floor(gzf));
+        int gx1 = gx0 + 1;
+        int gy1 = gy0 + 1;
+        int gz1 = gz0 + 1;
+        
+        // Clamp to grid bounds
+        gx0 = std::max(0, std::min(gx0, gridSizeX - 1));
+        gx1 = std::max(0, std::min(gx1, gridSizeX - 1));
+        gy0 = std::max(0, std::min(gy0, gridSizeY - 1));
+        gy1 = std::max(0, std::min(gy1, gridSizeY - 1));
+        gz0 = std::max(0, std::min(gz0, gridSizeZ - 1));
+        gz1 = std::max(0, std::min(gz1, gridSizeZ - 1));
+        
+        // Fractional parts
+        float fx = gxf - std::floor(gxf);
+        float fy = gyf - std::floor(gyf);
+        float fz = gzf - std::floor(gzf);
+        
+        // Get 8 corner values
+        int idx000 = gx0 + gy0 * gridSizeX + gz0 * gridSizeX * gridSizeY;
+        int idx001 = gx0 + gy0 * gridSizeX + gz1 * gridSizeX * gridSizeY;
+        int idx010 = gx0 + gy1 * gridSizeX + gz0 * gridSizeX * gridSizeY;
+        int idx011 = gx0 + gy1 * gridSizeX + gz1 * gridSizeX * gridSizeY;
+        int idx100 = gx1 + gy0 * gridSizeX + gz0 * gridSizeX * gridSizeY;
+        int idx101 = gx1 + gy0 * gridSizeX + gz1 * gridSizeX * gridSizeY;
+        int idx110 = gx1 + gy1 * gridSizeX + gz0 * gridSizeX * gridSizeY;
+        int idx111 = gx1 + gy1 * gridSizeX + gz1 * gridSizeX * gridSizeY;
+        
+        float v000 = UINT8_TO_FLOAT[noiseMap[idx000]];
+        float v001 = UINT8_TO_FLOAT[noiseMap[idx001]];
+        float v010 = UINT8_TO_FLOAT[noiseMap[idx010]];
+        float v011 = UINT8_TO_FLOAT[noiseMap[idx011]];
+        float v100 = UINT8_TO_FLOAT[noiseMap[idx100]];
+        float v101 = UINT8_TO_FLOAT[noiseMap[idx101]];
+        float v110 = UINT8_TO_FLOAT[noiseMap[idx110]];
+        float v111 = UINT8_TO_FLOAT[noiseMap[idx111]];
+        
+        // Trilinear interpolation
+        float v00 = v000 * (1.0f - fx) + v100 * fx;
+        float v01 = v001 * (1.0f - fx) + v101 * fx;
+        float v10 = v010 * (1.0f - fx) + v110 * fx;
+        float v11 = v011 * (1.0f - fx) + v111 * fx;
+        
+        float v0 = v00 * (1.0f - fy) + v10 * fy;
+        float v1 = v01 * (1.0f - fy) + v11 * fy;
+        
+        return v0 * (1.0f - fz) + v1 * fz;
+    };
+    
+    // **BFS CONNECTIVITY-AWARE GENERATION**
+    // Only place voxels reachable from center - guarantees connectivity
     float radiusSquared = (radius * 1.4f) * (radius * 1.4f);
     float radiusDivisor = 1.0f / (radius * 1.2f);
     
@@ -316,54 +462,131 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
         cachedChunk->setVoxelDataDirect(localX, localY, localZ, blockID);
     };
     
-    // Iterate through bounding box - no neighbor checking, just density evaluation
-    int maxRadius = static_cast<int>(radius * 1.4f);
-    for (int y = -islandHeight; y <= islandHeight; ++y)
+    // BFS from center
+    std::queue<Vec3> frontier;
+    
+    // OPTIMIZATION: Replace unordered_set with sparse 3D grid for visited tracking
+    // This eliminates millions of hash computations and lookups
+    // Use chunk-based storage: 16x16x16 sub-grids indexed by chunk coordinate
+    constexpr int VISIT_CHUNK_SIZE = 16;
+    std::unordered_map<int64_t, std::vector<bool>> visitedChunks;
+    
+    auto encodeChunkPos = [](int cx, int cy, int cz) -> int64_t {
+        return (static_cast<int64_t>(cx + 8192) << 32) |
+               (static_cast<int64_t>(cy + 8192) << 16) |
+               static_cast<int64_t>(cz + 8192);
+    };
+    
+    auto isVisited = [&](const Vec3& p) -> bool {
+        int cx = static_cast<int>(std::floor(p.x / VISIT_CHUNK_SIZE));
+        int cy = static_cast<int>(std::floor(p.y / VISIT_CHUNK_SIZE));
+        int cz = static_cast<int>(std::floor(p.z / VISIT_CHUNK_SIZE));
+        int64_t chunkKey = encodeChunkPos(cx, cy, cz);
+        
+        auto it = visitedChunks.find(chunkKey);
+        if (it == visitedChunks.end()) return false;
+        
+        int lx = static_cast<int>(p.x) - (cx * VISIT_CHUNK_SIZE);
+        int ly = static_cast<int>(p.y) - (cy * VISIT_CHUNK_SIZE);
+        int lz = static_cast<int>(p.z) - (cz * VISIT_CHUNK_SIZE);
+        
+        // Handle negative coordinates
+        if (lx < 0) lx += VISIT_CHUNK_SIZE;
+        if (ly < 0) ly += VISIT_CHUNK_SIZE;
+        if (lz < 0) lz += VISIT_CHUNK_SIZE;
+        
+        int idx = lx + ly * VISIT_CHUNK_SIZE + lz * VISIT_CHUNK_SIZE * VISIT_CHUNK_SIZE;
+        return it->second[idx];
+    };
+    
+    auto markVisited = [&](const Vec3& p) {
+        int cx = static_cast<int>(std::floor(p.x / VISIT_CHUNK_SIZE));
+        int cy = static_cast<int>(std::floor(p.y / VISIT_CHUNK_SIZE));
+        int cz = static_cast<int>(std::floor(p.z / VISIT_CHUNK_SIZE));
+        int64_t chunkKey = encodeChunkPos(cx, cy, cz);
+        
+        auto& visitChunk = visitedChunks[chunkKey];
+        if (visitChunk.empty()) {
+            visitChunk.resize(VISIT_CHUNK_SIZE * VISIT_CHUNK_SIZE * VISIT_CHUNK_SIZE, false);
+        }
+        
+        int lx = static_cast<int>(p.x) - (cx * VISIT_CHUNK_SIZE);
+        int ly = static_cast<int>(p.y) - (cy * VISIT_CHUNK_SIZE);
+        int lz = static_cast<int>(p.z) - (cz * VISIT_CHUNK_SIZE);
+        
+        // Handle negative coordinates
+        if (lx < 0) lx += VISIT_CHUNK_SIZE;
+        if (ly < 0) ly += VISIT_CHUNK_SIZE;
+        if (lz < 0) lz += VISIT_CHUNK_SIZE;
+        
+        int idx = lx + ly * VISIT_CHUNK_SIZE + lz * VISIT_CHUNK_SIZE * VISIT_CHUNK_SIZE;
+        visitChunk[idx] = true;
+    };
+    
+    Vec3 startPos(0, 0, 0);
+    frontier.push(startPos);
+    markVisited(startPos);
+    setVoxelDirect(startPos, palette.deepBlock);
+    voxelsGenerated++;
+    
+    while (!frontier.empty())
     {
-        float dy = static_cast<float>(y);
+        Vec3 current = frontier.front();
+        frontier.pop();
         
-        // Vertical density
-        float islandHeightRange = islandHeight * 2.0f;
-        float normalizedY = (dy + islandHeight) / islandHeightRange;
-        float centerOffset = normalizedY - 0.5f;
-        float verticalDensity = 1.0f - (centerOffset * centerOffset * 4.0f);
-        verticalDensity = std::max(0.0f, verticalDensity);
+        // Check all 6 neighbors
+        static const Vec3 neighbors[6] = {
+            Vec3(1, 0, 0), Vec3(-1, 0, 0),
+            Vec3(0, 1, 0), Vec3(0, -1, 0),
+            Vec3(0, 0, 1), Vec3(0, 0, -1)
+        };
         
-        if (verticalDensity < 0.01f) continue;
-        
-        for (int x = -maxRadius; x <= maxRadius; ++x)
+        for (const Vec3& delta : neighbors)
         {
-            float dx = static_cast<float>(x);
+            Vec3 neighbor = current + delta;
+            float dx = neighbor.x;
+            float dy = neighbor.y;
+            float dz = neighbor.z;
             
-            for (int z = -maxRadius; z <= maxRadius; ++z)
+            // EARLY EXIT 1: Vertical bounds
+            if (dy < -islandHeight || dy > islandHeight) continue;
+            
+            // EARLY EXIT 2: Radial bounds (eliminates corners/outer regions)
+            float distanceSquared = dx * dx + dy * dy + dz * dz;
+            if (distanceSquared > radiusSquared) continue;
+            
+            // EARLY EXIT 3: Only NOW check visited (avoid hash ops for out-of-bounds positions)
+            if (isVisited(neighbor)) continue;
+            markVisited(neighbor);
+            voxelsSampled++;
+            
+            // Vertical density
+            float islandHeightRange = islandHeight * 2.0f;
+            float normalizedY = (dy + islandHeight) / islandHeightRange;
+            float centerOffset = normalizedY - 0.5f;
+            float verticalDensity = 1.0f - (centerOffset * centerOffset * 4.0f);
+            verticalDensity = std::max(0.0f, verticalDensity);
+            
+            if (verticalDensity < 0.01f) continue;
+            
+            // Radial falloff
+            float distanceFromCenter = std::sqrt(distanceSquared);
+            float islandBase = 1.0f - (distanceFromCenter * radiusDivisor);
+            islandBase = std::max(0.0f, islandBase);
+            islandBase = islandBase * islandBase;
+            
+            if (islandBase < 0.01f) continue;
+            
+            // Sample from pre-generated noise map (instant lookup vs expensive calculation)
+            float noise = sampleNoise(dx, dy, dz);
+            
+            float finalDensity = islandBase * verticalDensity * noise;
+            
+            if (finalDensity > densityThreshold)
             {
-                float dz = static_cast<float>(z);
-                voxelsSampled++;
-                
-                // Radial bounds
-                float distanceSquared = dx * dx + dy * dy + dz * dz;
-                if (distanceSquared > radiusSquared) continue;
-                
-                // Radial falloff
-                float distanceFromCenter = std::sqrt(distanceSquared);
-                float islandBase = 1.0f - (distanceFromCenter * radiusDivisor);
-                islandBase = std::max(0.0f, islandBase);
-                islandBase = islandBase * islandBase;
-                
-                if (islandBase < 0.01f) continue;
-                
-                // 3D noise
-                float noise = noise3D.GetNoise(dx, dy * 0.7f, dz);
-                noise = (noise + 1.0f) * 0.5f;
-                
-                float finalDensity = islandBase * verticalDensity * noise;
-                
-                if (finalDensity > densityThreshold)
-                {
-                    Vec3 pos(x, y, z);
-                    setVoxelDirect(pos, palette.deepBlock);
-                    voxelsGenerated++;
-                }
+                setVoxelDirect(neighbor, palette.deepBlock);
+                voxelsGenerated++;
+                frontier.push(neighbor);  // Expand BFS frontier
             }
         }
     }
@@ -371,9 +594,9 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     auto voxelGenEnd = std::chrono::high_resolution_clock::now();
     auto voxelGenDuration = std::chrono::duration_cast<std::chrono::milliseconds>(voxelGenEnd - voxelGenStart).count();
     
-    std::cout << "🔨 Voxel Generation (Bulk): " << voxelGenDuration << "ms (" << voxelsGenerated << " voxels, " 
+    std::cout << "🔨 Voxel Generation (BFS): " << voxelGenDuration << "ms (" << voxelsGenerated << " voxels, " 
               << island->chunks.size() << " chunks)" << std::endl;
-    std::cout << "   └─ Positions Sampled: " << voxelsSampled << std::endl;
+    std::cout << "   └─ Positions Sampled: " << voxelsSampled << " (connectivity-aware)" << std::endl;
     
     // **SURFACE DETECTION PASS**
     // Now that all voxels are placed, determine which should be surface/subsurface blocks
@@ -496,13 +719,11 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     auto basinFillEnd = std::chrono::high_resolution_clock::now();
     auto basinFillDuration = std::chrono::duration_cast<std::chrono::milliseconds>(basinFillEnd - basinFillStart).count();
     
-    // Step 2: Cull exposed water (fast on small dataset)
+    // Step 2: Cull exposed water - ONLY check newly placed water
     auto initialCullStart = std::chrono::high_resolution_clock::now();
-    cullExposedWater(islandID);
+    cullExposedWater(islandID, &waterPositions);
     auto initialCullEnd = std::chrono::high_resolution_clock::now();
     auto initialCullDuration = std::chrono::duration_cast<std::chrono::milliseconds>(initialCullEnd - initialCullStart).count();
-    
-    std::cout << "   └─ Basin Fill: " << basinFillDuration << "ms, Initial Cull: " << initialCullDuration << "ms" << std::endl;
     
     // Update waterPositions after culling - remove positions that no longer have water
     auto decodePos = [](int64_t key) -> Vec3 {
@@ -619,9 +840,9 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
         auto placeWaterEnd = std::chrono::high_resolution_clock::now();
         auto placeWaterDuration = std::chrono::duration_cast<std::chrono::milliseconds>(placeWaterEnd - placeWaterStart).count();
         
-        // Cull exposed water at this layer
+        // Cull exposed water at this layer - ONLY check newly placed water
         auto cullStart = std::chrono::high_resolution_clock::now();
-        cullExposedWater(islandID);
+        cullExposedWater(islandID, &newWaterSet);
         auto cullEnd = std::chrono::high_resolution_clock::now();
         auto cullDuration = std::chrono::duration_cast<std::chrono::milliseconds>(cullEnd - cullStart).count();
         
@@ -1096,6 +1317,11 @@ std::unordered_set<int64_t> IslandChunkSystem::placeWaterBasins(uint32_t islandI
     {
         if (!chunk) continue;
         
+        // Cache chunk above (most water checks look upward)
+        Vec3 aboveChunkCoord = chunkCoord + Vec3(0, 1, 0);
+        auto aboveIt = chunkMap.find(aboveChunkCoord);
+        VoxelChunk* aboveChunk = (aboveIt != chunkMap.end()) ? aboveIt->second.get() : nullptr;
+        
         for (int lz = 0; lz < VoxelChunk::SIZE; ++lz)
         {
             for (int lx = 0; lx < VoxelChunk::SIZE; ++lx)
@@ -1105,12 +1331,29 @@ std::unordered_set<int64_t> IslandChunkSystem::placeWaterBasins(uint32_t islandI
                     uint8_t blockID = chunk->getVoxel(lx, ly, lz);
                     if (blockID != palette.surfaceBlock) continue;
                     
-                    Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(lx, ly, lz);
-                    Vec3 waterPos = worldPos + Vec3(0, 1, 0);
+                    int wx = static_cast<int>(chunkCoord.x) * VoxelChunk::SIZE + lx;
+                    int wy = static_cast<int>(chunkCoord.y) * VoxelChunk::SIZE + ly;
+                    int wz = static_cast<int>(chunkCoord.z) * VoxelChunk::SIZE + lz;
+                    
+                    // Check block above for air (water placement position)
+                    int waterY = wy + 1;
+                    uint8_t aboveBlock = BlockID::AIR;
+                    
+                    // Determine if above position is in current chunk or chunk above
+                    if (ly == VoxelChunk::SIZE - 1) {
+                        // Crosses into chunk above
+                        if (aboveChunk) {
+                            aboveBlock = aboveChunk->getVoxel(lx, 0, lz);
+                        }
+                    } else {
+                        // Same chunk, next Y level
+                        aboveBlock = chunk->getVoxel(lx, ly + 1, lz);
+                    }
                     
                     // Place water one block above surface if air
-                    if (getVoxelDirect(waterPos) == BlockID::AIR)
+                    if (aboveBlock == BlockID::AIR)
                     {
+                        Vec3 waterPos(wx, waterY, wz);
                         setBlockIDWithAutoChunk(islandID, waterPos, palette.waterBlock);
                         waterPositions.insert(encodePos(waterPos));
                         waterBlocksPlaced++;
@@ -1124,28 +1367,41 @@ std::unordered_set<int64_t> IslandChunkSystem::placeWaterBasins(uint32_t islandI
     return waterPositions;
 }
 
-void IslandChunkSystem::cullExposedWater(uint32_t islandID)
+void IslandChunkSystem::cullExposedWater(uint32_t islandID, const std::unordered_set<int64_t>* waterPositionsToCheck)
 {
     FloatingIsland* island = getIsland(islandID);
     if (!island) return;
     
     auto& chunkMap = island->chunks;
     
-    // Helper lambda: Direct voxel lookup without mutex
+    // Helper lambda: Cached voxel lookup (avoid hash map lookups)
+    VoxelChunk* cachedChunk = nullptr;
+    Vec3 cachedChunkCoord(-999999, -999999, -999999);
+    
+    auto getVoxelCached = [&](int wx, int wy, int wz) -> uint8_t {
+        int chunkX = static_cast<int>(std::floor(static_cast<float>(wx) / VoxelChunk::SIZE));
+        int chunkY = static_cast<int>(std::floor(static_cast<float>(wy) / VoxelChunk::SIZE));
+        int chunkZ = static_cast<int>(std::floor(static_cast<float>(wz) / VoxelChunk::SIZE));
+        
+        if (cachedChunk == nullptr || cachedChunkCoord.x != chunkX || 
+            cachedChunkCoord.y != chunkY || cachedChunkCoord.z != chunkZ) {
+            Vec3 chunkCoord(chunkX, chunkY, chunkZ);
+            auto it = chunkMap.find(chunkCoord);
+            if (it == chunkMap.end() || !it->second) return BlockID::AIR;
+            cachedChunk = it->second.get();
+            cachedChunkCoord = chunkCoord;
+        }
+        
+        int localX = wx - (static_cast<int>(cachedChunkCoord.x) * VoxelChunk::SIZE);
+        int localY = wy - (static_cast<int>(cachedChunkCoord.y) * VoxelChunk::SIZE);
+        int localZ = wz - (static_cast<int>(cachedChunkCoord.z) * VoxelChunk::SIZE);
+        
+        return cachedChunk->getVoxel(localX, localY, localZ);
+    };
+    
+    // Helper lambda: Direct voxel lookup without mutex (for Vec3 positions)
     auto getVoxelDirect = [&](const Vec3& pos) -> uint8_t {
-        int chunkX = static_cast<int>(std::floor(pos.x / VoxelChunk::SIZE));
-        int chunkY = static_cast<int>(std::floor(pos.y / VoxelChunk::SIZE));
-        int chunkZ = static_cast<int>(std::floor(pos.z / VoxelChunk::SIZE));
-        Vec3 chunkCoord(chunkX, chunkY, chunkZ);
-        
-        auto it = chunkMap.find(chunkCoord);
-        if (it == chunkMap.end() || !it->second) return 0;
-        
-        int localX = static_cast<int>(std::floor(pos.x)) - (chunkX * VoxelChunk::SIZE);
-        int localY = static_cast<int>(std::floor(pos.y)) - (chunkY * VoxelChunk::SIZE);
-        int localZ = static_cast<int>(std::floor(pos.z)) - (chunkZ * VoxelChunk::SIZE);
-        
-        return it->second->getVoxel(localX, localY, localZ);
+        return getVoxelCached(static_cast<int>(pos.x), static_cast<int>(pos.y), static_cast<int>(pos.z));
     };
     
     static const Vec3 neighbors[6] = {
@@ -1160,50 +1416,105 @@ void IslandChunkSystem::cullExposedWater(uint32_t islandID)
                static_cast<int64_t>(p.z + 32768);
     };
     
+    auto decodePos = [](int64_t key) -> Vec3 {
+        int x = static_cast<int>((key >> 32) & 0xFFFF) - 32768;
+        int y = static_cast<int>((key >> 16) & 0xFFFF) - 32768;
+        int z = static_cast<int>(key & 0xFFFF) - 32768;
+        return Vec3(x, y, z);
+    };
+    
     // PHASE 1: Find all water blocks with exposed leaks (side/bottom air)
     std::vector<Vec3> exposedWater;
     std::unordered_set<int64_t> allWater;
     
-    for (auto& [chunkCoord, chunk] : island->chunks)
+    // OPTIMIZATION: If specific water positions provided, only check those
+    if (waterPositionsToCheck && !waterPositionsToCheck->empty())
     {
-        if (!chunk) continue;
-        
-        for (int lz = 0; lz < VoxelChunk::SIZE; ++lz)
+        // Check only the specified water positions
+        for (int64_t waterKey : *waterPositionsToCheck)
         {
-            for (int ly = 0; ly < VoxelChunk::SIZE; ++ly)
+            Vec3 worldPos = decodePos(waterKey);
+            int wx = static_cast<int>(worldPos.x);
+            int wy = static_cast<int>(worldPos.y);
+            int wz = static_cast<int>(worldPos.z);
+            
+            uint8_t blockID = getVoxelCached(wx, wy, wz);
+            if (blockID != BlockID::WATER && blockID != BlockID::ICE && blockID != BlockID::LAVA)
+                continue;
+            
+            allWater.insert(waterKey);
+            
+            // Check if any SIDE or BOTTOM neighbor is air (exposed leak)
+            bool hasExposedLeak = false;
+            for (int i = 0; i < 6; ++i)
             {
-                for (int lx = 0; lx < VoxelChunk::SIZE; ++lx)
+                if (i == 2) continue; // Skip checking above
+                
+                const Vec3& delta = neighbors[i];
+                int nx = wx + static_cast<int>(delta.x);
+                int ny = wy + static_cast<int>(delta.y);
+                int nz = wz + static_cast<int>(delta.z);
+                
+                if (getVoxelCached(nx, ny, nz) == BlockID::AIR)
                 {
-                    uint8_t blockID = chunk->getVoxel(lx, ly, lz);
-                    
-                    // Check if this is a water-type block
-                    if (blockID != BlockID::WATER && blockID != BlockID::ICE && blockID != BlockID::LAVA)
-                        continue;
-                    
-                    Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(lx, ly, lz);
-                    allWater.insert(encodePos(worldPos));
-                    
-                    // Check if any SIDE or BOTTOM neighbor is air (exposed leak)
-                    // Allow air on TOP (that's just the water surface!)
-                    bool hasExposedLeak = false;
-                    for (int i = 0; i < 6; ++i)
+                    hasExposedLeak = true;
+                    break;
+                }
+            }
+            
+            if (hasExposedLeak)
+            {
+                exposedWater.push_back(worldPos);
+            }
+        }
+    }
+    else
+    {
+        // Check all water in all chunks (original behavior)
+        for (auto& [chunkCoord, chunk] : island->chunks)
+        {
+            if (!chunk) continue;
+            
+            for (int lz = 0; lz < VoxelChunk::SIZE; ++lz)
+            {
+                for (int ly = 0; ly < VoxelChunk::SIZE; ++ly)
+                {
+                    for (int lx = 0; lx < VoxelChunk::SIZE; ++lx)
                     {
-                        // Skip checking above (neighbors[2] is Vec3(0, 1, 0))
-                        if (i == 2) continue;
+                        uint8_t blockID = chunk->getVoxel(lx, ly, lz);
                         
-                        const Vec3& delta = neighbors[i];
-                        Vec3 neighborPos = worldPos + delta;
-                        uint8_t neighborBlock = getVoxelDirect(neighborPos);
-                        if (neighborBlock == BlockID::AIR)
+                        // Check if this is a water-type block
+                        if (blockID != BlockID::WATER && blockID != BlockID::ICE && blockID != BlockID::LAVA)
+                            continue;
+                        
+                        int wx = static_cast<int>(chunkCoord.x) * VoxelChunk::SIZE + lx;
+                        int wy = static_cast<int>(chunkCoord.y) * VoxelChunk::SIZE + ly;
+                        int wz = static_cast<int>(chunkCoord.z) * VoxelChunk::SIZE + lz;
+                        Vec3 worldPos(wx, wy, wz);
+                        allWater.insert(encodePos(worldPos));
+                        
+                        // Check if any SIDE or BOTTOM neighbor is air (exposed leak)
+                        bool hasExposedLeak = false;
+                        for (int i = 0; i < 6; ++i)
                         {
-                            hasExposedLeak = true;
-                            break;
+                            if (i == 2) continue; // Skip checking above
+                            
+                            const Vec3& delta = neighbors[i];
+                            int nx = wx + static_cast<int>(delta.x);
+                            int ny = wy + static_cast<int>(delta.y);
+                            int nz = wz + static_cast<int>(delta.z);
+                            
+                            if (getVoxelCached(nx, ny, nz) == BlockID::AIR)
+                            {
+                                hasExposedLeak = true;
+                                break;
+                            }
                         }
-                    }
-                    
-                    if (hasExposedLeak)
-                    {
-                        exposedWater.push_back(worldPos);
+                        
+                        if (hasExposedLeak)
+                        {
+                            exposedWater.push_back(worldPos);
+                        }
                     }
                 }
             }

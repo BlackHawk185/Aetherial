@@ -59,3 +59,23 @@ FetchContent_MakeAvailable(glm)
 
 # FastNoiseLite is header-only, no build needed (included directly in engine code)
 
+# FastNoiseSIMD - SIMD-accelerated noise library
+add_library(FastNoiseSIMD STATIC
+    FastNoiseSIMD/FastNoiseSIMD.cpp
+    FastNoiseSIMD/FastNoiseSIMD_internal.cpp
+    FastNoiseSIMD/FastNoiseSIMD_sse2.cpp
+    FastNoiseSIMD/FastNoiseSIMD_sse41.cpp
+    FastNoiseSIMD/FastNoiseSIMD_avx2.cpp
+)
+target_include_directories(FastNoiseSIMD PUBLIC FastNoiseSIMD)
+
+# Set architecture-specific flags for SIMD files
+if(MSVC)
+    set_source_files_properties(FastNoiseSIMD/FastNoiseSIMD_sse2.cpp PROPERTIES COMPILE_FLAGS "/arch:SSE2")
+    set_source_files_properties(FastNoiseSIMD/FastNoiseSIMD_sse41.cpp PROPERTIES COMPILE_FLAGS "/arch:SSE2")
+    set_source_files_properties(FastNoiseSIMD/FastNoiseSIMD_avx2.cpp PROPERTIES COMPILE_FLAGS "/arch:AVX2")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set_source_files_properties(FastNoiseSIMD/FastNoiseSIMD_sse2.cpp PROPERTIES COMPILE_FLAGS "-msse2")
+    set_source_files_properties(FastNoiseSIMD/FastNoiseSIMD_sse41.cpp PROPERTIES COMPILE_FLAGS "-msse4.1")
+    set_source_files_properties(FastNoiseSIMD/FastNoiseSIMD_avx2.cpp PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
+endif()

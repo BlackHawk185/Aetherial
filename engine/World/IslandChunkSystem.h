@@ -226,7 +226,7 @@ class IslandChunkSystem
 
     // Water basin generation (called during island generation)
     std::unordered_set<int64_t> placeWaterBasins(uint32_t islandID, const BiomePalette& palette, uint32_t seed);
-    void cullExposedWater(uint32_t islandID);
+    void cullExposedWater(uint32_t islandID, const std::unordered_set<int64_t>* waterPositionsToCheck = nullptr);
 
     // Island queries
     Vec3 getIslandCenter(uint32_t islandID) const;    // Get current physics center of island

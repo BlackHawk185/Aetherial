@@ -100,6 +100,7 @@ target_include_directories(engine PUBLIC
     ${CMAKE_SOURCE_DIR}/libs/stb
     ${CMAKE_SOURCE_DIR}/libs/bimg/3rdparty/stb
     ${CMAKE_SOURCE_DIR}/libs/FastNoiseLite
+    ${CMAKE_SOURCE_DIR}/libs/FastNoiseSIMD
 )
 
 target_compile_features(engine PUBLIC cxx_std_17)
@@ -130,6 +131,7 @@ target_link_libraries(engine PUBLIC
     glad
     OpenGL::GL
     glm::glm
+    FastNoiseSIMD
 )
 
 # Ensure GLFW does not include a GL header (glad provides it)
