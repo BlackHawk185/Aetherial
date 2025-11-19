@@ -94,11 +94,9 @@ private:
 
     // Internal methods
     bool setupCallbacks();
-    bool loadOpenGL(bool enableDebug = false);
 
 public:
     // Debug information
-    void printOpenGLInfo() const;
     void printGLFWInfo() const;
 };
 

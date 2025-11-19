@@ -26,20 +26,7 @@ add_library(engine STATIC
     Culling/Frustum.cpp
     
     # Rendering systems
-    Rendering/InstancedQuadRenderer.cpp  # MDI quad renderer with greedy meshing
-    Rendering/GPUMeshQueue.cpp           # Main-thread mesh generation queue
     Rendering/TextureManager.cpp
-    Rendering/CascadedShadowMap.cpp
-    Rendering/ModelInstanceRenderer.cpp
-    Rendering/BlockHighlightRenderer.cpp
-
-    Rendering/GBuffer.cpp               # Deferred rendering G-buffer
-    Rendering/HDRFramebuffer.cpp        # HDR framebuffer for proper lighting pipeline
-    Rendering/SkyRenderer.cpp           # Sky gradient and sun disc rendering
-    Rendering/VolumetricCloudRenderer.cpp  # Volumetric cloud rendering with raymarching
-    Rendering/DeferredLightingPass.cpp  # Deferred lighting shader
-    Rendering/ShadowBlur.cpp            # Bilateral blur for smooth shadows
-    Rendering/PostProcessingPipeline.cpp  # Post-processing effects (godrays, tone mapping)
     Assets/GLBLoader.cpp
     
     # Vulkan rendering systems
@@ -93,7 +80,6 @@ file(GLOB IMGUI_SRC
 # Add ImGui backend implementations
 set(IMGUI_BACKEND_SRC
     ${CMAKE_SOURCE_DIR}/libs/imgui/backends/imgui_impl_glfw.cpp
-    ${CMAKE_SOURCE_DIR}/libs/imgui/backends/imgui_impl_opengl3.cpp
     ${CMAKE_SOURCE_DIR}/libs/imgui/backends/imgui_impl_vulkan.cpp
 )
 
@@ -166,8 +152,6 @@ target_link_libraries(engine PUBLIC
     enet
     lz4
     stb
-    glad
-    OpenGL::GL
     glm::glm
     FastNoiseSIMD
     Vulkan::Vulkan
@@ -175,5 +159,5 @@ target_link_libraries(engine PUBLIC
     VulkanMemoryAllocator
 )
 
-# Ensure GLFW does not include a GL header (glad provides it)
+# Ensure GLFW does not include OpenGL headers
 target_compile_definitions(engine PUBLIC GLFW_INCLUDE_NONE)

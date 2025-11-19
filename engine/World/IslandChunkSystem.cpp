@@ -16,11 +16,8 @@
 #include "VoxelChunk.h"
 #include "BlockType.h"
 #include "TreeGenerator.h"
-#include "../Rendering/GPUMeshQueue.h"
 #include "../Profiling/Profiler.h"
 #include "../libs/FastNoiseSIMD/FastNoiseSIMD.h"
-#include "../Rendering/InstancedQuadRenderer.h"
-#include "../Rendering/ModelInstanceRenderer.h"
 #include "../Culling/Frustum.h"
 #include "../../libs/FastNoiseLite/FastNoiseLite.h"
 

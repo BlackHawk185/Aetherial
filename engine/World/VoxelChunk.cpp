@@ -3,8 +3,6 @@
 #include "BlockType.h"
 
 #include "../Time/DayNightController.h"  // For dynamic sun direction
-#include "../Rendering/GPUMeshQueue.h"  // For region-based remeshing queue (greedy meshing)
-#include "../Rendering/InstancedQuadRenderer.h"  // For GPU upload
 #include "../Rendering/Vulkan/VulkanQuadRenderer.h"  // For Vulkan GPU upload
 
 #include <algorithm>
@@ -15,7 +13,6 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
-#include <glad/gl.h>  // For OpenGL light map texture functions
 
 #include "../Profiling/Profiler.h"
 #include "IslandChunkSystem.h"  // For inter-island raycast queries
@@ -76,10 +73,10 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
         m_modelInstances[type].push_back(pos);
     }
     
-    // Remesh chunk
-    if (m_isClientChunk && g_greedyMeshQueue)
+    // Remesh chunk (Vulkan path generates mesh directly)
+    if (m_isClientChunk)
     {
-        g_greedyMeshQueue->queueChunkMesh(this);
+        generateMesh();
     }
 }
 
@@ -152,10 +149,16 @@ void VoxelChunk::generateMesh(bool generateLighting)
         renderMesh = std::make_shared<VoxelMesh>();
     }
     
-    // Queue entire chunk for meshing
-    if (g_greedyMeshQueue) {
-        g_greedyMeshQueue->queueChunkMesh(this);
+    // Clear previous mesh data
+    renderMesh->quads.clear();
+    
+    // Generate greedy mesh for all 6 faces
+    for (int face = 0; face < 6; ++face) {
+        greedyMeshFace(renderMesh->quads, face);
     }
+    
+    // Upload to GPU
+    uploadMeshToGPU();
 }
 
 // Greedy meshing for a single face direction
@@ -597,16 +600,8 @@ void VoxelChunk::uploadMeshToGPU()
         printf("[CHUNK] uploadMeshToGPU early return: mesh=%p, isClient=%d\n", (void*)mesh.get(), m_isClientChunk);
         return;
     }
-    // Mesh uploaded
-    
-    // Trigger GPU upload via renderer
-    extern std::unique_ptr<InstancedQuadRenderer> g_instancedQuadRenderer;
+    // Trigger GPU upload via Vulkan renderer
     extern class VulkanQuadRenderer* g_vulkanQuadRenderer;
-    
-    if (g_instancedQuadRenderer)
-    {
-        g_instancedQuadRenderer->uploadChunkMesh(this);
-    }
     
     if (g_vulkanQuadRenderer)
     {

@@ -122,15 +122,6 @@ bool Window::setupCallbacks() {
     return true;
 }
 
-bool Window::loadOpenGL([[maybe_unused]] bool enableDebug) {
-    // OpenGL removed - using Vulkan
-    return true;
-}
-
-void Window::printOpenGLInfo() const {
-    // OpenGL removed
-}
-
 void Window::printGLFWInfo() const {
     int major, minor, revision;
     glfwGetVersion(&major, &minor, &revision);

@@ -19,7 +19,6 @@
 
 // Forward declarations
 class ClientWorld;
-class BlockHighlightRenderer;
 class VulkanBlockHighlighter;
 class VulkanDeferred;
 class HUD;
@@ -150,7 +149,6 @@ private:
     
     // Player control system (unified input, physics, and camera)
     PlayerController m_playerController;
-    std::unique_ptr<BlockHighlightRenderer> m_blockHighlighter;
     std::unique_ptr<VulkanBlockHighlighter> m_vulkanBlockHighlighter;
     std::unique_ptr<HUD> m_hud;
     std::unique_ptr<PeriodicTableUI> m_periodicTableUI;

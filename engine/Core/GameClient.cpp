@@ -30,23 +30,11 @@
 
 #include "../Network/NetworkManager.h"
 #include "../Network/NetworkMessages.h"
-#include "../Rendering/BlockHighlightRenderer.h"
 #include "../Rendering/Vulkan/VulkanBlockHighlighter.h"
-
-#include "../Rendering/GBuffer.h"
-#include "../Rendering/DeferredLightingPass.h"
-#include "../Rendering/PostProcessingPipeline.h"
-#include "../Rendering/HDRFramebuffer.h"
-#include "../Rendering/SkyRenderer.h"
-#include "../Rendering/VolumetricCloudRenderer.h"
 #include "../UI/HUD.h"
 #include "../UI/PeriodicTableUI.h"  // NEW: Periodic table UI for hotbar binding
 #include "../Core/Window.h"
-#include "../Rendering/InstancedQuadRenderer.h"
-#include "../Rendering/ModelInstanceRenderer.h"
 #include "../Rendering/TextureManager.h"
-#include "../Rendering/CascadedShadowMap.h"
-#include "../Rendering/GPUMeshQueue.h"  // Main-thread mesh generation queue
 #include "../Physics/PhysicsSystem.h"  // For ground detection
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -56,7 +44,6 @@
 
 // External systems
 extern TimeEffects* g_timeEffects;
-extern LightMap g_lightMap;
 
 // Global Vulkan renderer pointer (for chunk mesh uploads)
 VulkanQuadRenderer* g_vulkanQuadRenderer = nullptr;
@@ -139,12 +126,6 @@ bool GameClient::initialize(bool enableDebug)
     if (!initializeVulkan())
     {
         return false;
-    }
-
-    // Initialize greedy mesh queue (main-thread mesh generation)
-    if (!g_greedyMeshQueue)
-    {
-        g_greedyMeshQueue = std::make_unique<GreedyMeshQueue>();
     }
 
     m_initialized = true;
@@ -230,18 +211,6 @@ bool GameClient::update(float deltaTime)
         m_networkManager->update();
     }
 
-    // Process mesh generation queue (processes up to 128 chunks per frame for faster updates)
-    if (g_greedyMeshQueue)
-    {
-        g_greedyMeshQueue->processQueue(128);
-    } else {
-        static bool warnedOnce = false;
-        if (!warnedOnce) {
-            std::cout << "[GAME CLIENT] WARNING: No mesh queue available in update loop!" << std::endl;
-            warnedOnce = true;
-        }
-    }
-
     // Update client-side physics for smooth island movement
     if (m_clientWorld)
     {
@@ -258,12 +227,6 @@ bool GameClient::update(float deltaTime)
     if (m_dayNightController)
     {
         m_dayNightController->update(deltaTime);
-    }
-
-    // Update model instancing time (wind animation)
-    if (g_modelRenderer)
-    {
-        g_modelRenderer->update(deltaTime);
     }
 
     // Process input
@@ -294,29 +257,9 @@ void GameClient::shutdown()
         return;
     }
 
-    // Shutdown GPU mesh queue
-    if (g_greedyMeshQueue)
-    {
-        g_greedyMeshQueue.reset();
-    }
-
     // Disconnect from game state
     m_clientWorld = nullptr;
 
-    // Cleanup renderers
-    if (g_instancedQuadRenderer)
-    {
-        g_instancedQuadRenderer->shutdown();
-        g_instancedQuadRenderer.reset();
-        std::cout << "InstancedQuadRenderer shutdown" << std::endl;
-    }
-
-    if (g_modelRenderer)
-    {
-        g_modelRenderer->shutdown();
-        g_modelRenderer.reset();
-    }
-    
     // Cleanup Vulkan renderers BEFORE VulkanContext
     if (m_vulkanCloudRenderer)
     {
@@ -465,12 +408,6 @@ bool GameClient::initializeCommonSystems()
             std::cerr << "❌ Failed to initialize TextureManager!" << std::endl;
             return false;
         }
-    }
-    
-    // Initialize greedy mesh queue (main-thread mesh generation)
-    if (!g_greedyMeshQueue)
-    {
-        g_greedyMeshQueue = std::make_unique<GreedyMeshQueue>();
     }
     
     // Initialize HUD overlay
@@ -940,17 +877,6 @@ void GameClient::processKeyboard(float deltaTime)
     wasEKeyPressed = isEKeyPressed;
 
     // Post-processing controls
-    // Toggle post-processing (press P)
-    static bool wasPostProcessingKeyPressed = false;
-    bool isPostProcessingKeyPressed = glfwGetKey(m_window->getHandle(), GLFW_KEY_P) == GLFW_PRESS;
-    
-    if (isPostProcessingKeyPressed && !wasPostProcessingKeyPressed)
-    {
-        g_postProcessing.setEnabled(!g_postProcessing.isEnabled());
-        std::cout << (g_postProcessing.isEnabled() ? "🌈 Post-processing enabled (tone mapping)" : "🌈 Post-processing disabled (raw HDR)") << std::endl;
-    }
-    wasPostProcessingKeyPressed = isPostProcessingKeyPressed;
-
     // Apply piloting controls (arrow keys for movement and rotation)
     // Send inputs to server instead of directly modifying island
     if (m_playerController.isPiloting() && m_playerController.getPilotedIslandID() != 0)
@@ -1145,298 +1071,6 @@ void GameClient::processBlockInteraction(float deltaTime)
     }
 }
 
-void GameClient::renderWorld()
-{
-    PROFILE_SCOPE("GameClient::renderWorld");
-    
-    if (!m_clientWorld)
-    {
-        return;
-    }
-    
-    // Sync island physics to chunk transforms (updates GLB instances)
-    {
-        PROFILE_SCOPE("syncPhysicsToChunks");
-        syncPhysicsToChunks();
-    }
-
-    // Get camera matrices once
-    float aspect = (float)m_windowWidth / (float)m_windowHeight;
-    glm::mat4 projectionMatrix = m_playerController.getCamera().getProjectionMatrix(aspect);
-    glm::mat4 viewMatrix = m_playerController.getCamera().getViewMatrix();
-    
-    // Update and get frustum for culling
-    m_playerController.getCamera().updateFrustum(aspect);
-    const Frustum& frustum = m_playerController.getCamera().getFrustum();
-    
-    // Get visible chunks using frustum culling
-    std::vector<VoxelChunk*> visibleChunks;
-    {
-        PROFILE_SCOPE("FrustumCull");
-        m_clientWorld->getIslandSystem()->getVisibleChunksFrustum(frustum, visibleChunks);
-    }
-
-    // === DEFERRED RENDERING PIPELINE ===
-    
-    // 1. G-Buffer Pass: Render scene geometry to G-buffer (albedo, normal, position, metadata)
-    {
-        PROFILE_SCOPE("GBuffer_Pass");
-        
-        g_gBuffer.bindForGeometryPass();
-        
-        glm::mat4 viewProjection = projectionMatrix * viewMatrix;
-        
-        if (g_instancedQuadRenderer)
-        {
-            g_instancedQuadRenderer->renderToGBufferCulledMDI(viewProjection, viewMatrix, visibleChunks);
-        }
-        
-        // Render GLB models to G-buffer (frustum culled)
-        if (g_modelRenderer)
-        {
-            g_modelRenderer->renderToGBufferVisible(viewMatrix, projectionMatrix, visibleChunks);
-        }
-        
-        g_gBuffer.unbind();
-    }
-    
-    // 2. Light Depth Pass: Render shadow maps (uses GBuffer for occlusion culling)
-    // Throttled - only update every Nth frame for performance
-    m_frameCounter++;
-    if (m_frameCounter % m_shadowUpdateInterval == 0)
-    {
-        renderLightDepthPass(visibleChunks);
-    }
-    
-    // Get shared data for lighting and sky rendering
-    Vec3 sunDir = m_dayNightController ? m_dayNightController->getSunDirection() : Vec3(-0.3f, -1.0f, -0.2f).normalized();
-    Vec3 moonDir = m_dayNightController ? m_dayNightController->getMoonDirection() : Vec3(0.3f, -1.0f, 0.2f).normalized();
-    glm::vec3 sunDirGLM(sunDir.x, sunDir.y, sunDir.z);
-    glm::vec3 moonDirGLM(moonDir.x, moonDir.y, moonDir.z);
-    
-    float sunIntensity = m_dayNightController ? m_dayNightController->getSunIntensity() : 0.8f;
-    float moonIntensity = m_dayNightController ? m_dayNightController->getMoonIntensity() : 0.15f;
-    
-    const Vec3& camPos = m_playerController.getCamera().position;
-    glm::vec3 cameraPosGLM(camPos.x, camPos.y, camPos.z);
-
-    // 3. Lighting Pass: Read G-buffer, apply light maps, output to HDR framebuffer
-    {
-        PROFILE_SCOPE("Deferred_Lighting_Pass");
-        
-        // Update cascade data in deferred lighting pass (4 cascades: 2 sun + 2 moon)
-        for (int i = 0; i < g_lightMap.getNumCascades(); ++i)
-        {
-            const CascadeData& cascade = g_lightMap.getCascade(i);
-            g_deferredLighting.setCascadeData(i, cascade.viewProj, cascade.splitDistance, cascade.orthoSize);
-        }
-        
-        // Render full-screen quad with deferred lighting to HDR framebuffer
-        float timeOfDay = m_dayNightController ? m_dayNightController->getTimeOfDay() : 12.0f;
-        g_deferredLighting.render(sunDirGLM, moonDirGLM, sunIntensity, moonIntensity, cameraPosGLM, timeOfDay);
-    }
-    
-    // 3. Sky Pass: Render sky gradient with sun disc to HDR framebuffer
-    {
-        PROFILE_SCOPE("Sky_Pass");
-        
-        // Bind HDR framebuffer and copy depth from G-buffer
-        g_hdrFramebuffer.bind();
-        
-        // Copy depth from G-buffer to HDR framebuffer for proper depth testing
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gBuffer.getFBO());
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_hdrFramebuffer.getFBO());
-        glBlitFramebuffer(0, 0, m_windowWidth, m_windowHeight, 0, 0, m_windowWidth, m_windowHeight, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
-        
-        // Render sky (will only render where depth = 1.0, i.e., background pixels)
-        float timeOfDay = m_dayNightController ? m_dayNightController->getTimeOfDay() : 12.0f;
-        g_skyRenderer.render(sunDirGLM, sunIntensity, moonDirGLM, moonIntensity, 
-                           cameraPosGLM, viewMatrix, projectionMatrix, timeOfDay);
-        
-        // Render volumetric clouds (after sky, before transparent objects)
-        g_cloudRenderer.render(sunDirGLM, sunIntensity, cameraPosGLM, 
-                              viewMatrix, projectionMatrix, 
-                              g_gBuffer.getDepthTexture(), timeOfDay);
-        
-        g_hdrFramebuffer.unbind();
-    }
-    
-    // 3.5. Transparent Water Pass: Render water with alpha blending after lighting
-    {
-        PROFILE_SCOPE("Transparent_Water_Pass");
-        
-        // Bind HDR framebuffer (already has depth from G-buffer)
-        g_hdrFramebuffer.bind();
-        
-        // Enable blending for transparency
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glEnable(GL_DEPTH_TEST);     // Read depth buffer
-        glDepthMask(GL_FALSE);       // Don't write to depth buffer
-        
-        // Render water blocks with transparency and SSR
-        if (g_modelRenderer) {
-            g_modelRenderer->renderWaterTransparent(viewMatrix, projectionMatrix, 
-                                                   sunDirGLM, sunIntensity, 
-                                                   moonDirGLM, moonIntensity, 
-                                                   cameraPosGLM,
-                                                   g_gBuffer.getPositionTexture(),
-                                                   g_gBuffer.getNormalTexture(),
-                                                   g_gBuffer.getAlbedoTexture(),
-                                                   g_hdrFramebuffer.getColorTexture());
-        }
-        
-        // Restore state
-        glDepthMask(GL_TRUE);
-        glDisable(GL_BLEND);
-        
-        g_hdrFramebuffer.unbind();
-    }
-    
-    // 4. Post-Processing Pass: Apply tone mapping, etc.
-    {
-        PROFILE_SCOPE("Post_Processing_Pass");
-        
-        // Get current framebuffer output
-        GLuint currentTexture = g_hdrFramebuffer.getColorTexture();
-        glm::mat4 viewProjectionMatrix = projectionMatrix * viewMatrix;
-        
-        // Apply post-processing effects (tone mapping only - godrays removed)
-        g_postProcessing.process(currentTexture, g_gBuffer.getDepthTexture(), 
-                               sunDirGLM, cameraPosGLM, viewProjectionMatrix);
-    }
-    
-    // 5. Forward Pass: Render transparent/special objects (water, block highlight, UI)
-    {
-        PROFILE_SCOPE("Forward_Pass");
-        
-        // Render screen-space fluid (water GLBs + particles with smoothing)
-        // Render block highlight (yellow wireframe cube on selected block) - Vulkan version
-        if (m_vulkanBlockHighlighter && m_inputState.cachedTargetBlock.hit)
-        {
-            PROFILE_SCOPE("renderBlockHighlight");
-            
-            auto& islands = m_clientWorld->getIslandSystem()->getIslands();
-            auto it = islands.find(m_inputState.cachedTargetBlock.islandID);
-            if (it != islands.end())
-            {
-                const FloatingIsland& island = it->second;
-                Vec3 localBlockPos = m_inputState.cachedTargetBlock.localBlockPos;
-                glm::mat4 islandTransform = island.getTransformMatrix();
-                glm::mat4 viewProjection = projectionMatrix * viewMatrix;
-                
-                // Get current command buffer (we're inside render pass)
-                VkCommandBuffer cmd = m_vulkanContext->getCurrentCommandBuffer();
-                m_vulkanBlockHighlighter->render(cmd, localBlockPos, islandTransform, viewProjection);
-            }
-        }
-    }
-}
-
-void GameClient::renderLightDepthPass(const std::vector<VoxelChunk*>& visibleChunks)
-{
-    PROFILE_SCOPE("GameClient::renderLightDepthPass");
-    
-    // Get camera matrices for GBuffer culling
-    float aspect = (float)m_windowWidth / (float)m_windowHeight;
-    glm::mat4 projectionMatrix = m_playerController.getCamera().getProjectionMatrix(aspect);
-    glm::mat4 viewMatrix = m_playerController.getCamera().getViewMatrix();
-    glm::mat4 viewProj = projectionMatrix * viewMatrix;
-    
-    // Get sun and moon directions from DayNightController
-    Vec3 sunDir = m_dayNightController ? m_dayNightController->getSunDirection() : Vec3(-0.3f, -1.0f, -0.2f).normalized();
-    Vec3 moonDir = m_dayNightController ? m_dayNightController->getMoonDirection() : Vec3(0.3f, -1.0f, 0.2f).normalized();
-    glm::vec3 camPos(m_playerController.getCamera().position.x, m_playerController.getCamera().position.y, m_playerController.getCamera().position.z);
-    
-    int numCascades = g_lightMap.getNumCascades();
-    
-    // Cascade configuration
-    const float cascade0Split = 128.0f;   // Near cascade max distance
-    const float cascade1Split = 1000.0f;  // Far cascade = camera far plane
-    const float nearOrthoSize = 64.0f;    // Near: 128x128 units coverage
-    const float farOrthoSize = 1024.0f;   // Far: 2048x2048 units coverage
-    
-    // Render all 4 cascades (0-1: sun, 2-3: moon)
-    for (int cascadeIdx = 0; cascadeIdx < numCascades; ++cascadeIdx)
-    {
-        // Determine which light source (sun or moon) this cascade is for
-        bool isSunCascade = (cascadeIdx < 2);
-        glm::vec3 lightDir = isSunCascade ? glm::vec3(sunDir.x, sunDir.y, sunDir.z) : glm::vec3(moonDir.x, moonDir.y, moonDir.z);
-        
-        // Determine near or far within the light source pair
-        bool isNear = (cascadeIdx % 2 == 0);
-        float splitDistance = isNear ? cascade0Split : cascade1Split;
-        float orthoSize = isNear ? nearOrthoSize : farOrthoSize;
-        
-        // Depth range must cover ALL shadow casters visible from camera
-        // At sunset/sunrise (horizontal sun), shadow casters can be very far along light direction
-        // Use a very large depth range to ensure we capture everything
-        float depthRange = (orthoSize + splitDistance) * 4.0f;  // 4x safety margin for low sun angles
-        float nearPlane = 0.1f;
-        float farPlane = depthRange;
-        
-        // Build light view matrix centered on camera
-        // Position light far back along light direction to capture shadow casters behind camera
-        glm::vec3 lightTarget = camPos;
-        glm::vec3 lightPos = camPos - lightDir * (depthRange * 0.5f);
-        glm::mat4 lightView = glm::lookAt(lightPos, lightTarget, glm::vec3(0,1,0));
-        
-        // Build light projection with texel snapping for stability
-        glm::mat4 lightProj = glm::ortho(-orthoSize, orthoSize, -orthoSize, orthoSize, nearPlane, farPlane);
-        
-        // Snap to texel grid to prevent light map shimmering
-        glm::vec4 centerLS = lightView * glm::vec4(lightTarget, 1.0f);
-        int smWidth = g_lightMap.getSize();
-        float texelSize = (2.0f * farOrthoSize) / float(smWidth);
-        glm::vec2 snapped = glm::floor(glm::vec2(centerLS.x, centerLS.y) / texelSize) * texelSize;
-        glm::vec2 delta = snapped - glm::vec2(centerLS.x, centerLS.y);
-        glm::mat4 snapMat = glm::translate(glm::mat4(1.0f), glm::vec3(-delta.x, -delta.y, 0.0f));
-        glm::mat4 lightVP = lightProj * snapMat * lightView;
-        
-        // Store cascade data for shader
-        CascadeData cascadeData;
-        cascadeData.viewProj = lightVP;
-        cascadeData.splitDistance = splitDistance;
-        cascadeData.orthoSize = orthoSize;
-        g_lightMap.setCascadeData(cascadeIdx, cascadeData);
-        
-        // Render light depth pass for this cascade
-        if (m_windowWidth > 0 && m_windowHeight > 0)
-        {
-            g_lightMap.bindForRendering(cascadeIdx);
-            
-            if (g_instancedQuadRenderer)
-            {
-                g_instancedQuadRenderer->renderLightDepthMDI(lightVP, visibleChunks,
-                                                            g_gBuffer.getPositionTexture(), viewProj);
-            }
-            
-            if (g_modelRenderer)
-            {
-                // GBuffer occlusion cull to only render camera-visible models
-                glm::vec3 cameraPosGLM(m_playerController.getCamera().position.x,
-                                      m_playerController.getCamera().position.y,
-                                      m_playerController.getCamera().position.z);
-                g_modelRenderer->renderLightDepthMDI(lightVP, visibleChunks, 
-                                                    g_gBuffer.getPositionTexture(), viewProj, cameraPosGLM);
-            }
-            
-            g_lightMap.unbindAfterRendering(m_windowWidth, m_windowHeight);
-        }
-    }
-    
-    // Restore culling for forward rendering pass
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
-    
-    // Set lighting data for forward pass (use sun cascade 0 for basic forward lighting)
-    glm::vec3 sunDirVec(sunDir.x, sunDir.y, sunDir.z);
-    if (g_modelRenderer)
-    {
-        g_modelRenderer->setLightingData(g_lightMap.getCascade(0).viewProj, sunDirVec);
-    }
-}
-
 void GameClient::renderWaitingScreen()
 {
     // Simple waiting screen for remote clients
@@ -1526,16 +1160,8 @@ void GameClient::onWindowResize(int width, int height)
 {
     m_windowWidth = width;
     m_windowHeight = height;
-    glViewport(0, 0, width, height);
     
-    // Resize G-buffer to match new window size
-    g_gBuffer.resize(width, height);
-    
-    // Resize HDR framebuffer to match new window size
-    g_hdrFramebuffer.resize(width, height);
-    
-    // Resize post-processing pipeline to match new window size
-    g_postProcessing.resize(width, height);
+    // Vulkan will handle swapchain recreation automatically
 }
 
 void GameClient::handleWorldStateReceived(const WorldStateMessage& worldState)
@@ -1565,14 +1191,7 @@ void GameClient::handleWorldStateReceived(const WorldStateMessage& worldState)
 
 void GameClient::registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* island, uint32_t islandID, const Vec3& chunkCoord)
 {
-    // Register with OpenGL renderer if available
-    if (g_instancedQuadRenderer && chunk && island)
-    {
-        glm::mat4 chunkTransform = island->getChunkTransform(chunkCoord);
-        g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
-    }
-    
-    // Register with Vulkan renderer if available
+    // Register with Vulkan renderer
     if (m_vulkanQuadRenderer && chunk && island)
     {
         // Calculate chunk offset in world units
@@ -1580,79 +1199,23 @@ void GameClient::registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* is
                               chunkCoord.y * VoxelChunk::SIZE,
                               chunkCoord.z * VoxelChunk::SIZE);
         m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
+        
+        // Generate mesh immediately after registration
+        chunk->generateMesh();
     }
 }
 
 void GameClient::syncPhysicsToChunks()
 {
-    if (!m_clientWorld || !g_instancedQuadRenderer)
+    if (!m_clientWorld)
         return;
     
     auto* islandSystem = m_clientWorld->getIslandSystem();
     if (!islandSystem)
         return;
     
-    // Cache OBJ block types once instead of querying every iteration
-    static std::vector<uint8_t> objBlockTypes;
-    static bool objBlockTypesCached = false;
-    if (!objBlockTypesCached)
-    {
-        auto& registry = BlockTypeRegistry::getInstance();
-        for (const auto& blockType : registry.getAllBlockTypes())
-        {
-            if (blockType.renderType == BlockRenderType::OBJ)
-            {
-                objBlockTypes.push_back(blockType.id);
-            }
-        }
-        objBlockTypesCached = true;
-    }
-    
-    // Update transforms for islands that have moved
-    for (auto& [id, island] : islandSystem->getIslands())
-    {
-        // Skip islands that haven't moved (need const_cast because getIslands() returns const ref)
-        if (!island.needsPhysicsUpdate) continue;
-        
-        // Island transforms are baked during meshing - chunks must be re-meshed when islands move
-        
-        // === UPDATE PER-CHUNK TRANSFORMS (OpenGL renderer) ===
-        if (g_instancedQuadRenderer)
-        {
-            for (auto& [chunkCoord, chunk] : island.chunks)
-            {
-                if (!chunk) continue;
-                
-                glm::mat4 chunkTransform = island.getChunkTransform(chunkCoord);
-                g_instancedQuadRenderer->updateChunkTransform(chunk.get(), chunkTransform);
-            }
-        }
-        
-        // === UPDATE GLB MODEL RENDERER ===
-        for (auto& [chunkCoord, chunk] : island.chunks)
-        {
-            if (!chunk) continue;
-            
-            glm::mat4 chunkTransform = island.getChunkTransform(chunkCoord);
-            
-            // === UPDATE GLB MODEL RENDERER (only for chunks with OBJ instances) ===
-            if (g_modelRenderer && !objBlockTypes.empty())
-            {
-                for (uint8_t blockID : objBlockTypes)
-                {
-                    // OPTIMIZATION: Skip chunks with zero instances of this block type
-                    const auto& instances = chunk->getModelInstances(blockID);
-                    if (!instances.empty())
-                    {
-                        g_modelRenderer->updateModelMatrix(blockID, chunk.get(), chunkTransform);
-                    }
-                }
-            }
-        }
-        
-        // Clear update flag after processing (need mutable access)
-        const_cast<FloatingIsland&>(island).needsPhysicsUpdate = false;
-    }
+    // Vulkan renderer updates transforms directly via UBOs
+    // No per-chunk transform updates needed
 }
 
 void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& position,
@@ -1759,22 +1322,15 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
         // Apply the voxel data directly
         chunk->setRawVoxelData(voxelData, dataSize);
         
-        // Register chunk with renderers
-        if (g_instancedQuadRenderer) {
-            glm::mat4 chunkTransform = island->getChunkTransform(chunkCoord);
-            g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
-        }
+        // Register chunk with Vulkan renderer
         if (m_vulkanQuadRenderer) {
             glm::vec3 chunkOffset(chunkCoord.x * VoxelChunk::SIZE,
                                   chunkCoord.y * VoxelChunk::SIZE,
                                   chunkCoord.z * VoxelChunk::SIZE);
             m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
-        }
-        
-        // Queue mesh generation for entire chunk
-        if (g_greedyMeshQueue)
-        {
-            g_greedyMeshQueue->queueChunkMesh(chunk);
+            
+            // Generate mesh immediately after registration
+            chunk->generateMesh();
         }
     }
     else

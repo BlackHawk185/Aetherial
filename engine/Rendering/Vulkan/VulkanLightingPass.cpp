@@ -348,7 +348,7 @@ bool VulkanLightingPass::updateDescriptorSet(const VulkanShadowMap& shadowMap, V
     VkDescriptorImageInfo shadowInfo = {};
     shadowInfo.sampler = m_shadowSampler;
     shadowInfo.imageView = shadowMap.getView();
-    shadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    shadowInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = m_lightingDescriptorSet;
