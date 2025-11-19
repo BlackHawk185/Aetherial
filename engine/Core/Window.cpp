@@ -1,6 +1,6 @@
+#include "../RenderConfig.h"  // USE_VULKAN flag
 #include "Window.h"
 #include <GLFW/glfw3.h>
-#include <glad/gl.h>
 #include <iostream>
 
 namespace Engine {
@@ -33,20 +33,11 @@ bool Window::initialize(int width, int height, const std::string& title, bool en
         return false;
     }
 
-    // Configure GLFW for OpenGL 4.6 Core Profile
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE); // macOS compatibility
+    // Configure GLFW for Vulkan (no OpenGL context)
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     
-    // Enable debug context for development builds
-    #ifdef _DEBUG
-    glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GL_TRUE);
-    #endif
-    
-    // Additional window hints
-    glfwWindowHint(GLFW_RESIZABLE, GL_TRUE);
-    glfwWindowHint(GLFW_SAMPLES, 4); // 4x MSAA
+    std::cout << "Window: Configuring for Vulkan..." << std::endl;
 
     std::cout << "Window: Creating GLFW window (" << width << "x" << height << ")..." << std::endl;
 
@@ -58,32 +49,17 @@ bool Window::initialize(int width, int height, const std::string& title, bool en
         return false;
     }
 
-    // Make OpenGL context current
-    glfwMakeContextCurrent(m_window);
+    // Vulkan - no OpenGL context
+    std::cout << "Window: Vulkan mode - GLFW_NO_API confirmed" << std::endl;
 
     // Set up FPS-style mouse capture
     glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-    
-    // Load OpenGL functions
-    if (!loadOpenGL(enableDebug)) {
-        std::cerr << "Window: Failed to load OpenGL" << std::endl;
-        glfwDestroyWindow(m_window);
-        glfwTerminate();
-        m_window = nullptr;
-        return false;
-    }
 
     // Set up callbacks
     if (!setupCallbacks()) {
         std::cerr << "Window: Failed to setup callbacks" << std::endl;
         return false;
     }
-
-    // Disable V-Sync for maximum performance (uncapped FPS)
-    glfwSwapInterval(0);
-
-    // Print basic system information
-    std::cout << "OpenGL " << glGetString(GL_VERSION) << " (" << glGetString(GL_RENDERER) << ")" << std::endl;
 
     std::cout << "Window: Initialization complete" << std::endl;
     return true;
@@ -118,10 +94,8 @@ bool Window::isKeyPressed(int key) const {
 void Window::update() {
     if (!m_window) return;
 
-    // Swap front and back buffers
-    glfwSwapBuffers(m_window);
-
-    // Poll for and process events
+    // Vulkan handles its own presentation via vkQueuePresentKHR
+    // Just poll events
     glfwPollEvents();
 }
 
@@ -148,59 +122,13 @@ bool Window::setupCallbacks() {
     return true;
 }
 
-bool Window::loadOpenGL(bool enableDebug) {
-    std::cout << "Window: Loading OpenGL with GLAD..." << std::endl;
-
-    // Load OpenGL functions using GLAD
-    if (!gladLoadGL(glfwGetProcAddress)) {
-        std::cerr << "Window: Failed to initialize GLAD" << std::endl;
-        return false;
-    }
-
-    // Enable KHR_debug output only if debug is enabled and we're in a debug build
-    #ifdef _DEBUG
-    if (enableDebug) {
-        GLint flags = 0;
-        glGetIntegerv(GL_CONTEXT_FLAGS, &flags);
-        if (flags & GL_CONTEXT_FLAG_DEBUG_BIT)
-        {
-            std::cout << "Window: Enabling OpenGL debug output" << std::endl;
-            glEnable(GL_DEBUG_OUTPUT);
-            glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
-            auto cb = [](GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length,
-                         const GLchar* message, const void* userParam)
-            {
-                (void)length; (void)userParam; (void)source; (void)type; (void)id;
-                
-                // Filter out NOTIFY level messages to reduce spam
-                if (severity == GL_DEBUG_SEVERITY_NOTIFICATION) {
-                    return;
-                }
-                
-                const char* sev = severity == GL_DEBUG_SEVERITY_HIGH ? "HIGH" :
-                                  severity == GL_DEBUG_SEVERITY_MEDIUM ? "MEDIUM" :
-                                  severity == GL_DEBUG_SEVERITY_LOW ? "LOW" : "NOTIFY";
-                std::cerr << "[GL DEBUG][" << sev << "] " << message << std::endl;
-            };
-            glDebugMessageCallback((GLDEBUGPROC)cb, nullptr);
-            glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_TRUE);
-        }
-    }
-    #else
-    (void)enableDebug; // Suppress unused parameter warning in release builds
-    #endif
-
-    std::cout << "Window: OpenGL loaded successfully" << std::endl;
+bool Window::loadOpenGL([[maybe_unused]] bool enableDebug) {
+    // OpenGL removed - using Vulkan
     return true;
 }
 
 void Window::printOpenGLInfo() const {
-    std::cout << "=== OpenGL Information ===" << std::endl;
-    std::cout << "Vendor: " << glGetString(GL_VENDOR) << std::endl;
-    std::cout << "Renderer: " << glGetString(GL_RENDERER) << std::endl;
-    std::cout << "Version: " << glGetString(GL_VERSION) << std::endl;
-    std::cout << "GLSL Version: " << glGetString(GL_SHADING_LANGUAGE_VERSION) << std::endl;
-    std::cout << "=========================" << std::endl;
+    // OpenGL removed
 }
 
 void Window::printGLFWInfo() const {
@@ -236,9 +164,6 @@ void Window::glfwCursorPosCallback(GLFWwindow* window, double xpos, double ypos)
 }
 
 void Window::glfwFramebufferSizeCallback(GLFWwindow* window, int width, int height) {
-    // Update OpenGL viewport
-    glViewport(0, 0, width, height);
-
     Window* windowInstance = static_cast<Window*>(glfwGetWindowUserPointer(window));
     if (windowInstance) {
         windowInstance->m_width = width;

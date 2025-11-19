@@ -13,9 +13,15 @@
 #include <array>
 #include <unordered_map>
 
+// Vulkan headers (needed for unique_ptr destructor)
+#include "../Rendering/Vulkan/VulkanContext.h"
+#include "../Rendering/Vulkan/VulkanQuadRenderer.h"
+
 // Forward declarations
 class ClientWorld;
 class BlockHighlightRenderer;
+class VulkanBlockHighlighter;
+class VulkanDeferred;
 class HUD;
 class PeriodicTableUI;
 class VoxelChunk;
@@ -125,6 +131,13 @@ private:
     int m_windowWidth = 1280;
     int m_windowHeight = 720;
     
+    // Vulkan rendering backend
+    std::unique_ptr<VulkanContext> m_vulkanContext;
+    std::unique_ptr<VulkanQuadRenderer> m_vulkanQuadRenderer;
+    std::unique_ptr<VulkanDeferred> m_vulkanDeferred;
+    std::unique_ptr<class VulkanSkyRenderer> m_vulkanSkyRenderer;
+    std::unique_ptr<class VulkanCloudRenderer> m_vulkanCloudRenderer;
+    
     // Client world connection
     ClientWorld* m_clientWorld = nullptr;  // Not owned by client
     
@@ -138,6 +151,7 @@ private:
     // Player control system (unified input, physics, and camera)
     PlayerController m_playerController;
     std::unique_ptr<BlockHighlightRenderer> m_blockHighlighter;
+    std::unique_ptr<VulkanBlockHighlighter> m_vulkanBlockHighlighter;
     std::unique_ptr<HUD> m_hud;
     std::unique_ptr<PeriodicTableUI> m_periodicTableUI;
     
@@ -187,9 +201,19 @@ private:
     bool initializeWindow();
     
     /**
-     * Initialize graphics systems (ImGui, etc.)
+     * Initialize common systems (texture manager, mesh queue, UI)
      */
-    bool initializeGraphics();
+    bool initializeCommonSystems();
+    
+    /**
+     * Initialize Vulkan rendering backend
+     */
+    bool initializeVulkan();
+    
+    /**
+     * Render frame using Vulkan
+     */
+    void renderVulkan();
     
     /**
      * Process keyboard and mouse input
@@ -245,7 +269,7 @@ private:
     /**
      * Helper: Register a chunk with the renderer and set up callbacks
      */
-    void registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* island, const Vec3& chunkCoord);
+    void registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* island, uint32_t islandID, const Vec3& chunkCoord);
     
     /**
      * Sync island transforms to chunk renderers (event-driven, only updates moved islands)

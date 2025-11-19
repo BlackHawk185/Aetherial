@@ -1,7 +1,7 @@
 // VoxelChunk.h - Dynamic physics-enabled voxel chunks with light mapping
 #pragma once
 
-#include "../Math/Vec3.h"
+#include <glm/glm.hpp>
 #include "BlockType.h"
 #include "ChunkConstants.h"
 #include <array>
@@ -17,19 +17,22 @@
 using GLuint = uint32_t;
 
 // Unified quad/face representation (used for both render and collision)
-// Pack tightly to match GPU buffer layout
-#pragma pack(push, 1)
-struct QuadFace
+// QuadFace struct for vertex pulling - 40 bytes (matches GPU shader std430 layout exactly)
+// CRITICAL: std430 aligns vec3 to 16 bytes (as if it were vec4), so we add explicit padding
+// CRITICAL: Force 16-byte alignment for entire struct to match std430 array layout
+struct alignas(16) QuadFace
 {
-    Vec3 position;   // Center position (12 bytes, offset 0)
-    Vec3 normal;     // Face normal (12 bytes, offset 12)
-    float width;     // Width of the quad (4 bytes, offset 24)
-    float height;    // Height of the quad (4 bytes, offset 28)
-    uint8_t blockType; // Block type (1 byte, offset 32)
-    uint8_t faceDir;   // Face direction 0-5 (1 byte, offset 33)
-    uint16_t padding;  // Padding (2 bytes, offset 34) - Total: 36 bytes (was 44)
+    glm::vec3 position;   // Island-relative CORNER position (12 bytes, offset 0)
+    float _padding0;      // Explicit padding to match std430 vec3 alignment (4 bytes, offset 12)
+    float width;          // Width of the quad (4 bytes, offset 16)
+    float height;         // Height of the quad (4 bytes, offset 20)
+    uint32_t packedNormal;// Packed 10:10:10:2 normal (4 bytes, offset 24)
+    uint32_t blockType;   // Block type ID (4 bytes, offset 28)
+    uint32_t faceDir;     // Face direction 0-5 (4 bytes, offset 32)
+    uint32_t islandID;    // Island ID for transform lookup (4 bytes, offset 36)
 };
-#pragma pack(pop)
+static_assert(sizeof(QuadFace) == 48, "QuadFace must be 48 bytes with 16-byte alignment for std430 array");
+static_assert(alignof(QuadFace) == 16, "QuadFace must have 16-byte alignment for std430 array");
 
 struct VoxelMesh
 {
@@ -97,7 +100,6 @@ class VoxelChunk
     // Mesh generation and management
     // Generate mesh for entire chunk as single unit
     void generateMesh(bool generateLighting = true);
-    std::vector<QuadFace> generateFullChunkMesh();
     
     // Explosion system for direct quad manipulation
     void explodeQuad(uint16_t quadIndex);
@@ -105,15 +107,15 @@ class VoxelChunk
     void uploadMeshToGPU();
 
     // **LOD AND CULLING SUPPORT**
-    int calculateLOD(const Vec3& cameraPos) const;
-    bool shouldRender(const Vec3& cameraPos, float maxDistance = 1024.0f) const;
+    int calculateLOD(const glm::vec3& cameraPos) const;
+    bool shouldRender(const glm::vec3& cameraPos, float maxDistance = 1024.0f) const;
     
     // Cached world-space AABB for frustum culling
     struct WorldAABB {
-        Vec3 min, max;
+        glm::vec3 min, max;
         bool valid = false;
     };
-    void setCachedWorldAABB(const Vec3& min, const Vec3& max) {
+    void setCachedWorldAABB(const glm::vec3& min, const glm::vec3& max) {
         m_cachedWorldAABB.min = min;
         m_cachedWorldAABB.max = max;
         m_cachedWorldAABB.valid = true;
@@ -126,35 +128,39 @@ class VoxelChunk
     void setRenderMesh(std::shared_ptr<VoxelMesh> newMesh) { renderMesh = newMesh; }
 
     // Decorative/model instance positions (generic per block type)
-    const std::vector<Vec3>& getModelInstances(uint8_t blockID) const;
+    const std::vector<glm::vec3>& getModelInstances(uint8_t blockID) const;
     
     // NOTE: For raycasting, use VoxelRaycaster::raycast() - it's DDA-based and handles rotated islands
 
     // Island context for inter-chunk culling
-    void setIslandContext(uint32_t islandID, const Vec3& chunkCoord);
+    void setIslandContext(uint32_t islandID, const glm::vec3& chunkCoord);
 
+   public:
+    // Island context for inter-chunk culling
+    uint32_t m_islandID = 0;
+    glm::vec3 m_chunkCoord{0, 0, 0};
+    
+    // Generate full chunk mesh (island-relative positions)
+    std::vector<QuadFace> generateFullChunkMesh();
+    
    private:
     std::array<uint8_t, VOLUME> voxels;
     std::shared_ptr<VoxelMesh> renderMesh;  // Direct access (no atomic overhead)
-    
-    // Island context for inter-chunk culling
-    uint32_t m_islandID = 0;
-    Vec3 m_chunkCoord{0, 0, 0};
     
     // Cached world-space AABB for frustum culling optimization
     WorldAABB m_cachedWorldAABB;
 
     // NEW: Per-block-type model instance positions (for BlockRenderType::OBJ blocks)
     // Key: BlockID, Value: list of instance positions within this chunk
-    std::unordered_map<uint8_t, std::vector<Vec3>> m_modelInstances;
+    std::unordered_map<uint8_t, std::vector<glm::vec3>> m_modelInstances;
     
     // Client/Server flag - only client chunks upload to GPU
     bool m_isClientChunk = false;
 
-    // Quad generation helper
+    // Quad generation helper (island-relative positions)
     void addQuad(std::vector<QuadFace>& quads, float x, float y, float z, int face, int width, int height, uint8_t blockType);
     
-    // Greedy meshing per face direction
+    // Greedy meshing per face direction (island-relative)
     void greedyMeshFace(std::vector<QuadFace>& quads, int face);
     
     bool isVoxelSolid(int x, int y, int z) const;

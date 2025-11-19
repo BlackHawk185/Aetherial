@@ -42,6 +42,20 @@ add_library(engine STATIC
     Rendering/PostProcessingPipeline.cpp  # Post-processing effects (godrays, tone mapping)
     Assets/GLBLoader.cpp
     
+    # Vulkan rendering systems
+    Rendering/Vulkan/VulkanMemoryAllocator.cpp
+    Rendering/Vulkan/VulkanContext.cpp
+    Rendering/Vulkan/VulkanTriangleRenderer.cpp
+    Rendering/Vulkan/VulkanQuadRenderer.cpp
+    Rendering/Vulkan/VulkanBlockHighlighter.cpp
+    Rendering/Vulkan/VulkanImage.cpp
+    Rendering/Vulkan/VulkanGBuffer.cpp
+    Rendering/Vulkan/VulkanDeferred.cpp
+    Rendering/Vulkan/VulkanShadowMap.cpp
+    Rendering/Vulkan/VulkanLightingPass.cpp
+    Rendering/Vulkan/VulkanSkyRenderer.cpp
+    Rendering/Vulkan/VulkanCloudRenderer.cpp
+    
     # Input systems
     Input/Camera.cpp
     Input/PlayerController.cpp
@@ -80,6 +94,7 @@ file(GLOB IMGUI_SRC
 set(IMGUI_BACKEND_SRC
     ${CMAKE_SOURCE_DIR}/libs/imgui/backends/imgui_impl_glfw.cpp
     ${CMAKE_SOURCE_DIR}/libs/imgui/backends/imgui_impl_opengl3.cpp
+    ${CMAKE_SOURCE_DIR}/libs/imgui/backends/imgui_impl_vulkan.cpp
 )
 
 # Add third-party sources to engine target
@@ -122,6 +137,29 @@ endif()
 
 find_package(OpenGL REQUIRED)
 
+# Find Vulkan (optional for now - migration in progress)
+find_package(Vulkan)
+
+# Fetch vk-bootstrap for Vulkan initialization
+include(FetchContent)
+FetchContent_Declare(
+    vk-bootstrap
+    GIT_REPOSITORY https://github.com/charles-lunarg/vk-bootstrap
+    GIT_TAG v1.3.295
+)
+
+# Fetch VulkanMemoryAllocator for memory management
+FetchContent_Declare(
+    VulkanMemoryAllocator
+    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+    GIT_TAG v3.3.0
+)
+
+FetchContent_MakeAvailable(vk-bootstrap VulkanMemoryAllocator)
+
+# Include auto-generated shader paths header
+target_include_directories(engine PRIVATE ${CMAKE_BINARY_DIR}/engine)
+
 # Link third-party libraries
 target_link_libraries(engine PUBLIC
     glfw
@@ -132,6 +170,9 @@ target_link_libraries(engine PUBLIC
     OpenGL::GL
     glm::glm
     FastNoiseSIMD
+    Vulkan::Vulkan
+    vk-bootstrap::vk-bootstrap
+    VulkanMemoryAllocator
 )
 
 # Ensure GLFW does not include a GL header (glad provides it)

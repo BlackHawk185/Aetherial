@@ -24,12 +24,76 @@ add_executable(MMORPGEngine
 target_link_libraries(MMORPGEngine PRIVATE engine)
 
 # Copy shaders to build directory
-file(GLOB SHADER_FILES "${CMAKE_SOURCE_DIR}/shaders/*")
+file(GLOB SHADER_FILES "${CMAKE_SOURCE_DIR}/shaders/*.vert" "${CMAKE_SOURCE_DIR}/shaders/*.frag" "${CMAKE_SOURCE_DIR}/shaders/*.comp")
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/bin/shaders)
 foreach(SHADER ${SHADER_FILES})
     get_filename_component(SHADER_NAME ${SHADER} NAME)
     configure_file(${SHADER} ${CMAKE_BINARY_DIR}/bin/shaders/${SHADER_NAME} COPYONLY)
 endforeach()
+
+# Compile Vulkan shaders to SPIR-V (REQUIRED - build fails if missing)
+find_program(GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin" "C:/VulkanSDK/1.4.328.1/Bin")
+if(NOT GLSLC)
+    message(FATAL_ERROR "glslc not found! Install Vulkan SDK or set VULKAN_SDK environment variable.")
+endif()
+
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/bin/shaders/vulkan)
+
+# Define required shaders explicitly to catch missing files at build time
+set(REQUIRED_VULKAN_SHADERS
+    quad_vertex_pulling.vert
+    quad.frag
+    quad_gbuffer.frag
+    quad_simple.frag
+    lighting.vert
+    lighting.frag
+    lighting_pass.vert
+    lighting_pass.frag
+    sky.vert
+    sky.frag
+    highlight.vert
+    highlight.frag
+    clouds.vert
+    clouds.frag
+)
+
+# Verify all required shaders exist in source
+foreach(SHADER_NAME ${REQUIRED_VULKAN_SHADERS})
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/shaders/vulkan/${SHADER_NAME}")
+        message(FATAL_ERROR "Required shader missing: shaders/vulkan/${SHADER_NAME}")
+    endif()
+endforeach()
+
+# Compile each shader
+foreach(SHADER_NAME ${REQUIRED_VULKAN_SHADERS})
+    set(SHADER_SOURCE "${CMAKE_SOURCE_DIR}/shaders/vulkan/${SHADER_NAME}")
+    set(SHADER_OUTPUT "${CMAKE_BINARY_DIR}/bin/shaders/vulkan/${SHADER_NAME}.spv")
+    
+    add_custom_command(
+        OUTPUT ${SHADER_OUTPUT}
+        COMMAND ${GLSLC} ${SHADER_SOURCE} -o ${SHADER_OUTPUT}
+        DEPENDS ${SHADER_SOURCE}
+        COMMENT "Compiling Vulkan shader: ${SHADER_NAME}"
+        VERBATIM
+    )
+    
+    list(APPEND VULKAN_SHADER_OUTPUTS ${SHADER_OUTPUT})
+endforeach()
+
+# Generate shader paths header for compile-time validation
+set(SHADER_PATHS_HEADER "${CMAKE_BINARY_DIR}/engine/ShaderPaths.h")
+file(WRITE ${SHADER_PATHS_HEADER} "// Auto-generated shader paths - DO NOT EDIT\n")
+file(APPEND ${SHADER_PATHS_HEADER} "#pragma once\n\n")
+file(APPEND ${SHADER_PATHS_HEADER} "namespace ShaderPaths {\n")
+foreach(SHADER_NAME ${REQUIRED_VULKAN_SHADERS})
+    string(REPLACE "." "_" SHADER_VAR ${SHADER_NAME})
+    file(APPEND ${SHADER_PATHS_HEADER} "    constexpr const char* ${SHADER_VAR}_spv = \"build/bin/shaders/vulkan/${SHADER_NAME}.spv\";\n")
+endforeach()
+file(APPEND ${SHADER_PATHS_HEADER} "}\n")
+
+add_custom_target(VulkanShaders ALL DEPENDS ${VULKAN_SHADER_OUTPUTS})
+add_dependencies(engine VulkanShaders)  # Engine must wait for shaders
+add_dependencies(MMORPGEngine VulkanShaders)
 
 # Remove old shader files that were renamed
 file(REMOVE ${CMAKE_BINARY_DIR}/bin/shaders/greedy_mesh.comp)

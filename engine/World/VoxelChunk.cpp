@@ -5,6 +5,7 @@
 #include "../Time/DayNightController.h"  // For dynamic sun direction
 #include "../Rendering/GPUMeshQueue.h"  // For region-based remeshing queue (greedy meshing)
 #include "../Rendering/InstancedQuadRenderer.h"  // For GPU upload
+#include "../Rendering/Vulkan/VulkanQuadRenderer.h"  // For Vulkan GPU upload
 
 #include <algorithm>
 #include <cmath>
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <memory>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <glad/gl.h>  // For OpenGL light map texture functions
 
@@ -50,119 +52,34 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
     
     int voxelIdx = x + y * SIZE + z * SIZE * SIZE;
     uint8_t oldType = voxels[voxelIdx];
-    if (oldType == type) return; // No change
+    if (oldType == type) return;
     
+    // Update voxel data
     voxels[voxelIdx] = type;
     
-    // Track OBJ-type blocks (instanced models like grass, water)
+    // Track OBJ-type blocks
     auto& registry = BlockTypeRegistry::getInstance();
     const BlockTypeInfo* oldBlockInfo = registry.getBlockType(oldType);
     const BlockTypeInfo* newBlockInfo = registry.getBlockType(type);
     
-    // Remove old OBJ instance if it was an OBJ block
     if (oldBlockInfo && oldBlockInfo->renderType == BlockRenderType::OBJ) {
         auto it = m_modelInstances.find(oldType);
         if (it != m_modelInstances.end()) {
             auto& instances = it->second;
-            Vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+            glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
             instances.erase(std::remove(instances.begin(), instances.end(), pos), instances.end());
         }
     }
     
-    // Add new OBJ instance if it's an OBJ block
     if (newBlockInfo && newBlockInfo->renderType == BlockRenderType::OBJ) {
-        Vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+        glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
         m_modelInstances[type].push_back(pos);
     }
     
-    // CLIENT ONLY: Use explosion system for instant mesh updates
-    if (m_isClientChunk)
+    // Remesh chunk
+    if (m_isClientChunk && g_greedyMeshQueue)
     {
-        auto mesh = getRenderMesh();
-        if (!mesh)
-        {
-            // No mesh yet - queue for initial generation
-            if (g_greedyMeshQueue) {
-                g_greedyMeshQueue->queueChunkMesh(this);
-            }
-            return;
-        }
-        
-        // Find and explode ALL quads covering this voxel (check all 6 face directions)
-        for (int face = 0; face < 6; ++face)
-        {
-            uint32_t key = voxelIdx * 6 + face;
-            auto it = mesh->voxelFaceToQuadIndex.find(key);
-            if (it != mesh->voxelFaceToQuadIndex.end())
-            {
-                explodeQuad(it->second);
-                mesh->voxelFaceToQuadIndex.erase(it);
-            }
-        }
-        
-        // If placing a block, add new faces
-        if (type != 0)  // 0 = air
-        {
-            addSimpleFacesForVoxel(x, y, z);
-        }
-        
-        // CRITICAL: Update neighboring voxels - they may now have exposed faces
-        // When we break/place a block, the 6 adjacent voxels may need new faces added
-        static const int dx[6] = { 0,  0,  0,  0, -1,  1};
-        static const int dy[6] = {-1,  1,  0,  0,  0,  0};
-        static const int dz[6] = { 0,  0, -1,  1,  0,  0};
-        
-        for (int face = 0; face < 6; ++face)
-        {
-            int nx = x + dx[face];
-            int ny = y + dy[face];
-            int nz = z + dz[face];
-            
-            // Skip out of bounds
-            if (nx < 0 || nx >= SIZE || ny < 0 || ny >= SIZE || nz < 0 || nz >= SIZE)
-                continue;
-            
-            // If neighbor is solid, it might need a new face toward this voxel
-            if (isVoxelSolid(nx, ny, nz))
-            {
-                // Opposite face direction (face toward the modified voxel)
-                int oppositeFace = face ^ 1; // 0<->1, 2<->3, 4<->5
-                
-                // Check if that face is now exposed
-                if (isFaceExposed(nx, ny, nz, oppositeFace))
-                {
-                    int neighborIdx = nx + ny * SIZE + nz * SIZE * SIZE;
-                    
-                    // Explode the quad on this specific face direction for the neighbor
-                    if (!mesh->isExploded[neighborIdx])
-                    {
-                        uint32_t neighborKey = neighborIdx * 6 + oppositeFace;
-                        auto it = mesh->voxelFaceToQuadIndex.find(neighborKey);
-                        if (it != mesh->voxelFaceToQuadIndex.end())
-                        {
-                            explodeQuad(it->second);
-                            mesh->voxelFaceToQuadIndex.erase(it);
-                        }
-                    }
-                    
-                    // Add a 1x1 face for this exposed direction
-                    uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
-                    uint8_t neighborBlockType = getVoxel(nx, ny, nz);
-                    addQuad(mesh->quads, static_cast<float>(nx), static_cast<float>(ny),
-                           static_cast<float>(nz), oppositeFace, 1, 1, neighborBlockType);
-                    
-                    // Add to tracking map (voxelIdx * 6 + faceDir)
-                    uint32_t neighborKey = neighborIdx * 6 + oppositeFace;
-                    mesh->voxelFaceToQuadIndex[neighborKey] = newQuadIdx;
-                    mesh->isExploded[neighborIdx] = true;
-                }
-            }
-        }
-        
-        mesh->needsGPUUpload = true;
-        
-        // Upload to GPU immediately
-        uploadMeshToGPU();
+        g_greedyMeshQueue->queueChunkMesh(this);
     }
 }
 
@@ -197,7 +114,7 @@ void VoxelChunk::setRawVoxelData(const uint8_t* data, uint32_t size)
                 
                 const BlockTypeInfo* blockInfo = registry.getBlockType(blockType);
                 if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
-                    Vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+                    glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
                     m_modelInstances[blockType].push_back(pos);
                 }
             }
@@ -205,7 +122,7 @@ void VoxelChunk::setRawVoxelData(const uint8_t* data, uint32_t size)
     }
 }
 
-void VoxelChunk::setIslandContext(uint32_t islandID, const Vec3& chunkCoord)
+void VoxelChunk::setIslandContext(uint32_t islandID, const glm::vec3& chunkCoord)
 {
     m_islandID = islandID;
     m_chunkCoord = chunkCoord;
@@ -244,10 +161,10 @@ void VoxelChunk::generateMesh(bool generateLighting)
 // Greedy meshing for a single face direction
 void VoxelChunk::greedyMeshFace(std::vector<QuadFace>& quads, int face)
 {
-    // Face directions: 0=-Y, 1=+Y, 2=-Z, 3=+Z, 4=-X, 5=+X
+    // Industry standard face ordering: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z
     // Process each face direction with proper axis mapping
     
-    // Simpler approach: iterate through each voxel position and build greedy rectangles
+    // Iterate through each voxel position and build greedy rectangles
     // Use a visited mask to track which faces have been merged
     std::vector<bool> visited(SIZE * SIZE * SIZE, false);
     
@@ -270,69 +187,7 @@ void VoxelChunk::greedyMeshFace(std::vector<QuadFace>& quads, int face)
                 int height = 1;
                 
                 // Expand width (horizontal for this face)
-                if (face == 0 || face == 1) // Y faces: expand in X direction
-                {
-                    while (x + width < SIZE)
-                    {
-                        int checkIdx = (x + width) + y * SIZE + z * SIZE * SIZE;
-                        if (visited[checkIdx]) break;
-                        if (!isVoxelSolid(x + width, y, z)) break;
-                        if (getVoxel(x + width, y, z) != blockType) break;
-                        if (!isFaceExposed(x + width, y, z, face)) break;
-                        ++width;
-                    }
-                    
-                    // Expand height (Z direction)
-                    bool canExpand = true;
-                    while (z + height < SIZE && canExpand)
-                    {
-                        for (int dx = 0; dx < width; ++dx)
-                        {
-                            int checkIdx = (x + dx) + y * SIZE + (z + height) * SIZE * SIZE;
-                            if (visited[checkIdx] ||
-                                !isVoxelSolid(x + dx, y, z + height) ||
-                                getVoxel(x + dx, y, z + height) != blockType ||
-                                !isFaceExposed(x + dx, y, z + height, face))
-                            {
-                                canExpand = false;
-                                break;
-                            }
-                        }
-                        if (canExpand) ++height;
-                    }
-                }
-                else if (face == 2 || face == 3) // Z faces: expand in X direction
-                {
-                    while (x + width < SIZE)
-                    {
-                        int checkIdx = (x + width) + y * SIZE + z * SIZE * SIZE;
-                        if (visited[checkIdx]) break;
-                        if (!isVoxelSolid(x + width, y, z)) break;
-                        if (getVoxel(x + width, y, z) != blockType) break;
-                        if (!isFaceExposed(x + width, y, z, face)) break;
-                        ++width;
-                    }
-                    
-                    // Expand height (Y direction)
-                    bool canExpand = true;
-                    while (y + height < SIZE && canExpand)
-                    {
-                        for (int dx = 0; dx < width; ++dx)
-                        {
-                            int checkIdx = (x + dx) + (y + height) * SIZE + z * SIZE * SIZE;
-                            if (visited[checkIdx] ||
-                                !isVoxelSolid(x + dx, y + height, z) ||
-                                getVoxel(x + dx, y + height, z) != blockType ||
-                                !isFaceExposed(x + dx, y + height, z, face))
-                            {
-                                canExpand = false;
-                                break;
-                            }
-                        }
-                        if (canExpand) ++height;
-                    }
-                }
-                else // X faces: expand in Z direction
+                if (face == 0 || face == 1) // X faces: expand in Z direction (width), Y direction (height)
                 {
                     while (z + width < SIZE)
                     {
@@ -363,28 +218,90 @@ void VoxelChunk::greedyMeshFace(std::vector<QuadFace>& quads, int face)
                         if (canExpand) ++height;
                     }
                 }
+                else if (face == 2 || face == 3) // Y faces: expand in X direction (width), Z direction (height)
+                {
+                    while (x + width < SIZE)
+                    {
+                        int checkIdx = (x + width) + y * SIZE + z * SIZE * SIZE;
+                        if (visited[checkIdx]) break;
+                        if (!isVoxelSolid(x + width, y, z)) break;
+                        if (getVoxel(x + width, y, z) != blockType) break;
+                        if (!isFaceExposed(x + width, y, z, face)) break;
+                        ++width;
+                    }
+                    
+                    // Expand height (Z direction)
+                    bool canExpand = true;
+                    while (z + height < SIZE && canExpand)
+                    {
+                        for (int dx = 0; dx < width; ++dx)
+                        {
+                            int checkIdx = (x + dx) + y * SIZE + (z + height) * SIZE * SIZE;
+                            if (visited[checkIdx] ||
+                                !isVoxelSolid(x + dx, y, z + height) ||
+                                getVoxel(x + dx, y, z + height) != blockType ||
+                                !isFaceExposed(x + dx, y, z + height, face))
+                            {
+                                canExpand = false;
+                                break;
+                            }
+                        }
+                        if (canExpand) ++height;
+                    }
+                }
+                else // Z faces: expand in X direction (width), Y direction (height)
+                {
+                    while (x + width < SIZE)
+                    {
+                        int checkIdx = (x + width) + y * SIZE + z * SIZE * SIZE;
+                        if (visited[checkIdx]) break;
+                        if (!isVoxelSolid(x + width, y, z)) break;
+                        if (getVoxel(x + width, y, z) != blockType) break;
+                        if (!isFaceExposed(x + width, y, z, face)) break;
+                        ++width;
+                    }
+                    
+                    // Expand height (Y direction)
+                    bool canExpand = true;
+                    while (y + height < SIZE && canExpand)
+                    {
+                        for (int dx = 0; dx < width; ++dx)
+                        {
+                            int checkIdx = (x + dx) + (y + height) * SIZE + z * SIZE * SIZE;
+                            if (visited[checkIdx] ||
+                                !isVoxelSolid(x + dx, y + height, z) ||
+                                getVoxel(x + dx, y + height, z) != blockType ||
+                                !isFaceExposed(x + dx, y + height, z, face))
+                            {
+                                canExpand = false;
+                                break;
+                            }
+                        }
+                        if (canExpand) ++height;
+                    }
+                }
                 
                 // Mark merged area as visited
-                if (face == 0 || face == 1) // Y faces
-                {
-                    for (int dz = 0; dz < height; ++dz)
-                        for (int dx = 0; dx < width; ++dx)
-                            visited[(x + dx) + y * SIZE + (z + dz) * SIZE * SIZE] = true;
-                }
-                else if (face == 2 || face == 3) // Z faces
-                {
-                    for (int dy = 0; dy < height; ++dy)
-                        for (int dx = 0; dx < width; ++dx)
-                            visited[(x + dx) + (y + dy) * SIZE + z * SIZE * SIZE] = true;
-                }
-                else // X faces
+                if (face == 0 || face == 1) // X faces
                 {
                     for (int dy = 0; dy < height; ++dy)
                         for (int dz = 0; dz < width; ++dz)
                             visited[x + (y + dy) * SIZE + (z + dz) * SIZE * SIZE] = true;
                 }
+                else if (face == 2 || face == 3) // Y faces
+                {
+                    for (int dz = 0; dz < height; ++dz)
+                        for (int dx = 0; dx < width; ++dx)
+                            visited[(x + dx) + y * SIZE + (z + dz) * SIZE * SIZE] = true;
+                }
+                else // Z faces
+                {
+                    for (int dy = 0; dy < height; ++dy)
+                        for (int dx = 0; dx < width; ++dx)
+                            visited[(x + dx) + (y + dy) * SIZE + z * SIZE * SIZE] = true;
+                }
                 
-                // Add merged quad (quad index will be assigned after all faces are generated)
+                // Add merged quad (island-relative position)
                 addQuad(quads, static_cast<float>(x), static_cast<float>(y),
                        static_cast<float>(z), face, width, height, blockType);
             }
@@ -392,7 +309,7 @@ void VoxelChunk::greedyMeshFace(std::vector<QuadFace>& quads, int face)
     }
 }
 
-// Generate mesh for entire chunk - GREEDY MESHING with voxel-to-quad tracking
+// Generate mesh for entire chunk - GREEDY MESHING (island-relative positions)
 std::vector<QuadFace> VoxelChunk::generateFullChunkMesh()
 {
     auto startTime = std::chrono::high_resolution_clock::now();
@@ -410,7 +327,7 @@ std::vector<QuadFace> VoxelChunk::generateFullChunkMesh()
         return quads;
     }
     
-    // GREEDY MESHING - Process each face direction separately
+    // GREEDY MESHING - Merge adjacent faces of same block type
     for (int face = 0; face < 6; ++face)
     {
         greedyMeshFace(quads, face);
@@ -423,13 +340,12 @@ std::vector<QuadFace> VoxelChunk::generateFullChunkMesh()
     return quads;
 }
 
-int VoxelChunk::calculateLOD(const Vec3& cameraPos) const
+int VoxelChunk::calculateLOD(const glm::vec3& cameraPos) const
 {
     // Simple distance-based LOD calculation
-    Vec3 chunkCenter(SIZE * 0.5f, SIZE * 0.5f, SIZE * 0.5f);
-    Vec3 distance = cameraPos - chunkCenter;
-    float dist =
-        std::sqrt(distance.x * distance.x + distance.y * distance.y + distance.z * distance.z);
+    glm::vec3 chunkCenter(SIZE * 0.5f, SIZE * 0.5f, SIZE * 0.5f);
+    glm::vec3 distance = cameraPos - chunkCenter;
+    float dist = glm::length(distance);
 
     // LOD distances scale with chunk size (half-chunk and full-chunk)
     if (dist < SIZE * 0.5f)
@@ -440,12 +356,11 @@ int VoxelChunk::calculateLOD(const Vec3& cameraPos) const
         return 2;  // Low detail (beyond chunk)
 }
 
-bool VoxelChunk::shouldRender(const Vec3& cameraPos, float maxDistance) const
+bool VoxelChunk::shouldRender(const glm::vec3& cameraPos, float maxDistance) const
 {
-    Vec3 chunkCenter(SIZE * 0.5f, SIZE * 0.5f, SIZE * 0.5f);
-    Vec3 distance = cameraPos - chunkCenter;
-    float dist =
-        std::sqrt(distance.x * distance.x + distance.y * distance.y + distance.z * distance.z);
+    glm::vec3 chunkCenter(SIZE * 0.5f, SIZE * 0.5f, SIZE * 0.5f);
+    glm::vec3 distance = cameraPos - chunkCenter;
+    float dist = glm::length(distance);
     return dist <= maxDistance;
 }
 
@@ -457,20 +372,22 @@ bool VoxelChunk::shouldRender(const Vec3& cameraPos, float maxDistance) const
 // Boundary faces are always rendered (negligible visual difference, massive speed gain)
 bool VoxelChunk::isFaceExposed(int x, int y, int z, int face) const
 {
-    static const int dx[6] = { 0,  0,  0,  0, -1,  1};
-    static const int dy[6] = {-1,  1,  0,  0,  0,  0};
-    static const int dz[6] = { 0,  0, -1,  1,  0,  0};
+    // Industry standard: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z
+    static const int dx[6] = {-1,  1,  0,  0,  0,  0};
+    static const int dy[6] = { 0,  0, -1,  1,  0,  0};
+    static const int dz[6] = { 0,  0,  0,  0, -1,  1};
     
     int nx = x + dx[face];
     int ny = y + dy[face];
     int nz = z + dz[face];
     
-    // Only check within this chunk - out of bounds = exposed
+    // Chunk boundary = always render (no inter-chunk culling)
     if (nx < 0 || nx >= SIZE || ny < 0 || ny >= SIZE || nz < 0 || nz >= SIZE)
     {
-        return true;  // Chunk boundary = always render face
+        return true;
     }
     
+    // Face is exposed if neighbor is not solid (intra-chunk culling)
     return !isVoxelSolid(nx, ny, nz);
 }
 
@@ -495,40 +412,41 @@ void VoxelChunk::explodeQuad(uint16_t quadIndex)
     quad.width = 0;
     quad.height = 0;
     
-    // Calculate base corner position from center position (reverse of addQuad)
+    // Convert corner position back to base voxel coordinates
+    // Must reverse the corner offsets applied in addQuad()
     int baseX, baseY, baseZ;
     
     switch (face)
     {
-        case 0: // -Y (bottom): width=X, height=Z
-            baseX = static_cast<int>(quad.position.x - width * 0.5f);
+        case 0: // -X: corner at (x, y, z)
+            baseX = static_cast<int>(quad.position.x);
             baseY = static_cast<int>(quad.position.y);
-            baseZ = static_cast<int>(quad.position.z - height * 0.5f);
-            break;
-        case 1: // +Y (top): width=X, height=Z
-            baseX = static_cast<int>(quad.position.x - width * 0.5f);
-            baseY = static_cast<int>(quad.position.y - 1);
-            baseZ = static_cast<int>(quad.position.z - height * 0.5f);
-            break;
-        case 2: // -Z (back): width=X, height=Y
-            baseX = static_cast<int>(quad.position.x - width * 0.5f);
-            baseY = static_cast<int>(quad.position.y - height * 0.5f);
             baseZ = static_cast<int>(quad.position.z);
             break;
-        case 3: // +Z (front): width=X, height=Y
-            baseX = static_cast<int>(quad.position.x - width * 0.5f);
-            baseY = static_cast<int>(quad.position.y - height * 0.5f);
-            baseZ = static_cast<int>(quad.position.z - 1);
+        case 1: // +X: corner at (x+1, y, z+width) - reverse it
+            baseX = static_cast<int>(quad.position.x) - 1;
+            baseY = static_cast<int>(quad.position.y);
+            baseZ = static_cast<int>(quad.position.z) - width;
             break;
-        case 4: // -X (left): width=Z, height=Y
+        case 2: // -Y: corner at (x, y, z)
             baseX = static_cast<int>(quad.position.x);
-            baseY = static_cast<int>(quad.position.y - height * 0.5f);
-            baseZ = static_cast<int>(quad.position.z - width * 0.5f);
+            baseY = static_cast<int>(quad.position.y);
+            baseZ = static_cast<int>(quad.position.z);
             break;
-        case 5: // +X (right): width=Z, height=Y
-            baseX = static_cast<int>(quad.position.x - 1);
-            baseY = static_cast<int>(quad.position.y - height * 0.5f);
-            baseZ = static_cast<int>(quad.position.z - width * 0.5f);
+        case 3: // +Y: corner at (x, y+1, z+height) - reverse it
+            baseX = static_cast<int>(quad.position.x);
+            baseY = static_cast<int>(quad.position.y) - 1;
+            baseZ = static_cast<int>(quad.position.z) - height;
+            break;
+        case 4: // -Z: corner at (x+width, y, z) - reverse it
+            baseX = static_cast<int>(quad.position.x) - width;
+            baseY = static_cast<int>(quad.position.y);
+            baseZ = static_cast<int>(quad.position.z);
+            break;
+        case 5: // +Z: corner at (x, y, z+1) - reverse it
+            baseX = static_cast<int>(quad.position.x);
+            baseY = static_cast<int>(quad.position.y);
+            baseZ = static_cast<int>(quad.position.z) - 1;
             break;
         default:
             return;
@@ -538,63 +456,13 @@ void VoxelChunk::explodeQuad(uint16_t quadIndex)
     quad.width = 0;
     quad.height = 0;
     
+    std::cout << "[EXPLODE] Quad " << quadIndex << " face=" << face << " width=" << width << " height=" << height 
+              << " base=(" << baseX << "," << baseY << "," << baseZ << ")\n";
+    
     // Create 1x1 replacement quads for each voxel that still exists
-    // Iterate based on face direction
-    if (face == 0 || face == 1) // Y faces: width=X, height=Z
-    {
-        for (int dz = 0; dz < height; ++dz)
-        {
-            for (int dx = 0; dx < width; ++dx)
-            {
-                int vx = baseX + dx;
-                int vy = baseY;
-                int vz = baseZ + dz;
-                
-                if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
-                {
-                    if (isVoxelSolid(vx, vy, vz) && isFaceExposed(vx, vy, vz, face))
-                    {
-                        uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
-                        addQuad(mesh->quads, static_cast<float>(vx), static_cast<float>(vy),
-                               static_cast<float>(vz), face, 1, 1, blockType);
-                        
-                        int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
-                        uint32_t key = voxelIdx * 6 + face;
-                        mesh->voxelFaceToQuadIndex[key] = newQuadIdx;
-                        mesh->isExploded[voxelIdx] = true;
-                    }
-                }
-            }
-        }
-    }
-    else if (face == 2 || face == 3) // Z faces: width=X, height=Y
-    {
-        for (int dy = 0; dy < height; ++dy)
-        {
-            for (int dx = 0; dx < width; ++dx)
-            {
-                int vx = baseX + dx;
-                int vy = baseY + dy;
-                int vz = baseZ;
-                
-                if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
-                {
-                    if (isVoxelSolid(vx, vy, vz) && isFaceExposed(vx, vy, vz, face))
-                    {
-                        uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
-                        addQuad(mesh->quads, static_cast<float>(vx), static_cast<float>(vy),
-                               static_cast<float>(vz), face, 1, 1, blockType);
-                        
-                        int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
-                        uint32_t key = voxelIdx * 6 + face;
-                        mesh->voxelFaceToQuadIndex[key] = newQuadIdx;
-                        mesh->isExploded[voxelIdx] = true;
-                    }
-                }
-            }
-        }
-    }
-    else // X faces: width=Z, height=Y
+    // Iterate based on face direction (industry standard: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z)
+    int replacementCount = 0;
+    if (face == 0 || face == 1) // X faces: width=Z, height=Y
     {
         for (int dy = 0; dy < height; ++dy)
         {
@@ -606,7 +474,10 @@ void VoxelChunk::explodeQuad(uint16_t quadIndex)
                 
                 if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
                 {
-                    if (isVoxelSolid(vx, vy, vz) && isFaceExposed(vx, vy, vz, face))
+                    bool solid = isVoxelSolid(vx, vy, vz);
+                    bool exposed = isFaceExposed(vx, vy, vz, face);
+                    std::cout << "[EXPLODE] Voxel (" << vx << "," << vy << "," << vz << ") solid=" << solid << " exposed=" << exposed << "\n";
+                    if (solid && exposed)
                     {
                         uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
                         addQuad(mesh->quads, static_cast<float>(vx), static_cast<float>(vy),
@@ -616,12 +487,76 @@ void VoxelChunk::explodeQuad(uint16_t quadIndex)
                         uint32_t key = voxelIdx * 6 + face;
                         mesh->voxelFaceToQuadIndex[key] = newQuadIdx;
                         mesh->isExploded[voxelIdx] = true;
+                        replacementCount++;
+                    }
+                }
+            }
+        }
+    }
+    else if (face == 2 || face == 3) // Y faces: width=X, height=Z
+    {
+        for (int dz = 0; dz < height; ++dz)
+        {
+            for (int dx = 0; dx < width; ++dx)
+            {
+                int vx = baseX + dx;
+                int vy = baseY;
+                int vz = baseZ + dz;
+                
+                if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                {
+                    bool solid = isVoxelSolid(vx, vy, vz);
+                    bool exposed = isFaceExposed(vx, vy, vz, face);
+                    std::cout << "[EXPLODE] Voxel (" << vx << "," << vy << "," << vz << ") solid=" << solid << " exposed=" << exposed << "\n";
+                    if (solid && exposed)
+                    {
+                        uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
+                        addQuad(mesh->quads, static_cast<float>(vx), static_cast<float>(vy),
+                               static_cast<float>(vz), face, 1, 1, blockType);
+                        
+                        int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                        uint32_t key = voxelIdx * 6 + face;
+                        mesh->voxelFaceToQuadIndex[key] = newQuadIdx;
+                        mesh->isExploded[voxelIdx] = true;
+                        replacementCount++;
+                    }
+                }
+            }
+        }
+    }
+    else // Z faces: width=X, height=Y
+    {
+        for (int dy = 0; dy < height; ++dy)
+        {
+            for (int dx = 0; dx < width; ++dx)
+            {
+                int vx = baseX + dx;
+                int vy = baseY + dy;
+                int vz = baseZ;
+                
+                if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                {
+                    bool solid = isVoxelSolid(vx, vy, vz);
+                    bool exposed = isFaceExposed(vx, vy, vz, face);
+                    std::cout << "[EXPLODE] Voxel (" << vx << "," << vy << "," << vz << ") solid=" << solid << " exposed=" << exposed << "\n";
+                    if (solid && exposed)
+                    {
+                        uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
+                        addQuad(mesh->quads, static_cast<float>(vx), static_cast<float>(vy),
+                               static_cast<float>(vz), face, 1, 1, blockType);
+                        
+                        int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                        uint32_t key = voxelIdx * 6 + face;
+                        mesh->voxelFaceToQuadIndex[key] = newQuadIdx;
+                        mesh->isExploded[voxelIdx] = true;
+                        replacementCount++;
                     }
                 }
             }
         }
     }
     
+    std::cout << "[EXPLODE] Created " << replacementCount << " replacement quads\n";
     mesh->needsGPUUpload = true;
 }
 
@@ -658,20 +593,31 @@ void VoxelChunk::addSimpleFacesForVoxel(int x, int y, int z)
 void VoxelChunk::uploadMeshToGPU()
 {
     auto mesh = getRenderMesh();
-    if (!mesh || !m_isClientChunk) return;
+    if (!mesh || !m_isClientChunk) {
+        printf("[CHUNK] uploadMeshToGPU early return: mesh=%p, isClient=%d\n", (void*)mesh.get(), m_isClientChunk);
+        return;
+    }
+    // Mesh uploaded
     
     // Trigger GPU upload via renderer
     extern std::unique_ptr<InstancedQuadRenderer> g_instancedQuadRenderer;
+    extern class VulkanQuadRenderer* g_vulkanQuadRenderer;
+    
     if (g_instancedQuadRenderer)
     {
         g_instancedQuadRenderer->uploadChunkMesh(this);
     }
+    
+    if (g_vulkanQuadRenderer)
+    {
+        g_vulkanQuadRenderer->uploadChunkMesh(this);
+    }
 }
 
 // Model instance management (for BlockRenderType::OBJ blocks)
-const std::vector<Vec3>& VoxelChunk::getModelInstances(uint8_t blockID) const
+const std::vector<glm::vec3>& VoxelChunk::getModelInstances(uint8_t blockID) const
 {
-    static const std::vector<Vec3> empty;
+    static const std::vector<glm::vec3> empty;
     auto it = m_modelInstances.find(blockID);
     if (it != m_modelInstances.end())
         return it->second;
@@ -681,54 +627,70 @@ const std::vector<Vec3>& VoxelChunk::getModelInstances(uint8_t blockID) const
 // Add a single quad to the mesh (width/height support for future optimizations)
 void VoxelChunk::addQuad(std::vector<QuadFace>& quads, float x, float y, float z, int face, int width, int height, uint8_t blockType)
 {
-    // Quad vertices based on face direction
-    // Face ordering: 0=-Y, 1=+Y, 2=-Z, 3=+Z, 4=-X, 5=+X
+    // Industry standard face ordering: -X, +X, -Y, +Y, -Z, +Z
+    // Face ordering: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z
     
-    static const Vec3 normals[6] = {
-        Vec3(0, -1, 0),  // -Y (bottom)
-        Vec3(0, 1, 0),   // +Y (top)
-        Vec3(0, 0, -1),  // -Z (back)
-        Vec3(0, 0, 1),   // +Z (front)
-        Vec3(-1, 0, 0),  // -X (left)
-        Vec3(1, 0, 0)    // +X (right)
+    static const glm::vec3 normals[6] = {
+        glm::vec3(-1, 0, 0),  // -X (left)
+        glm::vec3(1, 0, 0),   // +X (right)
+        glm::vec3(0, -1, 0),  // -Y (bottom)
+        glm::vec3(0, 1, 0),   // +Y (top)
+        glm::vec3(0, 0, -1),  // -Z (back)
+        glm::vec3(0, 0, 1)    // +Z (front)
     };
     
-    Vec3 normal = normals[face];
+    glm::vec3 normal = normals[face];
     float w = static_cast<float>(width);
     float h = static_cast<float>(height);
     
-    // Add to QuadFace array for instanced rendering
-    QuadFace quadFace;
-    
-    // Calculate center position based on face direction
+    // INDUSTRY STANDARD: Store corner position (bottom-left in face-local space)
+    // Shader rotation matrices define face-local axes:
+    // -X: right=+Z, up=+Y → BL at (x, y, z)
+    // +X: right=-Z, up=+Y → BL at (x+1, y, z+width) because right=-Z
+    // -Y: right=+X, up=+Z → BL at (x, y, z)
+    // +Y: right=+X, up=-Z → BL at (x, y+1, z+height) because up=-Z
+    // -Z: right=-X, up=+Y → BL at (x+width, y, z) because right=-X
+    // +Z: right=+X, up=+Y → BL at (x, y, z+1)
+    glm::vec3 cornerPos;
     switch (face)
     {
-        case 0: // -Y (bottom)
-            quadFace.position = Vec3(x + w * 0.5f, y, z + h * 0.5f);
+        case 0: // -X (left): right=+Z, up=+Y
+            cornerPos = glm::vec3(x, y, z);
             break;
-        case 1: // +Y (top)
-            quadFace.position = Vec3(x + w * 0.5f, y + 1, z + h * 0.5f);
+        case 1: // +X (right): right=-Z, up=+Y (reversed width direction)
+            cornerPos = glm::vec3(x + 1.0f, y, z + static_cast<float>(width));
             break;
-        case 2: // -Z (back)
-            quadFace.position = Vec3(x + w * 0.5f, y + h * 0.5f, z);
+        case 2: // -Y (bottom): right=+X, up=+Z
+            cornerPos = glm::vec3(x, y, z);
             break;
-        case 3: // +Z (front)
-            quadFace.position = Vec3(x + w * 0.5f, y + h * 0.5f, z + 1);
+        case 3: // +Y (top): right=+X, up=-Z (reversed height direction)
+            cornerPos = glm::vec3(x, y + 1.0f, z + static_cast<float>(height));
             break;
-        case 4: // -X (left)
-            quadFace.position = Vec3(x, y + h * 0.5f, z + w * 0.5f);
+        case 4: // -Z (back): right=-X, up=+Y (reversed width direction)
+            cornerPos = glm::vec3(x + static_cast<float>(width), y, z);
             break;
-        case 5: // +X (right)
-            quadFace.position = Vec3(x + 1, y + h * 0.5f, z + w * 0.5f);
+        case 5: // +Z (front): right=+X, up=+Y
+            cornerPos = glm::vec3(x, y, z + 1.0f);
             break;
     }
     
-    quadFace.normal = normal;
+    // Pack normal into 10:10:10:2 format (X:10, Y:10, Z:10, W:2)
+    // Map -1..1 to 0..1023, with 512 as zero (matches shader unpacking: value - 512)
+    int nx = static_cast<int>(normal.x * 511.5f + 512.0f);  // -1→0, 0→512, 1→1023
+    int ny = static_cast<int>(normal.y * 511.5f + 512.0f);
+    int nz = static_cast<int>(normal.z * 511.5f + 512.0f);
+    uint32_t packedNormal = (nx & 0x3FF) | ((ny & 0x3FF) << 10) | ((nz & 0x3FF) << 20);
+    
+    // Add to QuadFace array for instanced rendering
+    QuadFace quadFace;
+    quadFace.position = cornerPos;  // Island-relative corner position (industry standard)
+    quadFace._padding0 = 0.0f;      // CRITICAL: Initialize padding for std430 alignment
     quadFace.width = w;
     quadFace.height = h;
+    quadFace.packedNormal = packedNormal;
     quadFace.blockType = blockType;
-    quadFace.faceDir = static_cast<uint8_t>(face);
-    quadFace.padding = 0;
+    quadFace.faceDir = static_cast<uint32_t>(face);  // uint32_t to match shader
+    quadFace.islandID = m_islandID;  // For SSBO transform lookup, set by renderer
     
     quads.push_back(quadFace);
 }

@@ -34,5 +34,7 @@ Alert user when doing:
 ## Architecture Notes
 - Custom voxel-face collision (no physics engine)
 - ENet networking with ~98% compression
-- OpenGL + Dear ImGui
+- Vulkan 1.3 + Dear ImGui (migrating from OpenGL 4.6)
 - CMake build system
+- VMA (Vulkan Memory Allocator) for memory management
+- vk-bootstrap for initialization

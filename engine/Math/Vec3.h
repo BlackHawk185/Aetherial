@@ -2,6 +2,7 @@
 #pragma once
 #include <cmath>
 #include <algorithm>
+#include <glm/glm.hpp>
 
 struct Vec3
 {
@@ -9,6 +10,12 @@ struct Vec3
 
     Vec3() : x(0.0f), y(0.0f), z(0.0f) {}
     Vec3(float x, float y, float z) : x(x), y(y), z(z) {}
+    
+    // Conversion from glm::vec3
+    Vec3(const glm::vec3& v) : x(v.x), y(v.y), z(v.z) {}
+    
+    // Conversion to glm::vec3
+    operator glm::vec3() const { return glm::vec3(x, y, z); }
 
     // Basic operations
     Vec3 operator+(const Vec3& other) const

@@ -68,7 +68,12 @@ void Camera::getProjectionMatrix(float* matrix, float aspect)
 glm::mat4 Camera::getProjectionMatrix(float aspect)
 {
     float fov = 70.0f * PI_F / 180.0f;  // radians (tighter FOV - makes spaces feel more accurate)
-    return glm::perspective(fov, aspect, 0.1f, 1000.0f);
+    glm::mat4 proj = glm::perspective(fov, aspect, 0.1f, 1000.0f);
+    
+    // Vulkan Y-axis flip: negate Y-scale to correct for inverted clip space
+    proj[1][1] *= -1.0f;
+    
+    return proj;
 }
 
 void Camera::updateFrustum(float aspect)

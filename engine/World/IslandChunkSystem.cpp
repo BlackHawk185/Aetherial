@@ -104,11 +104,6 @@ uint32_t IslandChunkSystem::createIsland(const Vec3& physicsCenter, uint32_t for
         dist(rng)   // Random Z drift
     );
     
-    std::cout << "[ISLAND] Created island " << islandID 
-              << " with drift velocity (" << island.velocity.x 
-              << ", " << island.velocity.y 
-              << ", " << island.velocity.z << ")" << std::endl;
-    
     return islandID;
 }
 
@@ -170,7 +165,7 @@ void IslandChunkSystem::addChunkToIsland(uint32_t islandID, const Vec3& chunkCoo
     if (island->chunks.find(chunkCoord) != island->chunks.end())
         return;
 
-    // Create new chunk and set island context
+    // Create new chunk and set island context with transform
     auto newChunk = std::make_unique<VoxelChunk>();
     newChunk->setIslandContext(islandID, chunkCoord);
     newChunk->setIsClient(m_isClient);  // Inherit client flag from island system
@@ -221,7 +216,7 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     BiomeSystem biomeSystem;
     BiomePalette palette = biomeSystem.getPalette(biome);
     
-    std::cout << "[BIOME] Island " << islandID << " - " << biomeSystem.getBiomeName(biome) << std::endl;
+    // Biome assigned
 
     // WORLDGEN OPTIMIZATION: Cache chunk map to avoid mutex locking on every voxel set
     // We can safely access island->chunks without locking during single-threaded generation
@@ -299,9 +294,9 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     simdNoise->SetFractalGain(fractalGain);
     
     // Generate noise for the entire grid with SIMD acceleration
-    int totalSamples = gridSizeX * gridSizeY * gridSizeZ;
-    std::vector<float> noiseValues(totalSamples);
-    simdNoise->FillNoiseSet(noiseValues.data(),
+    // Use aligned memory allocation for SIMD operations
+    float* noiseValues = FastNoiseSIMD::GetEmptySet(gridSizeX, gridSizeY, gridSizeZ);
+    simdNoise->FillNoiseSet(noiseValues,
                             -gridOffsetX * NOISE_SAMPLE_RATE,
                             -gridOffsetY * NOISE_SAMPLE_RATE,
                             -gridOffsetZ * NOISE_SAMPLE_RATE,
@@ -318,6 +313,9 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
             }
         }
     }
+    
+    // Free SIMD-aligned memory
+    FastNoiseSIMD::FreeNoiseSet(noiseValues);
     
     delete simdNoise;
     
@@ -880,8 +878,7 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     
     auto waterEnd = std::chrono::high_resolution_clock::now();
     auto waterDuration = std::chrono::duration_cast<std::chrono::milliseconds>(waterEnd - waterStart).count();
-    std::cout << "💧 Water Basins: " << waterDuration << "ms (" << layersAdded << " layers added)" << std::endl;
-    std::cout << "   └─ Layer Expansion: " << layerExpansionDuration << "ms" << std::endl;
+    // Water basins created
     
     // **VEGETATION DECORATION PASS**
     // Place grass GLB models and voxel trees based on biome vegetation density
@@ -1363,7 +1360,7 @@ std::unordered_set<int64_t> IslandChunkSystem::placeWaterBasins(uint32_t islandI
         }
     }
     
-    std::cout << "   └─ Initial Water: " << waterBlocksPlaced << " blocks" << std::endl;
+    // Water placed
     return waterPositions;
 }
 

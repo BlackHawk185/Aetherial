@@ -101,7 +101,7 @@ void GreedyMeshQueue::workerThreadFunc()
         ChunkMeshResult result;
         result.chunk = chunk;
         
-        // Generate quads and store in chunk's renderMesh
+        // Generate quads and store in chunk's renderMesh (island-relative positions)
         auto quads = chunk->generateFullChunkMesh();
         auto mesh = chunk->getRenderMesh();
         if (mesh) {
@@ -110,68 +110,47 @@ void GreedyMeshQueue::workerThreadFunc()
             
             // Build voxelFaceToQuadIndex map for ALL voxels in ALL quads
             mesh->voxelFaceToQuadIndex.clear();
+            // Building voxelFaceToQuadIndex for collision
             for (size_t quadIdx = 0; quadIdx < mesh->quads.size(); ++quadIdx) {
                 const QuadFace& quad = mesh->quads[quadIdx];
                 int width = static_cast<int>(quad.width);
                 int height = static_cast<int>(quad.height);
                 int face = quad.faceDir;
                 
-                // Determine base voxel coordinates from quad center
+                // Determine base voxel coordinates from quad corner position
+                // Industry standard: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z
                 int baseX, baseY, baseZ;
-                if (face == 0) { // -Y
-                    baseX = static_cast<int>(quad.position.x - width * 0.5f);
-                    baseY = static_cast<int>(quad.position.y);
-                    baseZ = static_cast<int>(quad.position.z - height * 0.5f);
-                } else if (face == 1) { // +Y
-                    baseX = static_cast<int>(quad.position.x - width * 0.5f);
-                    baseY = static_cast<int>(quad.position.y - 1);
-                    baseZ = static_cast<int>(quad.position.z - height * 0.5f);
-                } else if (face == 2) { // -Z
-                    baseX = static_cast<int>(quad.position.x - width * 0.5f);
-                    baseY = static_cast<int>(quad.position.y - height * 0.5f);
-                    baseZ = static_cast<int>(quad.position.z);
-                } else if (face == 3) { // +Z
-                    baseX = static_cast<int>(quad.position.x - width * 0.5f);
-                    baseY = static_cast<int>(quad.position.y - height * 0.5f);
-                    baseZ = static_cast<int>(quad.position.z - 1);
-                } else if (face == 4) { // -X
+                if (face == 0) { // -X: width=Z, height=Y
                     baseX = static_cast<int>(quad.position.x);
-                    baseY = static_cast<int>(quad.position.y - height * 0.5f);
-                    baseZ = static_cast<int>(quad.position.z - width * 0.5f);
-                } else { // +X (face == 5)
-                    baseX = static_cast<int>(quad.position.x - 1);
-                    baseY = static_cast<int>(quad.position.y - height * 0.5f);
-                    baseZ = static_cast<int>(quad.position.z - width * 0.5f);
+                    baseY = static_cast<int>(quad.position.y);
+                    baseZ = static_cast<int>(quad.position.z);
+                } else if (face == 1) { // +X: width=Z, height=Y
+                    baseX = static_cast<int>(quad.position.x) - 1;
+                    baseY = static_cast<int>(quad.position.y);
+                    baseZ = static_cast<int>(quad.position.z);
+                } else if (face == 2) { // -Y: width=X, height=Z
+                    baseX = static_cast<int>(quad.position.x);
+                    baseY = static_cast<int>(quad.position.y);
+                    baseZ = static_cast<int>(quad.position.z);
+                } else if (face == 3) { // +Y: width=X, height=Z
+                    baseX = static_cast<int>(quad.position.x);
+                    baseY = static_cast<int>(quad.position.y) - 1;
+                    baseZ = static_cast<int>(quad.position.z);
+                } else if (face == 4) { // -Z: width=X, height=Y
+                    baseX = static_cast<int>(quad.position.x);
+                    baseY = static_cast<int>(quad.position.y);
+                    baseZ = static_cast<int>(quad.position.z);
+                } else { // +Z (face == 5): width=X, height=Y
+                    baseX = static_cast<int>(quad.position.x);
+                    baseY = static_cast<int>(quad.position.y);
+                    baseZ = static_cast<int>(quad.position.z) - 1;
                 }
                 
                 // Map every voxel covered by this quad
-                if (face == 0 || face == 1) { // Y faces: width=X, height=Z
-                    for (int dz = 0; dz < height; ++dz) {
-                        for (int dx = 0; dx < width; ++dx) {
-                            int vx = baseX + dx;
-                            int vy = baseY;
-                            int vz = baseZ + dz;
-                            if (vx >= 0 && vx < 256 && vy >= 0 && vy < 256 && vz >= 0 && vz < 256) {
-                                int voxelIdx = vx + vy * 256 + vz * 256 * 256;
-                                uint32_t key = voxelIdx * 6 + face;
-                                mesh->voxelFaceToQuadIndex[key] = static_cast<uint16_t>(quadIdx);
-                            }
-                        }
-                    }
-                } else if (face == 2 || face == 3) { // Z faces: width=X, height=Y
-                    for (int dy = 0; dy < height; ++dy) {
-                        for (int dx = 0; dx < width; ++dx) {
-                            int vx = baseX + dx;
-                            int vy = baseY + dy;
-                            int vz = baseZ;
-                            if (vx >= 0 && vx < 256 && vy >= 0 && vy < 256 && vz >= 0 && vz < 256) {
-                                int voxelIdx = vx + vy * 256 + vz * 256 * 256;
-                                uint32_t key = voxelIdx * 6 + face;
-                                mesh->voxelFaceToQuadIndex[key] = static_cast<uint16_t>(quadIdx);
-                            }
-                        }
-                    }
-                } else { // X faces: width=Z, height=Y
+                // 0=-X, 1=+X: width=Z, height=Y
+                // 2=-Y, 3=+Y: width=X, height=Z
+                // 4=-Z, 5=+Z: width=X, height=Y
+                if (face == 0 || face == 1) { // X faces: width=Z, height=Y
                     for (int dy = 0; dy < height; ++dy) {
                         for (int dz = 0; dz < width; ++dz) {
                             int vx = baseX;
@@ -184,8 +163,35 @@ void GreedyMeshQueue::workerThreadFunc()
                             }
                         }
                     }
+                } else if (face == 2 || face == 3) { // Y faces: width=X, height=Z
+                    for (int dz = 0; dz < height; ++dz) {
+                        for (int dx = 0; dx < width; ++dx) {
+                            int vx = baseX + dx;
+                            int vy = baseY;
+                            int vz = baseZ + dz;
+                            if (vx >= 0 && vx < 256 && vy >= 0 && vy < 256 && vz >= 0 && vz < 256) {
+                                int voxelIdx = vx + vy * 256 + vz * 256 * 256;
+                                uint32_t key = voxelIdx * 6 + face;
+                                mesh->voxelFaceToQuadIndex[key] = static_cast<uint16_t>(quadIdx);
+                            }
+                        }
+                    }
+                } else { // Z faces: width=X, height=Y
+                    for (int dy = 0; dy < height; ++dy) {
+                        for (int dx = 0; dx < width; ++dx) {
+                            int vx = baseX + dx;
+                            int vy = baseY + dy;
+                            int vz = baseZ;
+                            if (vx >= 0 && vx < 256 && vy >= 0 && vy < 256 && vz >= 0 && vz < 256) {
+                                int voxelIdx = vx + vy * 256 + vz * 256 * 256;
+                                uint32_t key = voxelIdx * 6 + face;
+                                mesh->voxelFaceToQuadIndex[key] = static_cast<uint16_t>(quadIdx);
+                            }
+                        }
+                    }
                 }
             }
+            // voxelFaceToQuadIndex built
         }
         
         // Push to completed queue for main thread GPU upload

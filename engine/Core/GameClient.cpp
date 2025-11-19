@@ -1,11 +1,22 @@
 // GameClient.cpp - Client-side rendering and input implementation
+#include "../RenderConfig.h"  // USE_VULKAN flag
 #include "GameClient.h"
 
 #include <GLFW/glfw3.h>
+
+#ifdef USE_VULKAN
+#include "../Rendering/Vulkan/VulkanContext.h"
+#include "../Rendering/Vulkan/VulkanQuadRenderer.h"
+#include "../Rendering/Vulkan/VulkanDeferred.h"
+#include "../Rendering/Vulkan/VulkanSkyRenderer.h"
+#include "../Rendering/Vulkan/VulkanCloudRenderer.h"
+#else
 #include <glad/gl.h>
+#endif
+
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
-#include <imgui_impl_opengl3.h>
+#include <imgui_impl_vulkan.h>
 
 #include <iostream>
 #include <memory>
@@ -20,6 +31,7 @@
 #include "../Network/NetworkManager.h"
 #include "../Network/NetworkMessages.h"
 #include "../Rendering/BlockHighlightRenderer.h"
+#include "../Rendering/Vulkan/VulkanBlockHighlighter.h"
 
 #include "../Rendering/GBuffer.h"
 #include "../Rendering/DeferredLightingPass.h"
@@ -45,6 +57,9 @@
 // External systems
 extern TimeEffects* g_timeEffects;
 extern LightMap g_lightMap;
+
+// Global Vulkan renderer pointer (for chunk mesh uploads)
+VulkanQuadRenderer* g_vulkanQuadRenderer = nullptr;
 
 GameClient::GameClient()
 {
@@ -121,7 +136,7 @@ bool GameClient::initialize(bool enableDebug)
         return false;
     }
 
-    if (!initializeGraphics())
+    if (!initializeVulkan())
     {
         return false;
     }
@@ -302,10 +317,52 @@ void GameClient::shutdown()
         g_modelRenderer.reset();
     }
     
-    // Cleanup ImGui
-    ImGui_ImplOpenGL3_Shutdown();
+    // Cleanup Vulkan renderers BEFORE VulkanContext
+    if (m_vulkanCloudRenderer)
+    {
+        m_vulkanCloudRenderer.reset();
+        std::cout << "VulkanCloudRenderer shutdown" << std::endl;
+    }
+    
+    if (m_vulkanDeferred)
+    {
+        m_vulkanDeferred.reset();
+        std::cout << "VulkanDeferred shutdown" << std::endl;
+    }
+    
+    if (m_vulkanSkyRenderer)
+    {
+        m_vulkanSkyRenderer->shutdown();
+        m_vulkanSkyRenderer.reset();
+        std::cout << "VulkanSkyRenderer shutdown" << std::endl;
+    }
+    
+    if (m_vulkanQuadRenderer)
+    {
+        m_vulkanQuadRenderer->shutdown();
+        m_vulkanQuadRenderer.reset();
+        g_vulkanQuadRenderer = nullptr;
+        std::cout << "VulkanQuadRenderer shutdown" << std::endl;
+    }
+    
+    if (m_vulkanBlockHighlighter)
+    {
+        m_vulkanBlockHighlighter->shutdown();
+        m_vulkanBlockHighlighter.reset();
+        std::cout << "VulkanBlockHighlighter shutdown" << std::endl;
+    }
+    
+    // Cleanup ImGui BEFORE VulkanContext (it uses the descriptor pool)
+    ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+    
+    // Cleanup VulkanContext (destroys descriptor pool AFTER ImGui is done)
+    if (m_vulkanContext)
+    {
+        m_vulkanContext.reset();
+        std::cout << "VulkanContext shutdown" << std::endl;
+    }
 
     // Cleanup window
     if (m_window)
@@ -367,22 +424,9 @@ void GameClient::render()
 {
     PROFILE_SCOPE("GameClient::render");
     
-    // Clear depth buffer only (gradient sky will be rendered by deferred lighting shader)
-    glClear(GL_DEPTH_BUFFER_BIT);
-
-    // Render world (only if we have local game state)
-    if (m_clientWorld)
-    {
-        PROFILE_SCOPE("renderWorld");
-        renderWorld();
-    }
-    else if (m_isRemoteClient)
-    {
-        // Render waiting screen for remote clients
-        PROFILE_SCOPE("renderWaitingScreen");
-        renderWaitingScreen();
-    }
-
+    // Vulkan render path
+    renderVulkan();
+    
     // Render UI
     {
         PROFILE_SCOPE("renderUI");
@@ -409,7 +453,7 @@ bool GameClient::initializeWindow()
     return true;
 }
 
-bool GameClient::initializeGraphics()
+bool GameClient::initializeCommonSystems()
 {
     // Initialize texture manager (needed by all renderers)
     extern TextureManager* g_textureManager;
@@ -423,95 +467,10 @@ bool GameClient::initializeGraphics()
         }
     }
     
-    // Initialize MDI quad renderer (greedy meshing + multi-draw indirect)
-    g_instancedQuadRenderer = std::make_unique<InstancedQuadRenderer>();
-    if (!g_instancedQuadRenderer->initialize())
+    // Initialize greedy mesh queue (main-thread mesh generation)
+    if (!g_greedyMeshQueue)
     {
-        std::cerr << "❌ Failed to initialize InstancedQuadRenderer!" << std::endl;
-        g_instancedQuadRenderer.reset();
-        return false;
-    }
-    std::cout << "✅ InstancedQuadRenderer initialized - MDI rendering ready!" << std::endl;
-
-    // Initialize light map system (must happen before renderers that use it)
-    // 4 cascades: 2 for sun (near+far), 2 for moon (near+far)
-    if (!g_lightMap.initialize(8192, 4))
-    {
-        std::cerr << "❌ Failed to initialize light map system!" << std::endl;
-        return false;
-    }
-
-    // Initialize G-buffer for deferred rendering
-    if (!g_gBuffer.initialize(m_windowWidth, m_windowHeight))
-    {
-        std::cerr << "❌ Failed to initialize G-buffer!" << std::endl;
-        return false;
-    }
-
-    // Initialize deferred lighting pass
-    if (!g_deferredLighting.initialize())
-    {
-        std::cerr << "❌ Failed to initialize deferred lighting pass!" << std::endl;
-        return false;
-    }
-
-    // Initialize HDR framebuffer for lighting output
-    if (!g_hdrFramebuffer.initialize(m_windowWidth, m_windowHeight))
-    {
-        std::cerr << "❌ Failed to initialize HDR framebuffer!" << std::endl;
-        return false;
-    }
-
-    // Initialize sky renderer
-    if (!g_skyRenderer.initialize())
-    {
-        std::cerr << "❌ Failed to initialize sky renderer!" << std::endl;
-        return false;
-    }
-
-    // Initialize volumetric cloud renderer
-    if (!g_cloudRenderer.initialize())
-    {
-        std::cerr << "❌ Failed to initialize cloud renderer!" << std::endl;
-        return false;
-    }
-
-    // Initialize post-processing pipeline (tone mapping only)
-    if (!g_postProcessing.initialize(m_windowWidth, m_windowHeight))
-    {
-        std::cerr << "❌ Failed to initialize post-processing pipeline!" << std::endl;
-        return false;
-    }
-
-    // Initialize model instancing renderer (decorative GLB like grass)
-    g_modelRenderer = std::make_unique<ModelInstanceRenderer>();
-    if (!g_modelRenderer->initialize())
-    {
-        std::cerr << "Failed to initialize ModelInstanceRenderer!" << std::endl;
-        g_modelRenderer.reset();
-        return false;
-    }
-    
-    // Load all OBJ-type block models from registry
-    auto& registry = BlockTypeRegistry::getInstance();
-    for (const auto& blockType : registry.getAllBlockTypes())
-    {
-        if (blockType.renderType == BlockRenderType::OBJ && !blockType.assetPath.empty())
-        {
-            if (!g_modelRenderer->loadModel(blockType.id, blockType.assetPath))
-            {
-                std::cerr << "Warning: Failed to load model for '" << blockType.name 
-                          << "' from " << blockType.assetPath << std::endl;
-            }
-        }
-    }
-
-    // Initialize block highlighter for selected block wireframe
-    m_blockHighlighter = std::make_unique<BlockHighlightRenderer>();
-    if (!m_blockHighlighter->initialize())
-    {
-        std::cerr << "Warning: Failed to initialize BlockHighlightRenderer" << std::endl;
-        m_blockHighlighter.reset();
+        g_greedyMeshQueue = std::make_unique<GreedyMeshQueue>();
     }
     
     // Initialize HUD overlay
@@ -519,8 +478,98 @@ bool GameClient::initializeGraphics()
     
     // Initialize Periodic Table UI
     m_periodicTableUI = std::make_unique<PeriodicTableUI>();
+    
+    return true;
+}
 
-    // Initialize ImGui
+bool GameClient::initializeVulkan()
+{
+    std::cout << "🔷 Initializing Vulkan rendering backend..." << std::endl;
+    
+    // Initialize common systems (texture manager, mesh queue, UI)
+    if (!initializeCommonSystems())
+    {
+        return false;
+    }
+    
+    // Initialize Vulkan context (device, swapchain, etc.)
+    m_vulkanContext = std::make_unique<VulkanContext>();
+    if (!m_vulkanContext->init(m_window->getHandle(), true /* enable validation */))
+    {
+        std::cerr << "❌ Failed to initialize VulkanContext!" << std::endl;
+        return false;
+    }
+    std::cout << "✅ VulkanContext initialized" << std::endl;
+    
+    // Initialize Vulkan quad renderer (replaces InstancedQuadRenderer)
+    m_vulkanQuadRenderer = std::make_unique<VulkanQuadRenderer>();
+    if (!m_vulkanQuadRenderer->initialize(m_vulkanContext.get()))
+    {
+        std::cerr << "❌ Failed to initialize VulkanQuadRenderer!" << std::endl;
+        return false;
+    }
+    std::cout << "✅ VulkanQuadRenderer initialized - Vulkan MDI rendering ready!" << std::endl;
+    
+    // Set global pointer for chunk mesh uploads
+    g_vulkanQuadRenderer = m_vulkanQuadRenderer.get();
+    
+    // Initialize Vulkan sky renderer
+    m_vulkanSkyRenderer = std::make_unique<VulkanSkyRenderer>();
+    if (!m_vulkanSkyRenderer->initialize(m_vulkanContext.get()))
+    {
+        std::cerr << "⚠️  Warning: VulkanSkyRenderer failed to initialize (VMA buffer allocation issue)" << std::endl;
+        std::cerr << "   Continuing without skybox rendering..." << std::endl;
+        m_vulkanSkyRenderer.reset();  // Clear failed renderer
+    } else {
+        std::cout << "✅ VulkanSkyRenderer initialized" << std::endl;
+    }
+    
+    // Initialize Vulkan block highlighter
+    m_vulkanBlockHighlighter = std::make_unique<VulkanBlockHighlighter>();
+    if (!m_vulkanBlockHighlighter->initialize(m_vulkanContext.get()))
+    {
+        std::cerr << "⚠️  Warning: VulkanBlockHighlighter failed to initialize" << std::endl;
+        m_vulkanBlockHighlighter.reset();
+    } else {
+        std::cout << "✅ VulkanBlockHighlighter initialized" << std::endl;
+    }
+    
+    // Initialize Vulkan cloud renderer
+    m_vulkanCloudRenderer = std::make_unique<VulkanCloudRenderer>();
+    if (!m_vulkanCloudRenderer->initialize(m_vulkanContext.get(), m_windowWidth, m_windowHeight))
+    {
+        std::cerr << "⚠️  Warning: VulkanCloudRenderer failed to initialize" << std::endl;
+        m_vulkanCloudRenderer.reset();
+    } else {
+        std::cout << "✅ VulkanCloudRenderer initialized" << std::endl;
+    }
+    
+    // Initialize Vulkan deferred renderer (G-buffer + lighting pass)
+    m_vulkanDeferred = std::make_unique<VulkanDeferred>();
+    if (!m_vulkanDeferred->initialize(m_vulkanContext->getDevice(), 
+                                      m_vulkanContext->getAllocator(),
+                                      m_vulkanContext->getSwapchainFormat(),
+                                      m_vulkanContext->getRenderPass(),  // Use swapchain render pass
+                                      m_windowWidth, m_windowHeight))
+    {
+        std::cerr << "❌ Failed to initialize VulkanDeferred!" << std::endl;
+        return false;
+    }
+    std::cout << "✅ VulkanDeferred initialized - Shadow maps + lighting pass ready!" << std::endl;
+    
+    // Bind shadow maps and cloud noise to lighting pass
+    if (m_vulkanCloudRenderer) {
+        if (!m_vulkanDeferred->bindLightingTextures(m_vulkanCloudRenderer->getNoiseTextureView())) {
+            std::cerr << "❌ Failed to bind lighting textures!" << std::endl;
+            return false;
+        }
+        std::cout << "✅ Cascade light maps bound to lighting pass" << std::endl;
+    }
+    
+    // TODO: Port other OpenGL renderers to Vulkan
+    // - Model instancing
+    
+    // Initialize ImGui with Vulkan backend
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -528,10 +577,231 @@ bool GameClient::initializeGraphics()
     io.ConfigFlags |= ImGuiConfigFlags_NavNoCaptureKeyboard;
     ImGui::StyleColorsDark();
     
-    ImGui_ImplGlfw_InitForOpenGL(m_window->getHandle(), true);
-    ImGui_ImplOpenGL3_Init("#version 460");
-
+    // Initialize GLFW backend for Vulkan
+    ImGui_ImplGlfw_InitForVulkan(m_window->getHandle(), true);
+    
+    // Initialize Vulkan backend for ImGui
+    ImGui_ImplVulkan_InitInfo init_info = {};
+    init_info.Instance = m_vulkanContext->instance;
+    init_info.PhysicalDevice = m_vulkanContext->physicalDevice;
+    init_info.Device = m_vulkanContext->device;
+    init_info.QueueFamily = m_vulkanContext->graphicsQueueFamily;
+    init_info.Queue = m_vulkanContext->graphicsQueue;
+    init_info.PipelineCache = VK_NULL_HANDLE;
+    init_info.DescriptorPool = m_vulkanContext->descriptorPool;
+    init_info.RenderPass = m_vulkanContext->renderPass;
+    init_info.MinImageCount = 2;
+    init_info.ImageCount = static_cast<uint32_t>(m_vulkanContext->swapchainImages.size());
+    init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    init_info.Allocator = nullptr;
+    init_info.CheckVkResultFn = nullptr;
+    
+    if (!ImGui_ImplVulkan_Init(&init_info))
+    {
+        std::cerr << "❌ Failed to initialize ImGui Vulkan backend!" << std::endl;
+        return false;
+    }
+    
+    std::cout << "✅ Vulkan rendering backend initialized!" << std::endl;
     return true;
+}
+
+void GameClient::renderVulkan()
+{
+    // Begin frame (without starting render pass yet)
+    uint32_t imageIndex = 0;
+    if (!m_vulkanContext->beginFrame(imageIndex, false))
+    {
+        return; // Swapchain out of date, wait for resize
+    }
+    
+    VkCommandBuffer cmd = m_vulkanContext->getCurrentCommandBuffer();
+    
+    // Calculate camera matrices
+    float aspect = static_cast<float>(m_windowWidth) / static_cast<float>(m_windowHeight);
+    glm::mat4 projectionMatrix = m_playerController.getCamera().getProjectionMatrix(aspect);
+    glm::mat4 viewMatrix = m_playerController.getCamera().getViewMatrix();
+    glm::mat4 viewProjection = projectionMatrix * viewMatrix;
+    
+    // Update island transforms for Vulkan renderer (islands drift each frame)
+    if (m_vulkanQuadRenderer && m_clientWorld)
+    {
+        auto* islandSystem = m_clientWorld->getIslandSystem();
+        if (islandSystem)
+        {
+            const auto& islands = islandSystem->getIslands();
+            for (const auto& [islandID, island] : islands)
+            {
+                m_vulkanQuadRenderer->updateIslandTransform(islandID, island.getTransformMatrix());
+            }
+        }
+    }
+    
+    // Process pending mesh uploads (batched for performance)
+    if (m_vulkanQuadRenderer)
+    {
+        m_vulkanQuadRenderer->processPendingUploads();
+    }
+    
+    // Update dynamic buffers BEFORE render pass (vkCmdUpdateBuffer cannot be called inside render pass)
+    if (m_vulkanQuadRenderer)
+    {
+        m_vulkanQuadRenderer->updateDynamicBuffers(cmd, viewProjection);
+    }
+    
+    // Get sun/moon data for lighting
+    float timeOfDay = m_dayNightController ? m_dayNightController->getTimeOfDay() : 12.0f;
+    Vec3 sunDir = m_dayNightController ? m_dayNightController->getSunDirection() : Vec3(0.0f, -1.0f, 0.0f);
+    Vec3 moonDir = m_dayNightController ? m_dayNightController->getMoonDirection() : Vec3(0.0f, 1.0f, 0.0f);
+    float sunIntensity = m_dayNightController ? m_dayNightController->getSunIntensity() : 1.0f;
+    float moonIntensity = m_dayNightController ? m_dayNightController->getMoonIntensity() : 0.0f;
+    
+    glm::vec3 sunDirGLM(sunDir.x, sunDir.y, sunDir.z);
+    glm::vec3 moonDirGLM(moonDir.x, moonDir.y, moonDir.z);
+    
+    // ========================================
+    // PASS 0: SHADOW MAPS (Cascaded Light Maps)
+    // ========================================
+    // Calculate cascade matrices from camera frustum and sun direction
+    VulkanLightingPass::CascadeUniforms cascades{};
+    glm::vec3 camPos(m_playerController.getCamera().position.x,
+                     m_playerController.getCamera().position.y,
+                     m_playerController.getCamera().position.z);
+    
+    // Cascade split distances (near to far)
+    float cascadeSplits[4] = {50.0f, 200.0f, 800.0f, 3000.0f};
+    float orthoSizes[4] = {100.0f, 400.0f, 1600.0f, 6000.0f};
+    
+    for (int i = 0; i < 4; i++) {
+        glm::vec3 lightDir = (i < 2) ? sunDirGLM : moonDirGLM;
+        float splitDist = cascadeSplits[i];
+        float orthoSize = orthoSizes[i];
+        
+        // Light view: look from light direction toward camera
+        glm::vec3 lightPos = camPos - lightDir * (splitDist * 0.5f);
+        glm::mat4 lightView = glm::lookAt(lightPos, camPos, glm::vec3(0, 1, 0));
+        
+        // Orthographic projection for directional light
+        glm::mat4 lightProj = glm::ortho(-orthoSize, orthoSize, -orthoSize, orthoSize, -orthoSize * 2.0f, orthoSize * 2.0f);
+        
+        cascades.cascadeVP[i] = lightProj * lightView;
+        cascades.cascadeOrthoSizes[i] = orthoSize;
+    }
+    cascades.lightTexel = glm::vec4(1.0f / 4096.0f, 0, 0, 0);
+    
+    // Render shadow maps from sun/moon POV
+    if (m_vulkanDeferred && m_vulkanQuadRenderer) {
+        auto& shadowMap = m_vulkanDeferred->getShadowMap();
+        
+        // Render each cascade
+        for (int i = 0; i < 4; i++) {
+            shadowMap.beginCascadeRender(cmd, i);
+            
+            // Render geometry from light's perspective
+            m_vulkanQuadRenderer->renderDepthOnly(cmd, shadowMap.getRenderPass(), cascades.cascadeVP[i]);
+            
+            shadowMap.endCascadeRender(cmd, i);
+        }
+        
+        // Transition shadow maps for shader reading
+        shadowMap.transitionForShaderRead(cmd);
+    }
+    
+    // ========================================
+    // PASS 1: G-BUFFER (Deferred Geometry Pass)
+    // ========================================
+    if (m_vulkanDeferred)
+    {
+        m_vulkanDeferred->beginGeometryPass(cmd);
+        
+        // Render voxels to G-buffer
+        if (m_vulkanQuadRenderer)
+        {
+            m_vulkanQuadRenderer->renderToGBuffer(cmd, viewProjection, viewMatrix);
+        }
+        
+        m_vulkanDeferred->endGeometryPass(cmd);
+    }
+    
+    // ========================================
+    // PASS 2: LIGHTING (Read G-buffer, write to swapchain)
+    // ========================================
+    
+    // Start swapchain render pass for final composition
+    m_vulkanContext->beginRenderPass(cmd, imageIndex);
+    
+    // Render skybox first (no lighting needed)
+    if (m_vulkanSkyRenderer)
+    {
+        m_vulkanSkyRenderer->render(cmd, sunDirGLM, sunIntensity, moonDirGLM, moonIntensity,
+                                   viewMatrix, projectionMatrix, timeOfDay);
+    }
+    
+    // Apply deferred lighting (reads G-buffer, applies sun/moon, writes to swapchain)
+    // Lighting pass now uses swapchain render pass, so it works inside this render pass
+    if (m_vulkanDeferred)
+    {
+        VulkanDeferred::LightingParams lightingParams;
+        lightingParams.sunDirection = glm::vec4(sunDirGLM, sunIntensity);
+        lightingParams.moonDirection = glm::vec4(moonDirGLM, moonIntensity);
+        lightingParams.sunColor = glm::vec4(1.0f, 0.95f, 0.8f, 1.0f);
+        lightingParams.moonColor = glm::vec4(0.6f, 0.7f, 1.0f, 1.0f);
+        lightingParams.cameraPos = glm::vec4(
+            m_playerController.getCamera().position.x,
+            m_playerController.getCamera().position.y,
+            m_playerController.getCamera().position.z,
+            timeOfDay
+        );
+        
+        // Get cloud noise texture for volumetric shadows
+        VkImageView cloudNoise = m_vulkanCloudRenderer ? m_vulkanCloudRenderer->getNoiseTextureView() : VK_NULL_HANDLE;
+        VkImageView swapchainView = m_vulkanContext->getSwapchainImageView(imageIndex);
+        
+        m_vulkanDeferred->renderLightingPass(cmd, swapchainView, lightingParams, cascades, cloudNoise);
+    }
+    
+    // Render block highlight (yellow wireframe cube on selected block)
+    if (m_vulkanBlockHighlighter && m_inputState.cachedTargetBlock.hit)
+    {
+        auto& islands = m_clientWorld->getIslandSystem()->getIslands();
+        auto it = islands.find(m_inputState.cachedTargetBlock.islandID);
+        if (it != islands.end())
+        {
+            const FloatingIsland& island = it->second;
+            Vec3 localBlockPos = m_inputState.cachedTargetBlock.localBlockPos;
+            glm::mat4 islandTransform = island.getTransformMatrix();
+            m_vulkanBlockHighlighter->render(cmd, localBlockPos, islandTransform, viewProjection);
+        }
+    }
+    
+    // Depth already transitioned to shader-read before render pass began
+    
+    // Render volumetric clouds
+    if (m_vulkanCloudRenderer)
+    {
+        VulkanCloudRenderer::CloudParams cloudParams;
+        cloudParams.sunDirection = sunDirGLM;
+        cloudParams.sunIntensity = sunIntensity;
+        cloudParams.cameraPosition = m_playerController.getCamera().position;
+        cloudParams.timeOfDay = timeOfDay;
+        cloudParams.cloudCoverage = 0.5f;
+        cloudParams.cloudDensity = 0.5f;
+        cloudParams.cloudSpeed = 0.5f;
+        
+        VkImageView depthView = m_vulkanDeferred->getDepthView();
+        m_vulkanCloudRenderer->render(cmd, depthView,
+                                     viewMatrix, projectionMatrix, cloudParams);
+    }
+    
+    // Render ImGui
+    ImDrawData* draw_data = ImGui::GetDrawData();
+    if (draw_data)
+    {
+        ImGui_ImplVulkan_RenderDrawData(draw_data, cmd);
+    }
+    
+    // End frame and present
+    m_vulkanContext->endFrame(imageIndex);
 }
 
 void GameClient::processKeyboard(float deltaTime)
@@ -1041,8 +1311,8 @@ void GameClient::renderWorld()
         PROFILE_SCOPE("Forward_Pass");
         
         // Render screen-space fluid (water GLBs + particles with smoothing)
-        // Render block highlight (yellow wireframe cube on selected block)
-        if (m_blockHighlighter && m_inputState.cachedTargetBlock.hit)
+        // Render block highlight (yellow wireframe cube on selected block) - Vulkan version
+        if (m_vulkanBlockHighlighter && m_inputState.cachedTargetBlock.hit)
         {
             PROFILE_SCOPE("renderBlockHighlight");
             
@@ -1053,9 +1323,11 @@ void GameClient::renderWorld()
                 const FloatingIsland& island = it->second;
                 Vec3 localBlockPos = m_inputState.cachedTargetBlock.localBlockPos;
                 glm::mat4 islandTransform = island.getTransformMatrix();
+                glm::mat4 viewProjection = projectionMatrix * viewMatrix;
                 
-                m_blockHighlighter->render(localBlockPos, glm::value_ptr(islandTransform), 
-                    glm::value_ptr(viewMatrix), glm::value_ptr(projectionMatrix));
+                // Get current command buffer (we're inside render pass)
+                VkCommandBuffer cmd = m_vulkanContext->getCurrentCommandBuffer();
+                m_vulkanBlockHighlighter->render(cmd, localBlockPos, islandTransform, viewProjection);
             }
         }
     }
@@ -1174,7 +1446,7 @@ void GameClient::renderWaitingScreen()
 void GameClient::renderUI()
 {
     // Start ImGui frame
-    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
     
@@ -1245,9 +1517,9 @@ void GameClient::renderUI()
         // Additional remote client UI could go here
     }
     
-    // Finalize ImGui frame and render
+    // Finalize ImGui frame
     ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    // ImGui draw data will be rendered in renderVulkan()
 }
 
 void GameClient::onWindowResize(int width, int height)
@@ -1291,13 +1563,24 @@ void GameClient::handleWorldStateReceived(const WorldStateMessage& worldState)
     m_playerController.setPosition(worldState.playerSpawnPosition);
 }
 
-void GameClient::registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* island, const Vec3& chunkCoord)
+void GameClient::registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* island, uint32_t islandID, const Vec3& chunkCoord)
 {
-    if (!g_instancedQuadRenderer || !chunk || !island)
-        return;
+    // Register with OpenGL renderer if available
+    if (g_instancedQuadRenderer && chunk && island)
+    {
+        glm::mat4 chunkTransform = island->getChunkTransform(chunkCoord);
+        g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+    }
     
-    glm::mat4 chunkTransform = island->getChunkTransform(chunkCoord);
-    g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+    // Register with Vulkan renderer if available
+    if (m_vulkanQuadRenderer && chunk && island)
+    {
+        // Calculate chunk offset in world units
+        glm::vec3 chunkOffset(chunkCoord.x * VoxelChunk::SIZE,
+                              chunkCoord.y * VoxelChunk::SIZE,
+                              chunkCoord.z * VoxelChunk::SIZE);
+        m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
+    }
 }
 
 void GameClient::syncPhysicsToChunks()
@@ -1331,16 +1614,26 @@ void GameClient::syncPhysicsToChunks()
         // Skip islands that haven't moved (need const_cast because getIslands() returns const ref)
         if (!island.needsPhysicsUpdate) continue;
         
-        // Update transforms for all chunks in this island
+        // Island transforms are baked during meshing - chunks must be re-meshed when islands move
+        
+        // === UPDATE PER-CHUNK TRANSFORMS (OpenGL renderer) ===
+        if (g_instancedQuadRenderer)
+        {
+            for (auto& [chunkCoord, chunk] : island.chunks)
+            {
+                if (!chunk) continue;
+                
+                glm::mat4 chunkTransform = island.getChunkTransform(chunkCoord);
+                g_instancedQuadRenderer->updateChunkTransform(chunk.get(), chunkTransform);
+            }
+        }
+        
+        // === UPDATE GLB MODEL RENDERER ===
         for (auto& [chunkCoord, chunk] : island.chunks)
         {
             if (!chunk) continue;
             
-            // Use helper to compute chunk transform
             glm::mat4 chunkTransform = island.getChunkTransform(chunkCoord);
-            
-            // === UPDATE CHUNK QUAD RENDERER (voxel chunks) ===
-            g_instancedQuadRenderer->updateChunkTransform(chunk.get(), chunkTransform);
             
             // === UPDATE GLB MODEL RENDERER (only for chunks with OBJ instances) ===
             if (g_modelRenderer && !objBlockTypes.empty())
@@ -1401,7 +1694,7 @@ void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& p
             chunk->setRawVoxelData(voxelData, dataSize);
             
             // Register chunk with renderer (will queue mesh generation)
-            registerChunkWithRenderer(chunk, island, originChunk);
+            registerChunkWithRenderer(chunk, island, localIslandID, originChunk);
         }
         else
         {
@@ -1446,6 +1739,11 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
         }
         
         std::cout << "📦 Created new island " << islandID << " from server" << std::endl;
+        
+        // Update Vulkan renderer with island transform
+        if (m_vulkanQuadRenderer) {
+            m_vulkanQuadRenderer->updateIslandTransform(islandID, island->getTransformMatrix());
+        }
     }
 
     // Add chunk to island if it doesn't exist
@@ -1461,10 +1759,16 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
         // Apply the voxel data directly
         chunk->setRawVoxelData(voxelData, dataSize);
         
-        // Register chunk with renderer
+        // Register chunk with renderers
         if (g_instancedQuadRenderer) {
             glm::mat4 chunkTransform = island->getChunkTransform(chunkCoord);
             g_instancedQuadRenderer->registerChunk(chunk, chunkTransform);
+        }
+        if (m_vulkanQuadRenderer) {
+            glm::vec3 chunkOffset(chunkCoord.x * VoxelChunk::SIZE,
+                                  chunkCoord.y * VoxelChunk::SIZE,
+                                  chunkCoord.z * VoxelChunk::SIZE);
+            m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
         }
         
         // Queue mesh generation for entire chunk

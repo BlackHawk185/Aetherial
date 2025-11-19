@@ -398,8 +398,6 @@ Vec3 PhysicsSystem::resolveCapsuleMovement(const Vec3& currentPos, Vec3& velocit
             if (!checkCapsuleCollision(unstuckPos, radius, height, collisionNormal, nullptr))
             {
                 finalPosition = unstuckPos;
-                std::cout << "[PHYSICS] Unstuck entity (height=" << height << ") by pushing up " 
-                          << unstuckHeight << " units" << std::endl;
                 break;
             }
         }
