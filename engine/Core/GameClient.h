@@ -189,6 +189,9 @@ private:
     bool m_initialized = false;
     bool m_debugMode = false;
     
+    // Async mesh generation tracking
+    std::vector<VoxelChunk*> m_chunksWithPendingMeshes;
+    
     // ================================
     // INTERNAL METHODS
     // ================================

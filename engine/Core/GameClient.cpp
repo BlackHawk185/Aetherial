@@ -229,6 +229,19 @@ bool GameClient::update(float deltaTime)
         m_dayNightController->update(deltaTime);
     }
 
+    // Poll async mesh generation and upload when ready
+    {
+        PROFILE_SCOPE("AsyncMeshUpload");
+        auto it = m_chunksWithPendingMeshes.begin();
+        while (it != m_chunksWithPendingMeshes.end()) {
+            if ((*it)->tryUploadPendingMesh()) {
+                it = m_chunksWithPendingMeshes.erase(it); // Upload complete
+            } else {
+                ++it; // Still building
+            }
+        }
+    }
+
     // Process input
     {
         PROFILE_SCOPE("processInput");
@@ -1200,8 +1213,9 @@ void GameClient::registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* is
                               chunkCoord.z * VoxelChunk::SIZE);
         m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
         
-        // Generate mesh immediately after registration
-        chunk->generateMesh();
+        // Generate mesh async - uploads when ready
+        chunk->generateMeshAsync();
+        m_chunksWithPendingMeshes.push_back(chunk);
     }
 }
 
@@ -1329,8 +1343,9 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
                                   chunkCoord.z * VoxelChunk::SIZE);
             m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
             
-            // Generate mesh immediately after registration
-            chunk->generateMesh();
+            // Generate mesh async - uploads when ready
+            chunk->generateMeshAsync();
+            m_chunksWithPendingMeshes.push_back(chunk);
         }
     }
     else

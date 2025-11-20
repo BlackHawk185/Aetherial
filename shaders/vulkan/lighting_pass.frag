@@ -42,16 +42,24 @@ const float CLOUD_DENSITY = 2.0;
 const float CLOUD_SPEED = 0.5;
 const float CLOUD_SCALE = 0.00015;
 
-// 8-tap Poisson disk for PCF soft lighting
-const vec2 POISSON[8] = vec2[8](
-    vec2(-0.613392, 0.617481),
-    vec2(0.170019, -0.040254),
-    vec2(-0.299417, 0.791925),
-    vec2(0.645680, 0.493210),
-    vec2(-0.651784, 0.717887),
-    vec2(0.421003, 0.027070),
-    vec2(-0.817194, -0.271096),
-    vec2(-0.705374, -0.668203)
+// 32-tap Poisson disk for high-quality PCF soft shadows
+const vec2 POISSON[32] = vec2[32](
+    vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725),
+    vec2(-0.094184101, -0.92938870), vec2(0.34495938, 0.29387760),
+    vec2(-0.91588581, 0.45771432), vec2(-0.81544232, -0.87912464),
+    vec2(-0.38277543, 0.27676845), vec2(0.97484398, 0.75648379),
+    vec2(0.44323325, -0.97511554), vec2(0.53742981, -0.47373420),
+    vec2(-0.26496911, -0.41893023), vec2(0.79197514, 0.19090188),
+    vec2(-0.24188840, 0.99706507), vec2(-0.81409955, 0.91437590),
+    vec2(0.19984126, 0.78641367), vec2(0.14383161, -0.14100790),
+    vec2(-0.53023345, -0.60363561), vec2(0.69374341, -0.16296099),
+    vec2(-0.15957603, 0.13178897), vec2(-0.52976096, 0.56885791),
+    vec2(0.02906645, -0.61384201), vec2(0.25586777, 0.57080173),
+    vec2(-0.67520785, -0.15005630), vec2(0.58265102, 0.81282514),
+    vec2(-0.37054151, 0.64097851), vec2(0.82294636, -0.56667840),
+    vec2(-0.98003292, 0.00492644), vec2(0.35893059, -0.35269195),
+    vec2(-0.08734025, 0.47409865), vec2(0.94150668, 0.28232986),
+    vec2(-0.42024112, -0.88588715), vec2(0.02940664, 0.94268930)
 );
 
 // Sample cloud shadow occlusion
@@ -86,17 +94,25 @@ float sampleCloudShadow(vec3 worldPos, float time) {
     return clamp(totalOcclusion, 0.0, 0.85);
 }
 
-// Sample single cascade with PCF
-float sampleCascade(int cascadeIndex, vec3 worldPos, float bias) {
+// Sample single cascade with high-quality 32-tap PCF
+float sampleCascade(int cascadeIndex, vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
     vec4 lightSpacePos = cascade.cascadeVP[cascadeIndex] * vec4(worldPos, 1.0);
-    vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
-    proj = proj * 0.5 + 0.5;
+    vec3 ndc = lightSpacePos.xyz / lightSpacePos.w;
     
-    // Out of bounds
-    if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0 || proj.z > 1.0)
+    // Out of bounds (Vulkan NDC: xy = [-1,1], z = [0,1])
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z > 1.0)
         return -1.0;
     
-    float current = proj.z - bias;
+    // Convert XY from NDC [-1, 1] to texture coordinates [0, 1]. Z is already [0, 1] in Vulkan.
+    vec3 shadowCoord = vec3(ndc.xy * 0.5 + 0.5, ndc.z);
+    
+    // Slope-scale depth bias (reduces peter-panning and acne)
+    float slopeBias = max(0.002 * (1.0 - dot(normal, lightDir)), bias);
+    float current = shadowCoord.z - slopeBias;
+    
+    // Early exit optimization: sample center first with same depth as PCF
+    float centerShadow = texture(uLightMap, vec4(shadowCoord.xy, cascadeIndex, current));
+    if (centerShadow > 0.99) return 1.0;  // Fully lit, skip PCF
     
     // PCF radius scaled by cascade ortho size
     int baseCascade = (cascadeIndex / 2) * 2;
@@ -104,18 +120,19 @@ float sampleCascade(int cascadeIndex, vec3 worldPos, float bias) {
         (cascade.cascadeOrthoSizes[baseCascade] / cascade.cascadeOrthoSizes[baseCascade + 1]);
     float radius = 512.0 * radiusScale * cascade.lightTexel.x;
     
+    // 32-tap Poisson disk PCF for high-quality soft shadows
     float lightValue = 0.0;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 32; ++i) {
         vec2 offset = POISSON[i] * radius;
-        lightValue += texture(uLightMap, vec4(proj.xy + offset, cascadeIndex, current));
+        lightValue += texture(uLightMap, vec4(shadowCoord.xy + offset, cascadeIndex, current));
     }
-    return lightValue / 8.0;
+    return lightValue / 32.0;
 }
 
 // Sample sun light (cascades 0 and 1)
 float sampleSunLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
-    float lightNear = sampleCascade(0, worldPos, bias);
-    float lightFar = sampleCascade(1, worldPos, bias);
+    float lightNear = sampleCascade(0, worldPos, bias, normal, lightDir);
+    float lightFar = sampleCascade(1, worldPos, bias, normal, lightDir);
     
     bool nearValid = (lightNear >= 0.0);
     bool farValid = (lightFar >= 0.0);
@@ -123,10 +140,9 @@ float sampleSunLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
     if (nearValid && farValid) {
         // Blend cascades in transition zone
         vec4 lightSpacePos = cascade.cascadeVP[0] * vec4(worldPos, 1.0);
-        vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
-        proj = proj * 0.5 + 0.5;
+        vec3 ndc = lightSpacePos.xyz / lightSpacePos.w;
         
-        vec2 distToEdge = abs(proj.xy - 0.5) * 2.0;
+        vec2 distToEdge = abs(ndc.xy);
         float maxDist = max(distToEdge.x, distToEdge.y);
         
         float blendStart = 0.80;
@@ -145,18 +161,17 @@ float sampleSunLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
 
 // Sample moon light (cascades 2 and 3)
 float sampleMoonLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
-    float lightNear = sampleCascade(2, worldPos, bias);
-    float lightFar = sampleCascade(3, worldPos, bias);
+    float lightNear = sampleCascade(2, worldPos, bias, normal, lightDir);
+    float lightFar = sampleCascade(3, worldPos, bias, normal, lightDir);
     
     bool nearValid = (lightNear >= 0.0);
     bool farValid = (lightFar >= 0.0);
     
     if (nearValid && farValid) {
         vec4 lightSpacePos = cascade.cascadeVP[2] * vec4(worldPos, 1.0);
-        vec3 proj = lightSpacePos.xyz / lightSpacePos.w;
-        proj = proj * 0.5 + 0.5;
+        vec3 ndc = lightSpacePos.xyz / lightSpacePos.w;
         
-        vec2 distToEdge = abs(proj.xy - 0.5) * 2.0;
+        vec2 distToEdge = abs(ndc.xy);
         float maxDist = max(distToEdge.x, distToEdge.y);
         
         float blendStart = 0.80;

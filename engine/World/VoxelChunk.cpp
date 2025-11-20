@@ -1,6 +1,7 @@
 // VoxelChunk.cpp - 256x256x256 dynamic physics-enabled voxel chunks
 #include "VoxelChunk.h"
 #include "BlockType.h"
+#include "MeshGenerationPool.h"
 
 #include "../Time/DayNightController.h"  // For dynamic sun direction
 #include "../Rendering/Vulkan/VulkanQuadRenderer.h"  // For Vulkan GPU upload
@@ -73,10 +74,10 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
         m_modelInstances[type].push_back(pos);
     }
     
-    // Remesh chunk (Vulkan path generates mesh directly)
+    // Remesh chunk asynchronously to avoid main thread stalls
     if (m_isClientChunk)
     {
-        generateMesh();
+        generateMeshAsync();
     }
 }
 
@@ -140,25 +141,202 @@ bool VoxelChunk::isVoxelSolid(int x, int y, int z) const
     return true;
 }
 
-void VoxelChunk::generateMesh(bool generateLighting)
+void VoxelChunk::generateMeshAsync(bool generateLighting)
 {
-    (void)generateLighting; // Parameter kept for API compatibility but unused (real-time lighting only)
+    (void)generateLighting;
     
-    // Initialize mesh if needed
-    if (!renderMesh) {
-        renderMesh = std::make_shared<VoxelMesh>();
+    // Cancel any pending mesh generation
+    std::lock_guard<std::mutex> lock(m_meshMutex);
+    if (m_pendingMeshFuture.valid()) {
+        // Previous mesh still building - let it finish, we'll replace it
     }
     
-    // Clear previous mesh data
-    renderMesh->quads.clear();
+    // Copy voxel data for worker thread (thread-safe)
+    auto voxelDataCopy = std::make_shared<std::array<uint8_t, VOLUME>>(voxels);
+    uint32_t islandID = m_islandID;
     
-    // Generate greedy mesh for all 6 faces
-    for (int face = 0; face < 6; ++face) {
-        greedyMeshFace(renderMesh->quads, face);
+    // Create promise/future pair for thread pool
+    auto promise = std::make_shared<std::promise<std::shared_ptr<VoxelMesh>>>();
+    m_pendingMeshFuture = promise->get_future();
+    
+    // Submit to thread pool instead of spawning new thread
+    MeshGenerationPool::getInstance().enqueue([voxelDataCopy, islandID, promise]() {
+        auto newMesh = std::make_shared<VoxelMesh>();
+        
+        // Inline greedy meshing for all 6 faces using copied voxel data
+        std::vector<QuadFace> quads;
+        
+        // Helper lambda to check if a block is solid
+        auto& registry = BlockTypeRegistry::getInstance();
+        auto isBlockSolid = [&](uint8_t blockID) -> bool {
+            if (blockID == BlockID::AIR) return false;
+            const BlockTypeInfo* blockInfo = registry.getBlockType(blockID);
+            if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
+                return false;
+            }
+            return true;
+        };
+        
+        // Inline greedy meshing
+        for (int face = 0; face < 6; ++face) {
+            std::vector<bool> visited(SIZE * SIZE * SIZE, false);
+            
+            for (int z = 0; z < SIZE; ++z) {
+                for (int y = 0; y < SIZE; ++y) {
+                    for (int x = 0; x < SIZE; ++x) {
+                        int idx = x + y * SIZE + z * SIZE * SIZE;
+                        uint8_t blockType = (*voxelDataCopy)[idx];
+                        
+                        if (!isBlockSolid(blockType)) continue;
+                        if (visited[idx]) continue;
+                        
+                        // Check if face is exposed
+                        bool exposed = false;
+                        switch (face) {
+                            case 0: exposed = (x == 0 || !isBlockSolid((*voxelDataCopy)[(x-1) + y*SIZE + z*SIZE*SIZE])); break;
+                            case 1: exposed = (x == SIZE-1 || !isBlockSolid((*voxelDataCopy)[(x+1) + y*SIZE + z*SIZE*SIZE])); break;
+                            case 2: exposed = (y == 0 || !isBlockSolid((*voxelDataCopy)[x + (y-1)*SIZE + z*SIZE*SIZE])); break;
+                            case 3: exposed = (y == SIZE-1 || !isBlockSolid((*voxelDataCopy)[x + (y+1)*SIZE + z*SIZE*SIZE])); break;
+                            case 4: exposed = (z == 0 || !isBlockSolid((*voxelDataCopy)[x + y*SIZE + (z-1)*SIZE*SIZE])); break;
+                            case 5: exposed = (z == SIZE-1 || !isBlockSolid((*voxelDataCopy)[x + y*SIZE + (z+1)*SIZE*SIZE])); break;
+                        }
+                        
+                        if (!exposed) continue;
+                        
+                        // Greedy meshing - expand width and height
+                        int width = 1;
+                        int height = 1;
+                        
+                        if (face == 0 || face == 1) { // X faces
+                            while (z + width < SIZE) {
+                                int checkIdx = x + y * SIZE + (z + width) * SIZE * SIZE;
+                                uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
+                                if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) break;
+                                ++width;
+                            }
+                            bool canExpand = true;
+                            while (y + height < SIZE && canExpand) {
+                                for (int dz = 0; dz < width; ++dz) {
+                                    int checkIdx = x + (y + height) * SIZE + (z + dz) * SIZE * SIZE;
+                                    uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
+                                    if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) {
+                                        canExpand = false;
+                                        break;
+                                    }
+                                }
+                                if (canExpand) ++height;
+                            }
+                            for (int dy = 0; dy < height; ++dy)
+                                for (int dz = 0; dz < width; ++dz)
+                                    visited[x + (y + dy) * SIZE + (z + dz) * SIZE * SIZE] = true;
+                        } else if (face == 2 || face == 3) { // Y faces
+                            while (x + width < SIZE) {
+                                int checkIdx = (x + width) + y * SIZE + z * SIZE * SIZE;
+                                uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
+                                if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) break;
+                                ++width;
+                            }
+                            bool canExpand = true;
+                            while (z + height < SIZE && canExpand) {
+                                for (int dx = 0; dx < width; ++dx) {
+                                    int checkIdx = (x + dx) + y * SIZE + (z + height) * SIZE * SIZE;
+                                    uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
+                                    if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) {
+                                        canExpand = false;
+                                        break;
+                                    }
+                                }
+                                if (canExpand) ++height;
+                            }
+                            for (int dz = 0; dz < height; ++dz)
+                                for (int dx = 0; dx < width; ++dx)
+                                    visited[(x + dx) + y * SIZE + (z + dz) * SIZE * SIZE] = true;
+                        } else { // Z faces
+                            while (x + width < SIZE) {
+                                int checkIdx = (x + width) + y * SIZE + z * SIZE * SIZE;
+                                uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
+                                if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) break;
+                                ++width;
+                            }
+                            bool canExpand = true;
+                            while (y + height < SIZE && canExpand) {
+                                for (int dx = 0; dx < width; ++dx) {
+                                    int checkIdx = (x + dx) + (y + height) * SIZE + z * SIZE * SIZE;
+                                    uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
+                                    if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) {
+                                        canExpand = false;
+                                        break;
+                                    }
+                                }
+                                if (canExpand) ++height;
+                            }
+                            for (int dy = 0; dy < height; ++dy)
+                                for (int dx = 0; dx < width; ++dx)
+                                    visited[(x + dx) + (y + dy) * SIZE + z * SIZE * SIZE] = true;
+                        }
+                        
+                        // Build quad
+                        static const glm::vec3 normals[6] = {
+                            glm::vec3(-1, 0, 0), glm::vec3(1, 0, 0),
+                            glm::vec3(0, -1, 0), glm::vec3(0, 1, 0),
+                            glm::vec3(0, 0, -1), glm::vec3(0, 0, 1)
+                        };
+                        
+                        glm::vec3 cornerPos;
+                        switch (face) {
+                            case 0: cornerPos = glm::vec3(x, y, z); break;
+                            case 1: cornerPos = glm::vec3(x + 1.0f, y, z + width); break;
+                            case 2: cornerPos = glm::vec3(x, y, z); break;
+                            case 3: cornerPos = glm::vec3(x, y + 1.0f, z + height); break;
+                            case 4: cornerPos = glm::vec3(x + width, y, z); break;
+                            case 5: cornerPos = glm::vec3(x, y, z + 1.0f); break;
+                        }
+                        
+                        glm::vec3 normal = normals[face];
+                        int nx = static_cast<int>(normal.x * 511.5f + 512.0f);
+                        int ny = static_cast<int>(normal.y * 511.5f + 512.0f);
+                        int nz = static_cast<int>(normal.z * 511.5f + 512.0f);
+                        uint32_t packedNormal = (nx & 0x3FF) | ((ny & 0x3FF) << 10) | ((nz & 0x3FF) << 20);
+                        
+                        QuadFace quad;
+                        quad.position = cornerPos;
+                        quad._padding0 = 0.0f;
+                        quad.width = static_cast<float>(width);
+                        quad.height = static_cast<float>(height);
+                        quad.packedNormal = packedNormal;
+                        quad.blockType = blockType;
+                        quad.faceDir = static_cast<uint32_t>(face);
+                        quad.islandID = islandID;
+                        
+                        quads.push_back(quad);
+                    }
+                }
+            }
+        }
+        
+        newMesh->quads = std::move(quads);
+        promise->set_value(newMesh);
+    });
+}
+
+bool VoxelChunk::tryUploadPendingMesh()
+{
+    std::lock_guard<std::mutex> lock(m_meshMutex);
+    
+    if (!m_pendingMeshFuture.valid()) {
+        return false; // No pending mesh
     }
     
-    // Upload to GPU
+    // Check if mesh is ready (non-blocking)
+    if (m_pendingMeshFuture.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        return false; // Still building
+    }
+    
+    // Mesh ready - retrieve and upload
+    renderMesh = m_pendingMeshFuture.get();
     uploadMeshToGPU();
+    
+    return true; // Upload complete
 }
 
 // Greedy meshing for a single face direction

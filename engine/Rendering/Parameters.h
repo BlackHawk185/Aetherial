@@ -34,14 +34,9 @@ namespace Clouds {
     static constexpr int RAYMARCH_SAMPLES = 32;         // Cloud raymarching steps (32 = fast, 64 = balanced, 128 = quality)
     static constexpr int NOISE_TEXTURE_SIZE = 128;      // 3D noise resolution (64 = 256KB, 128 = 2MB, 256 = 16MB)
     
-    // === CLOUD VOLUME SETTINGS ===
-    // 3D noise naturally creates varied height clouds - just define min/max bounds
-    static constexpr float CLOUD_BASE_MIN_HEIGHT = -100.0f;    // Bottom of cloud volume (world units)
-    static constexpr float CLOUD_BASE_MAX_HEIGHT = 300.0f;   // Top of cloud volume (world units)
-    
     // === APPEARANCE SETTINGS ===
-    static constexpr float CLOUD_COVERAGE = 0.5f;       // Cloud coverage (0.0 = clear, 1.0 = overcast)
-    static constexpr float CLOUD_DENSITY = 0.5f;        // Cloud density multiplier (higher = thicker/darker)
+    static constexpr float CLOUD_COVERAGE = 0.01f;      // Cloud coverage (0.0 = clear, 1.0 = overcast) - lighter wispy clouds
+    static constexpr float CLOUD_DENSITY = 0.01f;       // Cloud density multiplier (higher = thicker/darker) - more transparent
     static constexpr float CLOUD_SPEED = 0.5f;          // Wind speed for cloud movement
     static constexpr float CLOUD_SCALE = 0.001f;        // World-space scale for noise sampling
     

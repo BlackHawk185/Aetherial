@@ -104,12 +104,15 @@ void main() {
     // Apply view-projection
     gl_Position = pc.viewProjection * vec4(worldPos, 1.0);
     
-    // Unpack normal (no transform applied - islands don't rotate yet)
+    // Unpack normal and transform with island rotation for per-pixel rotation
     int nx = int((quad.packedNormal >>  0) & 0x3FF) - 512;
     int ny = int((quad.packedNormal >> 10) & 0x3FF) - 512;
     int nz = int((quad.packedNormal >> 20) & 0x3FF) - 512;
-    vec3 normal = normalize(vec3(float(nx), float(ny), float(nz)));
-    vNormal = normal;
+    vec3 localNormal = normalize(vec3(float(nx), float(ny), float(nz)));
+    
+    // Extract rotation from island transform (upper 3x3) and apply to normal
+    mat3 rotationMatrix = mat3(islandTransform);
+    vNormal = normalize(rotationMatrix * localNormal);
     
     // Pass attributes with tiled texture coordinates
     // Multiply texcoords by quad dimensions to repeat texture instead of stretching

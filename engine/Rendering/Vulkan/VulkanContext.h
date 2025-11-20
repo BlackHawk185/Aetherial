@@ -76,6 +76,10 @@ public:
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     std::vector<VkImage> swapchainImages;
+    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+    
+    // Pipeline cache management
+    bool createPipelineCache();
     
 private:
     // Initialization helpers
@@ -138,6 +142,8 @@ private:
     
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> m_commandBuffers;
+    
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     
     // Synchronization objects (double buffering)
     static constexpr int MAX_FRAMES_IN_FLIGHT = 2;

@@ -14,10 +14,6 @@ layout(push_constant) uniform CloudParams {
     vec4 cloudParams;          // x = coverage, y = density, z = speed, w = timeOfDay
 } params;
 
-// Cloud volume bounds
-const float CLOUD_BASE_MIN = -100.0;
-const float CLOUD_BASE_MAX = 300.0;
-
 // Cloud appearance parameters
 const float CLOUD_SCALE = 0.001;
 
@@ -42,11 +38,6 @@ vec3 worldPositionFromDepth(vec2 uv, float depth) {
 
 // Sample cloud density from 3D noise
 float sampleCloudDensity(vec3 position, float time) {
-    // Check if we're in the cloud volume
-    if (position.y < CLOUD_BASE_MIN || position.y > CLOUD_BASE_MAX) {
-        return 0.0;
-    }
-    
     // Apply wind offset
     float cloudSpeed = params.cloudParams.z;
     vec3 windOffset = vec3(time * cloudSpeed * 0.05, 0.0, time * cloudSpeed * 0.03);
@@ -79,15 +70,9 @@ float sampleCloudDensity(vec3 position, float time) {
     // Apply coverage and remap
     float coverage = params.cloudParams.x;
     float densityMult = params.cloudParams.y;
-    float density = max(0.0, noise - (1.0 - coverage)) * densityMult;
     
-    // Height-based density falloff at volume edges
-    float heightInVolume = position.y - CLOUD_BASE_MIN;
-    float volumeHeight = CLOUD_BASE_MAX - CLOUD_BASE_MIN;
-    float heightGradient = smoothstep(0.0, 30.0, heightInVolume) * 
-                          smoothstep(volumeHeight, volumeHeight - 30.0, heightInVolume);
-    
-    return density * heightGradient;
+    // Smoothstep density for softer transitions
+    return smoothstep(0.0, 1.0, max(0.0, noise - (1.0 - coverage))) * densityMult;
 }
 
 // Simple light scattering
@@ -101,20 +86,6 @@ float lightEnergy(vec3 position, float time) {
     return exp(-density * 2.0);
 }
 
-// Ray-slab intersection for cloud layer
-bool intersectCloudLayer(vec3 origin, vec3 direction, out float tMin, out float tMax) {
-    float t1 = (CLOUD_BASE_MIN - origin.y) / direction.y;
-    float t2 = (CLOUD_BASE_MAX - origin.y) / direction.y;
-    
-    tMin = min(t1, t2);
-    tMax = max(t1, t2);
-    
-    // Clamp to forward ray
-    tMin = max(tMin, 0.0);
-    
-    return tMax > tMin;
-}
-
 void main() {
     // Get scene depth
     float sceneDepth = texture(uDepthTexture, vUV).r;
@@ -125,20 +96,9 @@ void main() {
     // Reconstruct ray direction
     vec3 rayDir = normalize(sceneWorldPos - cameraPos);
     
-    // Find intersection with cloud layer
-    float tMin, tMax;
-    if (!intersectCloudLayer(cameraPos, rayDir, tMin, tMax)) {
-        FragColor = vec4(0.0, 0.0, 0.0, 0.0);
-        return;
-    }
-    
-    // Clamp to scene depth
-    tMax = min(tMax, sceneDistance);
-    
-    if (tMax <= tMin) {
-        FragColor = vec4(0.0, 0.0, 0.0, 0.0);
-        return;
-    }
+    // Simple forward raymarching (no height culling)
+    float tMin = 0.0;
+    float tMax = min(MAX_DISTANCE, sceneDistance);
     
     // Raymarch through cloud layer
     float timeOfDay = params.cloudParams.w;

@@ -487,16 +487,7 @@ void VulkanCloudRenderer::render(VkCommandBuffer cmd, VkImageView depthTexture,
         return;
     }
 
-    // Early out if camera is far outside cloud layer
-    const float cloudLayerThickness = EngineParameters::Clouds::CLOUD_BASE_MAX_HEIGHT - 
-                                     EngineParameters::Clouds::CLOUD_BASE_MIN_HEIGHT;
-    const float cullDistance = cloudLayerThickness * 2.0f;
-    if (params.cameraPosition.y < EngineParameters::Clouds::CLOUD_BASE_MIN_HEIGHT - cullDistance ||
-        params.cameraPosition.y > EngineParameters::Clouds::CLOUD_BASE_MAX_HEIGHT + cullDistance) {
-        std::cout << "Camera culled: y=" << params.cameraPosition.y << " min=" << (EngineParameters::Clouds::CLOUD_BASE_MIN_HEIGHT - cullDistance) 
-                  << " max=" << (EngineParameters::Clouds::CLOUD_BASE_MAX_HEIGHT + cullDistance) << std::endl;
-        return;
-    }
+    // No height culling - clouds render everywhere (removed CLOUD_BASE_MIN/MAX_HEIGHT)
     
     // Skip rendering if depth texture is not available (layout transition issue)
     if (depthTexture == VK_NULL_HANDLE) {

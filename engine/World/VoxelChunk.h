@@ -12,6 +12,8 @@
 #include <memory>
 #include <atomic>
 #include <functional>
+#include <future>
+#include <mutex>
 
 // Forward declaration for OpenGL types
 using GLuint = uint32_t;
@@ -98,8 +100,9 @@ class VoxelChunk
     uint32_t getVoxelDataSize() const { return VOLUME; }
 
     // Mesh generation and management
-    // Generate mesh for entire chunk as single unit
-    void generateMesh(bool generateLighting = true);
+    // Async mesh generation (eliminates 100+ms frame drops)
+    void generateMeshAsync(bool generateLighting = true);
+    bool tryUploadPendingMesh();  // Non-blocking upload check
     
     // Explosion system for direct quad manipulation
     void explodeQuad(uint16_t quadIndex);
@@ -156,6 +159,10 @@ class VoxelChunk
     
     // Client/Server flag - only client chunks upload to GPU
     bool m_isClientChunk = false;
+    
+    // Async mesh generation state
+    std::mutex m_meshMutex;
+    std::future<std::shared_ptr<VoxelMesh>> m_pendingMeshFuture;
 
     // Quad generation helper (island-relative positions)
     void addQuad(std::vector<QuadFace>& quads, float x, float y, float z, int face, int width, int height, uint8_t blockType);

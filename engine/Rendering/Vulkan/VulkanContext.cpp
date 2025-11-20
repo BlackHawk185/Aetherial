@@ -26,6 +26,7 @@ bool VulkanContext::init(GLFWwindow* window, bool enableValidation) {
     if (!createCommandPool()) return false;
     if (!createCommandBuffers()) return false;
     if (!createSyncObjects()) return false;
+    if (!createPipelineCache()) return false;
     
     // Populate public members for ImGui and other systems
     instance = m_instance;
@@ -879,6 +880,13 @@ void VulkanContext::cleanup() {
     
     vkDestroyCommandPool(m_device, m_commandPool, nullptr);
     vkDestroyRenderPass(m_device, m_renderPass, nullptr);
+    
+    if (m_pipelineCache != VK_NULL_HANDLE) {
+        vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
+        m_pipelineCache = VK_NULL_HANDLE;
+        pipelineCache = VK_NULL_HANDLE;
+    }
+    
     vkDestroyDevice(m_device, nullptr);
     
     if (m_enableValidation && m_debugMessenger != VK_NULL_HANDLE) {
@@ -892,4 +900,18 @@ void VulkanContext::cleanup() {
     vkDestroyInstance(m_instance, nullptr);
     
     std::cout << "[Vulkan] Cleanup complete\n";
+}
+
+bool VulkanContext::createPipelineCache() {
+    VkPipelineCacheCreateInfo cacheInfo{};
+    cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    
+    if (vkCreatePipelineCache(m_device, &cacheInfo, nullptr, &m_pipelineCache) != VK_SUCCESS) {
+        std::cerr << "[Vulkan] Failed to create pipeline cache\n";
+        return false;
+    }
+    
+    pipelineCache = m_pipelineCache;
+    std::cout << "[Vulkan] Pipeline cache created\n";
+    return true;
 }
