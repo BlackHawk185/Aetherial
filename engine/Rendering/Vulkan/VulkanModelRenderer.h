@@ -46,6 +46,8 @@ private:
     struct InstanceData {
         glm::vec3 position;
         uint32_t islandID;
+        uint32_t blockID;
+        uint32_t padding;
     };
     
     struct DrawBatch {

@@ -48,37 +48,8 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
     if (x < 0 || x >= SIZE || y < 0 || y >= SIZE || z < 0 || z >= SIZE)
         return;
     
-    int voxelIdx = x + y * SIZE + z * SIZE * SIZE;
-    uint8_t oldType = voxels[voxelIdx];
-    if (oldType == type) return;
-    
-    // Update voxel data
-    voxels[voxelIdx] = type;
-    
-    // Track OBJ-type blocks
-    auto& registry = BlockTypeRegistry::getInstance();
-    const BlockTypeInfo* oldBlockInfo = registry.getBlockType(oldType);
-    const BlockTypeInfo* newBlockInfo = registry.getBlockType(type);
-    
-    if (oldBlockInfo && oldBlockInfo->renderType == BlockRenderType::OBJ) {
-        auto it = m_modelInstances.find(oldType);
-        if (it != m_modelInstances.end()) {
-            auto& instances = it->second;
-            glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-            instances.erase(std::remove(instances.begin(), instances.end(), pos), instances.end());
-        }
-    }
-    
-    if (newBlockInfo && newBlockInfo->renderType == BlockRenderType::OBJ) {
-        glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-        m_modelInstances[type].push_back(pos);
-    }
-    
-    // Remesh chunk asynchronously to avoid main thread stalls
-    if (m_isClientChunk)
-    {
-        generateMeshAsync();
-    }
+    // Use direct quad manipulation instead of full remesh
+    setVoxelWithQuadManipulation(x, y, z, type);
 }
 
 void VoxelChunk::setVoxelDataDirect(int x, int y, int z, uint8_t type)
@@ -315,6 +286,104 @@ void VoxelChunk::generateMeshAsync(bool generateLighting)
         }
         
         newMesh->quads = std::move(quads);
+        
+        // Build voxel-to-quad mapping for direct manipulation
+        for (size_t quadIdx = 0; quadIdx < newMesh->quads.size(); ++quadIdx)
+        {
+            const QuadFace& quad = newMesh->quads[quadIdx];
+            int width = static_cast<int>(quad.width);
+            int height = static_cast<int>(quad.height);
+            int face = quad.faceDir;
+            
+            // Determine base voxel coordinates from corner position
+            int baseX, baseY, baseZ;
+            switch (face)
+            {
+                case 0: // -X
+                    baseX = static_cast<int>(quad.position.x);
+                    baseY = static_cast<int>(quad.position.y);
+                    baseZ = static_cast<int>(quad.position.z);
+                    break;
+                case 1: // +X
+                    baseX = static_cast<int>(quad.position.x) - 1;
+                    baseY = static_cast<int>(quad.position.y);
+                    baseZ = static_cast<int>(quad.position.z) - width;
+                    break;
+                case 2: // -Y
+                    baseX = static_cast<int>(quad.position.x);
+                    baseY = static_cast<int>(quad.position.y);
+                    baseZ = static_cast<int>(quad.position.z);
+                    break;
+                case 3: // +Y
+                    baseX = static_cast<int>(quad.position.x);
+                    baseY = static_cast<int>(quad.position.y) - 1;
+                    baseZ = static_cast<int>(quad.position.z) - height;
+                    break;
+                case 4: // -Z
+                    baseX = static_cast<int>(quad.position.x) - width;
+                    baseY = static_cast<int>(quad.position.y);
+                    baseZ = static_cast<int>(quad.position.z);
+                    break;
+                case 5: // +Z
+                    baseX = static_cast<int>(quad.position.x);
+                    baseY = static_cast<int>(quad.position.y);
+                    baseZ = static_cast<int>(quad.position.z) - 1;
+                    break;
+                default:
+                    continue;
+            }
+            
+            // Map all voxels covered by this quad
+            if (face == 0 || face == 1) // X faces: width=Z, height=Y
+            {
+                for (int dy = 0; dy < height; ++dy)
+                    for (int dz = 0; dz < width; ++dz)
+                    {
+                        int vx = baseX;
+                        int vy = baseY + dy;
+                        int vz = baseZ + dz;
+                        if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                        {
+                            int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                            uint32_t key = voxelIdx * 6 + face;
+                            newMesh->voxelFaceToQuadIndex[key] = static_cast<uint16_t>(quadIdx);
+                        }
+                    }
+            }
+            else if (face == 2 || face == 3) // Y faces: width=X, height=Z
+            {
+                for (int dz = 0; dz < height; ++dz)
+                    for (int dx = 0; dx < width; ++dx)
+                    {
+                        int vx = baseX + dx;
+                        int vy = baseY;
+                        int vz = baseZ + dz;
+                        if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                        {
+                            int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                            uint32_t key = voxelIdx * 6 + face;
+                            newMesh->voxelFaceToQuadIndex[key] = static_cast<uint16_t>(quadIdx);
+                        }
+                    }
+            }
+            else // Z faces: width=X, height=Y
+            {
+                for (int dy = 0; dy < height; ++dy)
+                    for (int dx = 0; dx < width; ++dx)
+                    {
+                        int vx = baseX + dx;
+                        int vy = baseY + dy;
+                        int vz = baseZ;
+                        if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                        {
+                            int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                            uint32_t key = voxelIdx * 6 + face;
+                            newMesh->voxelFaceToQuadIndex[key] = static_cast<uint16_t>(quadIdx);
+                        }
+                    }
+            }
+        }
+        
         promise->set_value(newMesh);
     });
 }
@@ -652,6 +721,57 @@ void VoxelChunk::explodeQuad(uint16_t quadIndex)
     std::cout << "[EXPLODE] Quad " << quadIndex << " face=" << face << " width=" << width << " height=" << height 
               << " base=(" << baseX << "," << baseY << "," << baseZ << ")\n";
     
+    // CRITICAL: Remove old mapping entries for all voxels in this quad
+    // Otherwise they'll still point to the now-deleted quad
+    if (face == 0 || face == 1) // X faces: width=Z, height=Y
+    {
+        for (int dy = 0; dy < height; ++dy)
+            for (int dz = 0; dz < width; ++dz)
+            {
+                int vx = baseX;
+                int vy = baseY + dy;
+                int vz = baseZ + dz;
+                if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                {
+                    int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                    uint32_t key = voxelIdx * 6 + face;
+                    mesh->voxelFaceToQuadIndex.erase(key);
+                }
+            }
+    }
+    else if (face == 2 || face == 3) // Y faces: width=X, height=Z
+    {
+        for (int dz = 0; dz < height; ++dz)
+            for (int dx = 0; dx < width; ++dx)
+            {
+                int vx = baseX + dx;
+                int vy = baseY;
+                int vz = baseZ + dz;
+                if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                {
+                    int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                    uint32_t key = voxelIdx * 6 + face;
+                    mesh->voxelFaceToQuadIndex.erase(key);
+                }
+            }
+    }
+    else // Z faces: width=X, height=Y
+    {
+        for (int dy = 0; dy < height; ++dy)
+            for (int dx = 0; dx < width; ++dx)
+            {
+                int vx = baseX + dx;
+                int vy = baseY + dy;
+                int vz = baseZ;
+                if (vx >= 0 && vx < SIZE && vy >= 0 && vy < SIZE && vz >= 0 && vz < SIZE)
+                {
+                    int voxelIdx = vx + vy * SIZE + vz * SIZE * SIZE;
+                    uint32_t key = voxelIdx * 6 + face;
+                    mesh->voxelFaceToQuadIndex.erase(key);
+                }
+            }
+    }
+    
     // Create 1x1 replacement quads for each voxel that still exists
     // Iterate based on face direction (industry standard: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z)
     int replacementCount = 0;
@@ -796,6 +916,264 @@ void VoxelChunk::uploadMeshToGPU()
     if (g_vulkanQuadRenderer)
     {
         g_vulkanQuadRenderer->uploadChunkMesh(this);
+    }
+}
+
+// ========================================
+// DIRECT QUAD MANIPULATION FOR BLOCK CHANGES
+// ========================================
+
+// Set voxel using direct quad manipulation (no full remesh)
+void VoxelChunk::setVoxelWithQuadManipulation(int x, int y, int z, uint8_t type)
+{
+    if (x < 0 || x >= SIZE || y < 0 || y >= SIZE || z < 0 || z >= SIZE)
+        return;
+    
+    uint8_t oldType = getVoxel(x, y, z);
+    if (oldType == type)
+        return;
+    
+    // Update voxel data
+    voxels[x + y * SIZE + z * SIZE * SIZE] = type;
+    
+    // Handle OBJ block instances
+    auto& registry = BlockTypeRegistry::getInstance();
+    const BlockTypeInfo* oldBlockInfo = registry.getBlockType(oldType);
+    const BlockTypeInfo* newBlockInfo = registry.getBlockType(type);
+    
+    if (oldBlockInfo && oldBlockInfo->renderType == BlockRenderType::OBJ) {
+        auto it = m_modelInstances.find(oldType);
+        if (it != m_modelInstances.end()) {
+            auto& instances = it->second;
+            glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+            instances.erase(std::remove(instances.begin(), instances.end(), pos), instances.end());
+        }
+    }
+    
+    if (newBlockInfo && newBlockInfo->renderType == BlockRenderType::OBJ) {
+        glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+        m_modelInstances[type].push_back(pos);
+    }
+    
+    auto mesh = getRenderMesh();
+    if (!mesh) {
+        // No mesh yet - create one
+        if (m_isClientChunk) {
+            generateMeshAsync();
+        }
+        return;
+    }
+    
+    // Check if we have the voxel-to-quad mapping
+    if (mesh->voxelFaceToQuadIndex.empty()) {
+        // No mapping - need full remesh
+        if (m_isClientChunk) {
+            generateMeshAsync();
+        }
+        return;
+    }
+    
+    // Remove old quads for this voxel
+    if (oldType != 0) {
+        removeVoxelQuads(x, y, z);
+    }
+    
+    // Add new quads for this voxel (this also handles neighbor updates)
+    if (type != 0) {
+        addVoxelQuads(x, y, z);
+    }
+    
+    mesh->needsGPUUpload = true;
+    if (m_isClientChunk) {
+        uploadMeshToGPU();
+    }
+}
+
+// Remove all quads for a voxel (used when breaking blocks)
+void VoxelChunk::removeVoxelQuads(int x, int y, int z)
+{
+    auto mesh = getRenderMesh();
+    if (!mesh)
+        return;
+    
+    int voxelIdx = x + y * SIZE + z * SIZE * SIZE;
+    
+    // For each face direction, find and explode any greedy quads containing this voxel
+    for (int face = 0; face < 6; ++face)
+    {
+        uint32_t key = voxelIdx * 6 + face;
+        auto it = mesh->voxelFaceToQuadIndex.find(key);
+        
+        if (it != mesh->voxelFaceToQuadIndex.end())
+        {
+            uint16_t quadIdx = it->second;
+            
+            // Check if this is a greedy quad (width > 1 or height > 1)
+            if (quadIdx < mesh->quads.size())
+            {
+                QuadFace& quad = mesh->quads[quadIdx];
+                bool isGreedyQuad = (quad.width > 1.0f || quad.height > 1.0f);
+                
+                if (isGreedyQuad)
+                {
+                    // Explode the greedy quad - this will:
+                    // 1. Zero out the original quad
+                    // 2. Remove ALL mapping entries for voxels in the quad
+                    // 3. Create 1x1 quads for all remaining solid exposed voxels
+                    // 4. Update the mapping for those voxels
+                    explodeQuad(quadIdx);
+                    
+                    // NOTE: explodeQuad already erased the mapping entry, don't erase again!
+                }
+                else
+                {
+                    // This is already a 1x1 quad, just zero it out and remove mapping
+                    quad.width = 0;
+                    quad.height = 0;
+                    mesh->voxelFaceToQuadIndex.erase(it);
+                }
+            }
+            else
+            {
+                // Invalid quad index, just remove the mapping
+                mesh->voxelFaceToQuadIndex.erase(it);
+            }
+        }
+    }
+    
+    mesh->isExploded[voxelIdx] = false;
+    
+    // When breaking a block, check neighbors and add faces that are now exposed
+    static const int dx[6] = {-1,  1,  0,  0,  0,  0};
+    static const int dy[6] = { 0,  0, -1,  1,  0,  0};
+    static const int dz[6] = { 0,  0,  0,  0, -1,  1};
+    static const int oppositeFace[6] = {1, 0, 3, 2, 5, 4};
+    
+    for (int face = 0; face < 6; ++face)
+    {
+        int nx = x + dx[face];
+        int ny = y + dy[face];
+        int nz = z + dz[face];
+        
+        if (nx >= 0 && nx < SIZE && ny >= 0 && ny < SIZE && nz >= 0 && nz < SIZE)
+        {
+            if (isVoxelSolid(nx, ny, nz))
+            {
+                int oppFace = oppositeFace[face];
+                int neighborVoxelIdx = nx + ny * SIZE + nz * SIZE * SIZE;
+                uint32_t neighborKey = neighborVoxelIdx * 6 + oppFace;
+                
+                // Check if neighbor already has a face in this direction
+                auto it = mesh->voxelFaceToQuadIndex.find(neighborKey);
+                
+                if (it == mesh->voxelFaceToQuadIndex.end())
+                {
+                    // Neighbor doesn't have a face pointing at us
+                    // Check if it's now exposed (it should be since we just removed this block)
+                    if (isFaceExposed(nx, ny, nz, oppFace))
+                    {
+                        // Add a new 1x1 face for the neighbor
+                        // NOTE: explodeQuad might have already created this face, so check again
+                        if (mesh->voxelFaceToQuadIndex.find(neighborKey) == mesh->voxelFaceToQuadIndex.end())
+                        {
+                            uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
+                            uint8_t neighborType = getVoxel(nx, ny, nz);
+                            addQuad(mesh->quads, static_cast<float>(nx), static_cast<float>(ny),
+                                   static_cast<float>(nz), oppFace, 1, 1, neighborType);
+                            mesh->voxelFaceToQuadIndex[neighborKey] = newQuadIdx;
+                            mesh->isExploded[neighborVoxelIdx] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Add quads for a newly placed voxel
+void VoxelChunk::addVoxelQuads(int x, int y, int z)
+{
+    auto mesh = getRenderMesh();
+    if (!mesh)
+        return;
+    
+    if (!isVoxelSolid(x, y, z))
+        return;
+    
+    uint8_t blockType = getVoxel(x, y, z);
+    int voxelIdx = x + y * SIZE + z * SIZE * SIZE;
+    
+    // Add 1x1 face for each exposed direction
+    for (int face = 0; face < 6; ++face)
+    {
+        if (isFaceExposed(x, y, z, face))
+        {
+            uint16_t newQuadIdx = static_cast<uint16_t>(mesh->quads.size());
+            addQuad(mesh->quads, static_cast<float>(x), static_cast<float>(y),
+                   static_cast<float>(z), face, 1, 1, blockType);
+            
+            uint32_t key = voxelIdx * 6 + face;
+            mesh->voxelFaceToQuadIndex[key] = newQuadIdx;
+        }
+    }
+    
+    mesh->isExploded[voxelIdx] = true;
+    
+    // When placing a block, check neighbors and explode their greedy quads if needed
+    // This handles the case where a neighbor's face is now covered
+    static const int dx[6] = {-1,  1,  0,  0,  0,  0};
+    static const int dy[6] = { 0,  0, -1,  1,  0,  0};
+    static const int dz[6] = { 0,  0,  0,  0, -1,  1};
+    static const int oppositeFace[6] = {1, 0, 3, 2, 5, 4};
+    
+    for (int face = 0; face < 6; ++face)
+    {
+        int nx = x + dx[face];
+        int ny = y + dy[face];
+        int nz = z + dz[face];
+        
+        if (nx >= 0 && nx < SIZE && ny >= 0 && ny < SIZE && nz >= 0 && nz < SIZE)
+        {
+            if (isVoxelSolid(nx, ny, nz))
+            {
+                int oppFace = oppositeFace[face];
+                int neighborVoxelIdx = nx + ny * SIZE + nz * SIZE * SIZE;
+                uint32_t neighborKey = neighborVoxelIdx * 6 + oppFace;
+                
+                auto it = mesh->voxelFaceToQuadIndex.find(neighborKey);
+                if (it != mesh->voxelFaceToQuadIndex.end())
+                {
+                    uint16_t quadIdx = it->second;
+                    
+                    // The neighbor has a face pointing at us
+                    // If it's a greedy quad, explode it and recreate individual faces
+                    if (quadIdx < mesh->quads.size())
+                    {
+                        // Check dimensions before potentially reallocating
+                        float quadWidth = mesh->quads[quadIdx].width;
+                        float quadHeight = mesh->quads[quadIdx].height;
+                        bool isGreedyQuad = (quadWidth > 1.0f || quadHeight > 1.0f);
+                        
+                        if (isGreedyQuad)
+                        {
+                            // Explode the greedy quad - it will recreate only exposed faces
+                            // NOTE: This modifies mesh->quads and may invalidate references
+                            explodeQuad(quadIdx);
+                        }
+                        else
+                        {
+                            // Single face that's now covered - just remove it
+                            if (!isFaceExposed(nx, ny, nz, oppFace))
+                            {
+                                mesh->quads[quadIdx].width = 0;
+                                mesh->quads[quadIdx].height = 0;
+                                mesh->voxelFaceToQuadIndex.erase(it);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -63,7 +63,7 @@ bool VulkanDeferred::resize(uint32_t width, uint32_t height) {
         return true;
     }
 
-    // Wait for device idle before resizing
+    // Wait for GPU before recreating G-buffer (necessary during resize)
     vkDeviceWaitIdle(m_device);
 
     // NOTE: No framebuffers to cleanup - using swapchain framebuffers
@@ -513,6 +513,7 @@ bool VulkanDeferred::bindLightingTextures(VkImageView cloudNoiseTexture) {
 void VulkanDeferred::destroy() {
     if (m_device == VK_NULL_HANDLE) return;
 
+    // Wait for GPU before destroying resources (necessary during cleanup)
     vkDeviceWaitIdle(m_device);
 
     // NOTE: No framebuffers to destroy - using swapchain framebuffers directly

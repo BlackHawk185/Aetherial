@@ -154,6 +154,7 @@ bool VulkanShadowMap::createSampler() {
 bool VulkanShadowMap::resize(uint32_t newSize) {
     if (newSize == m_size) return true;
 
+    // Wait for GPU before recreating shadow maps (necessary during resize)
     vkDeviceWaitIdle(m_device);
 
     // Cleanup existing resources
@@ -236,6 +237,7 @@ void VulkanShadowMap::transitionForShaderRead(VkCommandBuffer commandBuffer) {
 void VulkanShadowMap::destroy() {
     if (m_device == VK_NULL_HANDLE) return;
 
+    // Wait for GPU before destroying resources (necessary during cleanup)
     vkDeviceWaitIdle(m_device);
 
     if (m_shadowSampler) {

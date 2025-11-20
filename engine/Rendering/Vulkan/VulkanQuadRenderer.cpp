@@ -109,6 +109,7 @@ void VulkanQuadRenderer::shutdown() {
         return;  // Already cleaned up
     }
     
+    // Wait for GPU to finish before destroying resources (necessary during shutdown)
     vkDeviceWaitIdle(m_context->device);
 
     if (m_gbufferPipeline) {
@@ -242,14 +243,13 @@ void VulkanQuadRenderer::uploadUnitQuadData() {
 
     vkEndCommandBuffer(cmdBuffer);
 
-    // Submit and wait
+    // Submit and wait (synchronous during initialization)
     VkSubmitInfo submitInfo = {}; submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmdBuffer;
 
     vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
-
     vkFreeCommandBuffers(m_context->device, m_context->getCommandPool(), 1, &cmdBuffer);
     
     std::cout << "[VulkanQuadRenderer] Unit quad data uploaded\n";
@@ -1147,15 +1147,16 @@ void VulkanQuadRenderer::processPendingUploads() {
     
     vkEndCommandBuffer(cmdBuffer);
 
-    // Submit once for all uploads
+    vkEndCommandBuffer(cmdBuffer);
+    
+    // Submit and wait (synchronous during initialization)
     VkSubmitInfo submitInfo = {};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmdBuffer;
 
     vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_context->getGraphicsQueue());  // TODO: Use fence instead
-
+    vkQueueWaitIdle(m_context->getGraphicsQueue());
     vkFreeCommandBuffers(m_context->device, m_context->getCommandPool(), 1, &cmdBuffer);
     
     m_pendingUploads.clear();
@@ -1453,7 +1454,7 @@ bool VulkanQuadRenderer::loadBlockTextureArray() {
     
     vkEndCommandBuffer(cmdBuffer);
     
-    // Submit and wait
+    // Submit and wait (synchronous during initialization)
     VkSubmitInfo submitInfo = {};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
@@ -1461,7 +1462,6 @@ bool VulkanQuadRenderer::loadBlockTextureArray() {
     
     vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
-    
     vkFreeCommandBuffers(m_context->device, m_context->getCommandPool(), 1, &cmdBuffer);
     vmaDestroyBuffer(m_allocator, transferBuffer, transferAllocation);
     

@@ -457,6 +457,7 @@ void VulkanLightingPass::render(VkCommandBuffer commandBuffer,
 void VulkanLightingPass::destroy() {
     if (m_device == VK_NULL_HANDLE) return;
 
+    // Wait for GPU before destroying resources (necessary during cleanup)
     vkDeviceWaitIdle(m_device);
 
     if (m_shadowSampler) {

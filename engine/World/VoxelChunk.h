@@ -108,6 +108,11 @@ class VoxelChunk
     void explodeQuad(uint16_t quadIndex);
     void addSimpleFacesForVoxel(int x, int y, int z);
     void uploadMeshToGPU();
+    
+    // Direct quad manipulation for block changes (no full remesh)
+    void setVoxelWithQuadManipulation(int x, int y, int z, uint8_t type);
+    void removeVoxelQuads(int x, int y, int z);
+    void addVoxelQuads(int x, int y, int z);
 
     // **LOD AND CULLING SUPPORT**
     int calculateLOD(const glm::vec3& cameraPos) const;

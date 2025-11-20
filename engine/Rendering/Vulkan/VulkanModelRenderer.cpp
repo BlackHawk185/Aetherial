@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <chrono>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -137,37 +138,34 @@ bool VulkanModelRenderer::loadModel(uint8_t blockID, const std::string& glbPath)
     // Upload data via staging buffer
     VkCommandBuffer cmd = m_context->beginSingleTimeCommands();
     
+    VulkanBuffer vertexStaging;
+    VulkanBuffer indexStaging;
+    
     // Upload vertices
-    {
-        VulkanBuffer stagingBuffer;
-        stagingBuffer.create(m_allocator, vertexDataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
-        void* data = stagingBuffer.map();
-        memcpy(data, allVertices.data(), vertexDataSize);
-        stagingBuffer.unmap();
-        
-        VkBufferCopy copyRegion{};
-        copyRegion.size = vertexDataSize;
-        vkCmdCopyBuffer(cmd, stagingBuffer.getBuffer(), modelData.vertexBuffer->getBuffer(), 1, &copyRegion);
-        
-        stagingBuffer.destroy();
-    }
+    vertexStaging.create(m_allocator, vertexDataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
+    void* vertexData = vertexStaging.map();
+    memcpy(vertexData, allVertices.data(), vertexDataSize);
+    vertexStaging.unmap();
+    
+    VkBufferCopy vertexCopy{};
+    vertexCopy.size = vertexDataSize;
+    vkCmdCopyBuffer(cmd, vertexStaging.getBuffer(), modelData.vertexBuffer->getBuffer(), 1, &vertexCopy);
     
     // Upload indices
-    {
-        VulkanBuffer stagingBuffer;
-        stagingBuffer.create(m_allocator, indexDataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
-        void* data = stagingBuffer.map();
-        memcpy(data, allIndices.data(), indexDataSize);
-        stagingBuffer.unmap();
-        
-        VkBufferCopy copyRegion{};
-        copyRegion.size = indexDataSize;
-        vkCmdCopyBuffer(cmd, stagingBuffer.getBuffer(), modelData.indexBuffer->getBuffer(), 1, &copyRegion);
-        
-        stagingBuffer.destroy();
-    }
+    indexStaging.create(m_allocator, indexDataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
+    void* indexData = indexStaging.map();
+    memcpy(indexData, allIndices.data(), indexDataSize);
+    indexStaging.unmap();
+    
+    VkBufferCopy indexCopy{};
+    indexCopy.size = indexDataSize;
+    vkCmdCopyBuffer(cmd, indexStaging.getBuffer(), modelData.indexBuffer->getBuffer(), 1, &indexCopy);
     
     m_context->endSingleTimeCommands(cmd);
+    
+    // Now safe to destroy staging buffers
+    vertexStaging.destroy();
+    indexStaging.destroy();
     
     modelData.indexCount = allIndices.size();
     m_models[blockID] = std::move(modelData);
@@ -249,33 +247,32 @@ void VulkanModelRenderer::createMagentaCube(uint8_t blockID) {
     // Upload via staging
     VkCommandBuffer cmd = m_context->beginSingleTimeCommands();
     
-    {
-        VulkanBuffer staging;
-        staging.create(m_allocator, vertexDataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
-        void* data = staging.map();
-        memcpy(data, cubeVertices, vertexDataSize);
-        staging.unmap();
-        
-        VkBufferCopy copyRegion{};
-        copyRegion.size = vertexDataSize;
-        vkCmdCopyBuffer(cmd, staging.getBuffer(), modelData.vertexBuffer->getBuffer(), 1, &copyRegion);
-        staging.destroy();
-    }
+    VulkanBuffer vertexStaging;
+    VulkanBuffer indexStaging;
     
-    {
-        VulkanBuffer staging;
-        staging.create(m_allocator, indexDataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
-        void* data = staging.map();
-        memcpy(data, cubeIndices, indexDataSize);
-        staging.unmap();
-        
-        VkBufferCopy copyRegion{};
-        copyRegion.size = indexDataSize;
-        vkCmdCopyBuffer(cmd, staging.getBuffer(), modelData.indexBuffer->getBuffer(), 1, &copyRegion);
-        staging.destroy();
-    }
+    vertexStaging.create(m_allocator, vertexDataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
+    void* vertexData = vertexStaging.map();
+    memcpy(vertexData, cubeVertices, vertexDataSize);
+    vertexStaging.unmap();
+    
+    VkBufferCopy vertexCopy{};
+    vertexCopy.size = vertexDataSize;
+    vkCmdCopyBuffer(cmd, vertexStaging.getBuffer(), modelData.vertexBuffer->getBuffer(), 1, &vertexCopy);
+    
+    indexStaging.create(m_allocator, indexDataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
+    void* indexData = indexStaging.map();
+    memcpy(indexData, cubeIndices, indexDataSize);
+    indexStaging.unmap();
+    
+    VkBufferCopy indexCopy{};
+    indexCopy.size = indexDataSize;
+    vkCmdCopyBuffer(cmd, indexStaging.getBuffer(), modelData.indexBuffer->getBuffer(), 1, &indexCopy);
     
     m_context->endSingleTimeCommands(cmd);
+    
+    // Now safe to destroy staging buffers
+    vertexStaging.destroy();
+    indexStaging.destroy();
     
     m_models[blockID] = std::move(modelData);
     
@@ -300,7 +297,8 @@ void VulkanModelRenderer::updateChunkInstances(VoxelChunk* chunk, uint32_t islan
         if (positions.empty()) continue;
         
         std::cout << "[ModelRenderer] Found " << positions.size() << " instances of BlockID " << (int)blockID 
-                  << " (" << info->name << ") in chunk at " << chunkOffset.x << "," << chunkOffset.y << "," << chunkOffset.z << std::endl;
+                  << " (" << info->name << ") in chunk at " << chunkOffset.x << "," << chunkOffset.y << "," << chunkOffset.z 
+                  << " islandID=" << islandID << std::endl;
         
         // Load model if not already loaded
         if (m_models.find(blockID) == m_models.end()) {
@@ -316,6 +314,8 @@ void VulkanModelRenderer::updateChunkInstances(VoxelChunk* chunk, uint32_t islan
             InstanceData inst;
             inst.position = chunkOffset + localPos;
             inst.islandID = islandID;
+            inst.blockID = blockID;
+            inst.padding = 0;
             batch.instances.push_back(inst);
         }
         
@@ -393,8 +393,17 @@ void VulkanModelRenderer::renderToGBuffer(VkCommandBuffer cmd, const glm::mat4& 
         return;
     }
     
-    std::cout << "[ModelRenderer] Rendering " << m_instanceData.size() << " instances from " << m_chunkBatches.size() << " chunks" << std::endl;
+    // Bind instance buffer (shared by both pipelines)
+    VkBuffer instanceBuffers[] = { m_instanceBuffer->getBuffer() };
+    VkDeviceSize offsets[] = { 0 };
+    vkCmdBindVertexBuffers(cmd, 1, 1, instanceBuffers, offsets);
     
+    // Get current time for animations
+    static auto startTime = std::chrono::high_resolution_clock::now();
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    float time = std::chrono::duration<float>(currentTime - startTime).count();
+    
+    // Bind pipeline once (single unified pipeline)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
     
     if (m_descriptorSet != VK_NULL_HANDLE) {
@@ -402,14 +411,15 @@ void VulkanModelRenderer::renderToGBuffer(VkCommandBuffer cmd, const glm::mat4& 
                                0, 1, &m_descriptorSet, 0, nullptr);
     }
     
-    // Push constants: viewProjection matrix
-    vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                      0, sizeof(glm::mat4), &viewProjection);
+    // Push constants: mat4 viewProjection + float time (all models)
+    struct alignas(16) PushConstants {
+        glm::mat4 viewProjection;  // 64 bytes
+        float time;                // 4 bytes
+        float padding[3];          // 12 bytes padding
+    } pushConstants = { viewProjection, time, {0,0,0} };
     
-    // Bind instance buffer
-    VkBuffer instanceBuffers[] = { m_instanceBuffer->getBuffer() };
-    VkDeviceSize offsets[] = { 0 };
-    vkCmdBindVertexBuffers(cmd, 1, 1, instanceBuffers, offsets);
+    vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                      0, sizeof(PushConstants), &pushConstants);
     
     // Draw each model type
     uint32_t instanceOffset = 0;
@@ -568,7 +578,7 @@ void VulkanModelRenderer::createPipeline() {
     bindings[1].stride = sizeof(InstanceData);
     bindings[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
     
-    VkVertexInputAttributeDescription attributes[5];
+    VkVertexInputAttributeDescription attributes[6];
     // Stream 0: model attributes
     attributes[0].binding = 0;
     attributes[0].location = 0;
@@ -596,11 +606,16 @@ void VulkanModelRenderer::createPipeline() {
     attributes[4].format = VK_FORMAT_R32_UINT;  // instance island ID
     attributes[4].offset = 3 * sizeof(float);
     
+    attributes[5].binding = 1;
+    attributes[5].location = 5;
+    attributes[5].format = VK_FORMAT_R32_UINT;  // instance block ID
+    attributes[5].offset = 4 * sizeof(float);
+    
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
     vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vertexInputInfo.vertexBindingDescriptionCount = 2;
     vertexInputInfo.pVertexBindingDescriptions = bindings;
-    vertexInputInfo.vertexAttributeDescriptionCount = 5;
+    vertexInputInfo.vertexAttributeDescriptionCount = 6;
     vertexInputInfo.pVertexAttributeDescriptions = attributes;
     
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
@@ -664,11 +679,11 @@ void VulkanModelRenderer::createPipeline() {
     colorBlending.attachmentCount = 4;
     colorBlending.pAttachments = colorBlendAttachments;
     
-    // Push constants
+    // Push constants: mat4 viewProjection + float time + padding (80 bytes total)
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(glm::mat4);
+    pushConstantRange.size = 80;  // mat4(64) + float(4) + padding(12)
     
     // Pipeline layout
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
@@ -710,3 +725,5 @@ void VulkanModelRenderer::createPipeline() {
     
     std::cout << "✓ VulkanModelRenderer pipeline created" << std::endl;
 }
+
+

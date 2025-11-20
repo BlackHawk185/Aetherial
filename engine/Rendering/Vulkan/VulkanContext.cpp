@@ -1,6 +1,7 @@
 #include "VulkanContext.h"
 #include <VkBootstrap.h>
 #include <iostream>
+#include <fstream>
 #include <set>
 #include <algorithm>
 
@@ -861,6 +862,26 @@ void VulkanContext::cleanup() {
     
     cleanupSwapchain();
     
+    // Save pipeline cache to disk for next launch
+    if (m_pipelineCache != VK_NULL_HANDLE) {
+        size_t cacheSize = 0;
+        vkGetPipelineCacheData(m_device, m_pipelineCache, &cacheSize, nullptr);
+        if (cacheSize > 0) {
+            std::vector<char> cacheData(cacheSize);
+            if (vkGetPipelineCacheData(m_device, m_pipelineCache, &cacheSize, cacheData.data()) == VK_SUCCESS) {
+                std::ofstream cacheFile("pipeline_cache.bin", std::ios::binary);
+                if (cacheFile.is_open()) {
+                    cacheFile.write(cacheData.data(), cacheSize);
+                    cacheFile.close();
+                    std::cout << "[Vulkan] Saved pipeline cache to disk (" << cacheSize << " bytes)\n";
+                }
+            }
+        }
+        vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
+        m_pipelineCache = VK_NULL_HANDLE;
+        pipelineCache = VK_NULL_HANDLE;
+    }
+    
     if (descriptorPool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(m_device, descriptorPool, nullptr);
         descriptorPool = VK_NULL_HANDLE;
@@ -905,6 +926,21 @@ void VulkanContext::cleanup() {
 bool VulkanContext::createPipelineCache() {
     VkPipelineCacheCreateInfo cacheInfo{};
     cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    
+    // Try to load cached pipeline data from disk
+    std::vector<char> cacheData;
+    std::ifstream cacheFile("pipeline_cache.bin", std::ios::binary | std::ios::ate);
+    if (cacheFile.is_open()) {
+        size_t fileSize = static_cast<size_t>(cacheFile.tellg());
+        cacheFile.seekg(0);
+        cacheData.resize(fileSize);
+        cacheFile.read(cacheData.data(), fileSize);
+        cacheFile.close();
+        
+        cacheInfo.initialDataSize = cacheData.size();
+        cacheInfo.pInitialData = cacheData.data();
+        std::cout << "[Vulkan] Loaded pipeline cache from disk (" << fileSize << " bytes)\n";
+    }
     
     if (vkCreatePipelineCache(m_device, &cacheInfo, nullptr, &m_pipelineCache) != VK_SUCCESS) {
         std::cerr << "[Vulkan] Failed to create pipeline cache\n";

@@ -97,6 +97,7 @@ bool VulkanSSR::resize(uint32_t width, uint32_t height) {
         return true;
     }
 
+    // Wait for GPU before recreating image (necessary during resize)
     vkDeviceWaitIdle(m_device);
 
     m_reflectionImage.destroy();
@@ -118,6 +119,7 @@ bool VulkanSSR::resize(uint32_t width, uint32_t height) {
 void VulkanSSR::destroy() {
     if (m_device == VK_NULL_HANDLE) return;
 
+    // Wait for GPU before destroying resources (necessary during cleanup)
     vkDeviceWaitIdle(m_device);
 
     if (m_descriptorPool) vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);

@@ -720,6 +720,16 @@ void GameClient::renderVulkan()
     }
     
     // ========================================
+    // PASS 1.5: SCREEN SPACE REFLECTIONS (Compute SSR from G-buffer)
+    // ========================================
+    if (m_vulkanDeferred)
+    {
+        // Use G-buffer albedo as color input for SSR (it has SAMPLED_BIT unlike swapchain)
+        VkImageView colorBuffer = m_vulkanDeferred->getAlbedoView();
+        m_vulkanDeferred->computeSSR(cmd, colorBuffer, viewMatrix, projectionMatrix);
+    }
+    
+    // ========================================
     // PASS 2: LIGHTING (Read G-buffer, write to swapchain)
     // ========================================
     
@@ -1407,7 +1417,7 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
         if (m_vulkanModelRenderer) {
             m_vulkanModelRenderer->updateChunkInstances(chunk, islandID, chunkOffset);
         }
-        
+
         // Generate mesh async - uploads when ready
         chunk->generateMeshAsync();
         m_chunksWithPendingMeshes.push_back(chunk);

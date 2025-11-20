@@ -100,6 +100,7 @@ public:
     VkDescriptorSetLayout getGeometryDescriptorLayout() const { return m_geometryDescriptorLayout; }
     VkDescriptorSet getGBufferDescriptorSet() const { return m_lightingDescriptorSet; }
     VkImageView getDepthView() const { return m_gbuffer.getDepthView(); }
+    VkImageView getAlbedoView() const { return m_gbuffer.getAlbedoView(); }
     
     uint32_t getWidth() const { return m_width; }
     uint32_t getHeight() const { return m_height; }

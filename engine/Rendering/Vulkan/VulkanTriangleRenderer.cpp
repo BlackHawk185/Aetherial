@@ -282,7 +282,6 @@ bool VulkanTriangleRenderer::createVertexBuffer() {
     
     vkQueueSubmit(m_context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
     vkQueueWaitIdle(m_context->getGraphicsQueue());
-    
     vkFreeCommandBuffers(m_context->getDevice(), m_context->getCommandPool(), 1, &commandBuffer);
     
     std::cout << "[Vulkan] ✅ Vertex buffer created (discrete GPU, DEVICE_LOCAL, 3 vertices)\n";
