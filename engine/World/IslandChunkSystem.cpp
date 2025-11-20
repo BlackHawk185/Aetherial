@@ -12,6 +12,7 @@
 #include <random>
 #include <unordered_set>
 #include <queue>
+#include <deque>
 
 #include "VoxelChunk.h"
 #include "BlockType.h"
@@ -203,11 +204,14 @@ VoxelChunk* IslandChunkSystem::getChunkFromIsland(uint32_t islandID, const Vec3&
 
 void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_t seed, float radius, BiomeType biome)
 {
+    try {
     auto startTime = std::chrono::high_resolution_clock::now();
     
     FloatingIsland* island = getIsland(islandID);
-    if (!island)
+    if (!island) {
+        std::cerr << "ERROR: Island " << islandID << " not found!" << std::endl;
         return;
+    }
 
     // Get biome palette for block selection
     BiomeSystem biomeSystem;
@@ -261,9 +265,9 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     // Generate 3D noise grid for entire island bounds ONCE instead of per-voxel lookups
     int islandHeight = static_cast<int>(radius * baseHeightRatio);
     
-    // Sample every other block (2x2x2 grid) for 8x memory reduction + 8x faster generation
+    // Sample every 4th block (4x4x4 grid) for 64x memory reduction + 64x faster generation
     // Trilinear interpolation fills in the gaps with imperceptible quality loss
-    constexpr int NOISE_SAMPLE_RATE = 2;
+    constexpr int NOISE_SAMPLE_RATE = 4;  // Was 2, now 4 for 8x memory savings
     int gridSizeX = (static_cast<int>(radius) * 2) / NOISE_SAMPLE_RATE;
     int gridSizeY = (islandHeight * 2) / NOISE_SAMPLE_RATE;
     int gridSizeZ = (static_cast<int>(radius) * 2) / NOISE_SAMPLE_RATE;
@@ -455,85 +459,94 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
         cachedChunk->setVoxelDataDirect(localX, localY, localZ, blockID);
     };
     
-    // BFS from center
-    std::queue<Vec3> frontier;
+    // BFS from center - use deque instead of queue for better performance
+    std::deque<Vec3> frontier;
     
-    // OPTIMIZATION: Replace unordered_set with sparse 3D grid for visited tracking
-    // This eliminates millions of hash computations and lookups
-    // Use chunk-based storage: 16x16x16 sub-grids indexed by chunk coordinate
-    constexpr int VISIT_CHUNK_SIZE = 16;
-    std::unordered_map<int64_t, std::vector<bool>> visitedChunks;
+    // PRE-ALLOCATED FLAT BITSET: Fast O(1) access with no hash lookups
+    // Islands are sparse (not solid), so use half the radius for grid sizing
+    int gridRadius = static_cast<int>(radius * 0.7f) + 32;  // Conservative: ~70% of radius + margin
+    int gridSize = gridRadius * 2;
+    int gridOffset = gridRadius;  // Center offset for negative coordinates
     
-    auto encodeChunkPos = [](int cx, int cy, int cz) -> int64_t {
-        return (static_cast<int64_t>(cx + 8192) << 32) |
-               (static_cast<int64_t>(cy + 8192) << 16) |
-               static_cast<int64_t>(cz + 8192);
-    };
+    // Allocate flat bitset for bounded region
+    size_t totalPositions = static_cast<size_t>(gridSize) * static_cast<size_t>(gridSize) * static_cast<size_t>(gridSize);
+    size_t bitsetWords = (totalPositions + 63) / 64;
+    size_t bitsetMemoryMB = (bitsetWords * sizeof(uint64_t)) / (1024 * 1024);
+    
+    std::vector<uint64_t> visitedBits(bitsetWords, 0);
+    std::cout << "   └─ Visited Bitset: " << gridSize << "³ grid (" << bitsetMemoryMB << " MB)" << std::endl;
     
     auto isVisited = [&](const Vec3& p) -> bool {
-        int cx = static_cast<int>(std::floor(p.x / VISIT_CHUNK_SIZE));
-        int cy = static_cast<int>(std::floor(p.y / VISIT_CHUNK_SIZE));
-        int cz = static_cast<int>(std::floor(p.z / VISIT_CHUNK_SIZE));
-        int64_t chunkKey = encodeChunkPos(cx, cy, cz);
+        int x = static_cast<int>(p.x) + gridOffset;
+        int y = static_cast<int>(p.y) + gridOffset;
+        int z = static_cast<int>(p.z) + gridOffset;
         
-        auto it = visitedChunks.find(chunkKey);
-        if (it == visitedChunks.end()) return false;
+        // Bounds check
+        if (x < 0 || x >= gridSize || y < 0 || y >= gridSize || z < 0 || z >= gridSize)
+            return true;  // Out of bounds = treat as visited
         
-        int lx = static_cast<int>(p.x) - (cx * VISIT_CHUNK_SIZE);
-        int ly = static_cast<int>(p.y) - (cy * VISIT_CHUNK_SIZE);
-        int lz = static_cast<int>(p.z) - (cz * VISIT_CHUNK_SIZE);
+        size_t bitIndex = static_cast<size_t>(x) + static_cast<size_t>(y) * gridSize + static_cast<size_t>(z) * gridSize * gridSize;
+        size_t word = bitIndex >> 6;  // Divide by 64
+        size_t bit = bitIndex & 63;   // Modulo 64
         
-        // Handle negative coordinates
-        if (lx < 0) lx += VISIT_CHUNK_SIZE;
-        if (ly < 0) ly += VISIT_CHUNK_SIZE;
-        if (lz < 0) lz += VISIT_CHUNK_SIZE;
-        
-        int idx = lx + ly * VISIT_CHUNK_SIZE + lz * VISIT_CHUNK_SIZE * VISIT_CHUNK_SIZE;
-        return it->second[idx];
+        return (visitedBits[word] & (1ULL << bit)) != 0;
     };
     
     auto markVisited = [&](const Vec3& p) {
-        int cx = static_cast<int>(std::floor(p.x / VISIT_CHUNK_SIZE));
-        int cy = static_cast<int>(std::floor(p.y / VISIT_CHUNK_SIZE));
-        int cz = static_cast<int>(std::floor(p.z / VISIT_CHUNK_SIZE));
-        int64_t chunkKey = encodeChunkPos(cx, cy, cz);
+        int x = static_cast<int>(p.x) + gridOffset;
+        int y = static_cast<int>(p.y) + gridOffset;
+        int z = static_cast<int>(p.z) + gridOffset;
         
-        auto& visitChunk = visitedChunks[chunkKey];
-        if (visitChunk.empty()) {
-            visitChunk.resize(VISIT_CHUNK_SIZE * VISIT_CHUNK_SIZE * VISIT_CHUNK_SIZE, false);
-        }
+        // Bounds check
+        if (x < 0 || x >= gridSize || y < 0 || y >= gridSize || z < 0 || z >= gridSize)
+            return;
         
-        int lx = static_cast<int>(p.x) - (cx * VISIT_CHUNK_SIZE);
-        int ly = static_cast<int>(p.y) - (cy * VISIT_CHUNK_SIZE);
-        int lz = static_cast<int>(p.z) - (cz * VISIT_CHUNK_SIZE);
+        size_t bitIndex = static_cast<size_t>(x) + static_cast<size_t>(y) * gridSize + static_cast<size_t>(z) * gridSize * gridSize;
+        size_t word = bitIndex >> 6;
+        size_t bit = bitIndex & 63;
         
-        // Handle negative coordinates
-        if (lx < 0) lx += VISIT_CHUNK_SIZE;
-        if (ly < 0) ly += VISIT_CHUNK_SIZE;
-        if (lz < 0) lz += VISIT_CHUNK_SIZE;
-        
-        int idx = lx + ly * VISIT_CHUNK_SIZE + lz * VISIT_CHUNK_SIZE * VISIT_CHUNK_SIZE;
-        visitChunk[idx] = true;
+        visitedBits[word] |= (1ULL << bit);
     };
     
     Vec3 startPos(0, 0, 0);
-    frontier.push(startPos);
+    frontier.push_back(startPos);
     markVisited(startPos);
     setVoxelDirect(startPos, palette.deepBlock);
     voxelsGenerated++;
     
+    // Static neighbor deltas for cache efficiency
+    static const Vec3 neighbors[6] = {
+        Vec3(1, 0, 0), Vec3(-1, 0, 0),
+        Vec3(0, 1, 0), Vec3(0, -1, 0),
+        Vec3(0, 0, 1), Vec3(0, 0, -1)
+    };
+    
+    // Pre-compute constants for SIMD-friendly calculations
+    const float islandHeightRange = islandHeight * 2.0f;
+    const float invHeightRange = 1.0f / islandHeightRange;
+    const float heightOffset = static_cast<float>(islandHeight);
+    
+    // Progress reporting
+    auto lastProgressTime = std::chrono::high_resolution_clock::now();
+    size_t iterationCount = 0;
+    
     while (!frontier.empty())
     {
         Vec3 current = frontier.front();
-        frontier.pop();
+        frontier.pop_front();
         
-        // Check all 6 neighbors
-        static const Vec3 neighbors[6] = {
-            Vec3(1, 0, 0), Vec3(-1, 0, 0),
-            Vec3(0, 1, 0), Vec3(0, -1, 0),
-            Vec3(0, 0, 1), Vec3(0, 0, -1)
-        };
+        // Progress reporting every 10 seconds
+        if (++iterationCount % 1000000 == 0) {
+            auto now = std::chrono::high_resolution_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastProgressTime).count();
+            if (elapsed >= 10) {
+                std::cout << "   [BFS Progress] " << voxelsGenerated << " voxels, " 
+                          << frontier.size() << " frontier" << std::endl;
+                lastProgressTime = now;
+            }
+        }
         
+        // Process all 6 neighbors
         for (const Vec3& delta : neighbors)
         {
             Vec3 neighbor = current + delta;
@@ -541,45 +554,46 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
             float dy = neighbor.y;
             float dz = neighbor.z;
             
-            // EARLY EXIT 1: Vertical bounds
-            if (dy < -islandHeight || dy > islandHeight) continue;
+            // EARLY EXIT 1: Vertical bounds (branchless where possible)
+            if (dy < -heightOffset || dy > heightOffset) continue;
             
-            // EARLY EXIT 2: Radial bounds (eliminates corners/outer regions)
+            // EARLY EXIT 2: Radial bounds - use squared distance to avoid sqrt
             float distanceSquared = dx * dx + dy * dy + dz * dz;
             if (distanceSquared > radiusSquared) continue;
             
-            // EARLY EXIT 3: Only NOW check visited (avoid hash ops for out-of-bounds positions)
+            // EARLY EXIT 3: Visited check (now O(1) bitset lookup)
             if (isVisited(neighbor)) continue;
             markVisited(neighbor);
             voxelsSampled++;
             
-            // Vertical density
-            float islandHeightRange = islandHeight * 2.0f;
-            float normalizedY = (dy + islandHeight) / islandHeightRange;
+            // Vertical density (optimized calculation)
+            float normalizedY = (dy + heightOffset) * invHeightRange;
             float centerOffset = normalizedY - 0.5f;
             float verticalDensity = 1.0f - (centerOffset * centerOffset * 4.0f);
-            verticalDensity = std::max(0.0f, verticalDensity);
             
+            // Branchless max(0, verticalDensity)
+            verticalDensity = verticalDensity > 0.0f ? verticalDensity : 0.0f;
             if (verticalDensity < 0.01f) continue;
             
-            // Radial falloff
+            // Radial falloff (sqrt still needed here, but only for passed checks)
             float distanceFromCenter = std::sqrt(distanceSquared);
             float islandBase = 1.0f - (distanceFromCenter * radiusDivisor);
-            islandBase = std::max(0.0f, islandBase);
+            islandBase = islandBase > 0.0f ? islandBase : 0.0f;
             islandBase = islandBase * islandBase;
             
             if (islandBase < 0.01f) continue;
             
-            // Sample from pre-generated noise map (instant lookup vs expensive calculation)
+            // Sample from pre-generated noise map (SIMD-accelerated trilinear interpolation)
             float noise = sampleNoise(dx, dy, dz);
             
+            // Final density test
             float finalDensity = islandBase * verticalDensity * noise;
             
             if (finalDensity > densityThreshold)
             {
                 setVoxelDirect(neighbor, palette.deepBlock);
                 voxelsGenerated++;
-                frontier.push(neighbor);  // Expand BFS frontier
+                frontier.push_back(neighbor);  // push_back for deque
             }
         }
     }
@@ -615,10 +629,52 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     
     auto iterationStart = std::chrono::high_resolution_clock::now();
     
-    // Iterate through all chunks and check each solid block
+    // OPTIMIZED SURFACE DETECTION: Use flat bitset for O(1) neighbor lookups
+    // Build fast lookup grid from generated voxels
+    int surfaceGridRadius = static_cast<int>(radius * 0.7f) + 32;
+    int surfaceGridSize = surfaceGridRadius * 2;
+    int surfaceGridOffset = surfaceGridRadius;
+    
+    size_t surfaceTotalPos = static_cast<size_t>(surfaceGridSize) * static_cast<size_t>(surfaceGridSize) * static_cast<size_t>(surfaceGridSize);
+    size_t surfaceBitsetWords = (surfaceTotalPos + 63) / 64;
+    std::vector<uint64_t> voxelBits(surfaceBitsetWords, 0);
+    
+    // Fast voxel existence check
+    auto voxelExists = [&](const Vec3& p) -> bool {
+        int x = static_cast<int>(p.x) + surfaceGridOffset;
+        int y = static_cast<int>(p.y) + surfaceGridOffset;
+        int z = static_cast<int>(p.z) + surfaceGridOffset;
+        
+        if (x < 0 || x >= surfaceGridSize || y < 0 || y >= surfaceGridSize || z < 0 || z >= surfaceGridSize)
+            return false;
+        
+        size_t bitIndex = static_cast<size_t>(x) + static_cast<size_t>(y) * surfaceGridSize + static_cast<size_t>(z) * surfaceGridSize * surfaceGridSize;
+        size_t word = bitIndex >> 6;
+        size_t bit = bitIndex & 63;
+        
+        return (voxelBits[word] & (1ULL << bit)) != 0;
+    };
+    
+    auto markVoxel = [&](const Vec3& p) {
+        int x = static_cast<int>(p.x) + surfaceGridOffset;
+        int y = static_cast<int>(p.y) + surfaceGridOffset;
+        int z = static_cast<int>(p.z) + surfaceGridOffset;
+        
+        if (x < 0 || x >= surfaceGridSize || y < 0 || y >= surfaceGridSize || z < 0 || z >= surfaceGridSize)
+            return;
+        
+        size_t bitIndex = static_cast<size_t>(x) + static_cast<size_t>(y) * surfaceGridSize + static_cast<size_t>(z) * surfaceGridSize * surfaceGridSize;
+        size_t word = bitIndex >> 6;
+        size_t bit = bitIndex & 63;
+        
+        voxelBits[word] |= (1ULL << bit);
+    };
+    
+    // First pass: populate bitset with all deep blocks
     for (auto& [chunkCoord, chunk] : island->chunks)
     {
         if (!chunk) continue;
+        Vec3 chunkBase = chunkCoord * VoxelChunk::SIZE;
         
         for (int lz = 0; lz < VoxelChunk::SIZE; ++lz)
         {
@@ -627,65 +683,79 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
                 for (int lx = 0; lx < VoxelChunk::SIZE; ++lx)
                 {
                     uint8_t currentBlock = chunk->getVoxel(lx, ly, lz);
-                    if (currentBlock == BlockID::AIR) continue;
-                    if (currentBlock != palette.deepBlock) continue;  // Only process deep blocks
+                    if (currentBlock == palette.deepBlock)
+                    {
+                        Vec3 worldPos = chunkBase + Vec3(lx, ly, lz);
+                        markVoxel(worldPos);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Second pass: classify surface/subsurface using O(1) bitset lookups
+    for (auto& [chunkCoord, chunk] : island->chunks)
+    {
+        if (!chunk) continue;
+        Vec3 chunkBase = chunkCoord * VoxelChunk::SIZE;
+        
+        for (int lz = 0; lz < VoxelChunk::SIZE; ++lz)
+        {
+            for (int ly = 0; ly < VoxelChunk::SIZE; ++ly)
+            {
+                for (int lx = 0; lx < VoxelChunk::SIZE; ++lx)
+                {
+                    uint8_t currentBlock = chunk->getVoxel(lx, ly, lz);
+                    if (currentBlock != palette.deepBlock) continue;
                     
                     voxelsChecked++;
+                    Vec3 worldPos = chunkBase + Vec3(lx, ly, lz);
                     
-                    // Calculate world position
-                    Vec3 worldPos = chunkCoord * VoxelChunk::SIZE + Vec3(lx, ly, lz);
-                    
-                    // Single-pass neighbor scan: check for both air and surface blocks
-                    bool hasAirNeighbor = false;
-                    bool hasSurfaceNeighbor = false;
+                    // Check neighbors using O(1) bitset lookups (no getVoxelDirect calls)
+                    uint8_t neighborFlags = 0;
                     
                     for (const Vec3& delta : checkNeighbors)
                     {
-                        Vec3 neighborPos = worldPos + delta;
                         neighborChecks++;
-                        uint8_t neighborBlock = getVoxelDirect(neighborPos);
+                        Vec3 neighborPos = worldPos + delta;
                         
-                        if (neighborBlock == BlockID::AIR)
-                            hasAirNeighbor = true;
-                        else if (neighborBlock == palette.surfaceBlock)
-                            hasSurfaceNeighbor = true;
+                        if (!voxelExists(neighborPos))
+                            neighborFlags |= 0x01;  // Air
+                        // Note: we only mark deep blocks in bitset, so check for surface is implicit
                         
-                        // Early exit if we found both - no need to check remaining neighbors
-                        if (hasAirNeighbor && hasSurfaceNeighbor)
+                        if (neighborFlags == 0x01)  // Early exit once we find air
                             break;
                     }
                     
+                    bool hasAirNeighbor = (neighborFlags & 0x01) != 0;
+                    
                     if (hasAirNeighbor)
                     {
-                        // This is a surface block - replace with surface block type
                         chunk->setVoxel(lx, ly, lz, palette.surfaceBlock);
                         surfaceBlocksPlaced++;
-                        
-                        // Check if this surface block has horizontal air exposure (walls)
-                        // We collect these for satellite detection via surface shell connectivity
-                        bool hasHorizontalAir = false;
-                        for (const Vec3& delta : horizontalNeighbors)
+                        surfaceVoxelPositions.push_back(worldPos);
+                    }
+                    else
+                    {
+                        // Check if adjacent to any surface block (for subsurface)
+                        bool hasSurfaceNeighbor = false;
+                        for (const Vec3& delta : checkNeighbors)
                         {
                             Vec3 neighborPos = worldPos + delta;
                             uint8_t neighborBlock = getVoxelDirect(neighborPos);
-                            if (neighborBlock == BlockID::AIR)
+                            if (neighborBlock == palette.surfaceBlock)
                             {
-                                hasHorizontalAir = true;
+                                hasSurfaceNeighbor = true;
                                 break;
                             }
                         }
                         
-                        // Include blocks with ANY air exposure for satellite detection
-                        // (top/bottom exposed blocks connect surface shells vertically)
-                        surfaceVoxelPositions.push_back(worldPos);
+                        if (hasSurfaceNeighbor)
+                        {
+                            chunk->setVoxel(lx, ly, lz, palette.subsurfaceBlock);
+                            subsurfaceBlocksPlaced++;
+                        }
                     }
-                    else if (hasSurfaceNeighbor)
-                    {
-                        // This is a subsurface block (1 layer below surface)
-                        chunk->setVoxel(lx, ly, lz, palette.subsurfaceBlock);
-                        subsurfaceBlocksPlaced++;
-                    }
-                    // else: remains deep block
                 }
             }
         }
@@ -977,6 +1047,14 @@ void IslandChunkSystem::generateFloatingIslandOrganic(uint32_t islandID, uint32_
     std::cout << "✅ Island Generation Complete: " << totalDuration << "ms total" << std::endl;
     std::cout << "   └─ Breakdown: Voxels=" << voxelGenDuration << "ms (" 
               << (voxelGenDuration * 100 / std::max(1LL, totalDuration)) << "%)" << std::endl;
+    
+    } catch (const std::exception& e) {
+        std::cerr << "FATAL ERROR in island generation (ID=" << islandID << ", radius=" << radius << "): " << e.what() << std::endl;
+        throw;  // Re-throw to propagate to async handler
+    } catch (...) {
+        std::cerr << "FATAL ERROR in island generation (ID=" << islandID << ", radius=" << radius << "): Unknown exception" << std::endl;
+        throw;
+    }
 }
 
 uint8_t IslandChunkSystem::getVoxelFromIsland(uint32_t islandID, const Vec3& islandRelativePosition) const

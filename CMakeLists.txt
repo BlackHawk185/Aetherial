@@ -55,6 +55,9 @@ set(REQUIRED_VULKAN_SHADERS
     highlight.frag
     clouds.vert
     clouds.frag
+    ssr.comp
+    model_instance.vert
+    model_instance.frag
 )
 
 # Verify all required shaders exist in source

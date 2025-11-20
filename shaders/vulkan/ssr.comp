@@ -1,0 +1,111 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// G-buffer inputs
+layout(set = 0, binding = 0) uniform sampler2D gNormal;
+layout(set = 0, binding = 1) uniform sampler2D gPosition;
+layout(set = 0, binding = 2) uniform sampler2D gDepth;
+layout(set = 0, binding = 3) uniform sampler2D gMetadata;
+layout(set = 0, binding = 4) uniform sampler2D colorBuffer;
+
+// Output
+layout(set = 0, binding = 5, rgba16f) uniform image2D outputImage;
+
+// Uniforms
+layout(push_constant) uniform SSRParams {
+    mat4 viewMatrix;
+    mat4 projectionMatrix;
+    mat4 invViewMatrix;
+    mat4 invProjectionMatrix;
+} ssr;
+
+const float MAX_DISTANCE = 100.0;
+const int MAX_STEPS = 64;
+const float THICKNESS = 0.5;
+const float STRIDE = 1.0;
+const float JITTER = 0.25;
+
+vec3 viewSpaceFromDepth(vec2 uv, float depth) {
+    vec4 clipSpace = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec4 viewSpace = ssr.invProjectionMatrix * clipSpace;
+    return viewSpace.xyz / viewSpace.w;
+}
+
+bool rayMarch(vec3 rayOrigin, vec3 rayDir, out vec2 hitUV, out float hitDepth) {
+    vec3 rayStep = rayDir * STRIDE / float(MAX_STEPS);
+    vec3 currentPos = rayOrigin;
+    
+    for (int i = 0; i < MAX_STEPS; i++) {
+        currentPos += rayStep;
+        
+        vec4 projectedPos = ssr.projectionMatrix * vec4(currentPos, 1.0);
+        projectedPos.xyz /= projectedPos.w;
+        
+        vec2 sampleUV = projectedPos.xy * 0.5 + 0.5;
+        
+        if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0) {
+            return false;
+        }
+        
+        float sampleDepth = texture(gDepth, sampleUV).r;
+        vec3 sampleViewPos = viewSpaceFromDepth(sampleUV, sampleDepth);
+        
+        float depthDiff = sampleViewPos.z - currentPos.z;
+        
+        if (depthDiff > 0.0 && depthDiff < THICKNESS) {
+            hitUV = sampleUV;
+            hitDepth = sampleDepth;
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dimensions = imageSize(outputImage);
+    
+    if (coords.x >= dimensions.x || coords.y >= dimensions.y) {
+        return;
+    }
+    
+    vec2 uv = (vec2(coords) + 0.5) / vec2(dimensions);
+    
+    float depth = texture(gDepth, uv).r;
+    if (depth >= 0.9999) {
+        imageStore(outputImage, coords, vec4(0.0));
+        return;
+    }
+    
+    vec4 normalRoughness = texture(gNormal, uv);
+    vec3 normal = normalize(normalRoughness.rgb);
+    float roughness = normalRoughness.a;
+    vec4 metadata = texture(gMetadata, uv);
+    
+    if (roughness > 0.7) {
+        imageStore(outputImage, coords, vec4(0.0));
+        return;
+    }
+    
+    vec3 viewPos = viewSpaceFromDepth(uv, depth);
+    vec3 viewDir = normalize(viewPos);
+    vec3 viewNormal = (ssr.viewMatrix * vec4(normal, 0.0)).xyz;
+    vec3 reflectDir = normalize(reflect(viewDir, viewNormal));
+    
+    vec2 hitUV;
+    float hitDepth;
+    
+    if (rayMarch(viewPos, reflectDir, hitUV, hitDepth)) {
+        vec3 reflectedColor = texture(colorBuffer, hitUV).rgb;
+        
+        float edgeFade = 1.0 - pow(max(abs(hitUV.x - 0.5), abs(hitUV.y - 0.5)) * 2.0, 2.0);
+        float distanceFade = 1.0 - clamp(length(viewPos - viewSpaceFromDepth(hitUV, hitDepth)) / MAX_DISTANCE, 0.0, 1.0);
+        float fade = edgeFade * distanceFade * (1.0 - roughness);
+        
+        imageStore(outputImage, coords, vec4(reflectedColor * fade, fade));
+    } else {
+        imageStore(outputImage, coords, vec4(0.0));
+    }
+}

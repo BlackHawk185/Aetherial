@@ -469,7 +469,7 @@ bool VulkanCloudRenderer::createPipeline() {
     pipelineInfo.renderPass = m_renderPass;
     pipelineInfo.subpass = 0;
 
-    result = vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline);
+    result = vkCreateGraphicsPipelines(m_device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_pipeline);
     if (result != VK_SUCCESS) {
         std::cerr << "❌ Failed to create cloud pipeline" << std::endl;
         return false;

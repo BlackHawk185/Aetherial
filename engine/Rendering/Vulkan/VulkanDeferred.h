@@ -4,6 +4,7 @@
 #include "VulkanBuffer.h"
 #include "VulkanLightingPass.h"
 #include "VulkanShadowMap.h"
+#include "VulkanSSR.h"
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 #include <glm/glm.hpp>
@@ -38,14 +39,15 @@ public:
      * Initialize deferred rendering pipeline
      * @param device Vulkan device
      * @param allocator VMA allocator
+     * @param pipelineCache Pipeline cache for faster pipeline creation
      * @param swapchainFormat Format of swapchain images
      * @param swapchainRenderPass Render pass for final swapchain composition
      * @param width Render target width
      * @param height Render target height
      */
-    bool initialize(VkDevice device, VmaAllocator allocator, 
+    bool initialize(VkDevice device, VmaAllocator allocator, VkPipelineCache pipelineCache,
                     VkFormat swapchainFormat, VkRenderPass swapchainRenderPass,
-                    uint32_t width, uint32_t height);
+                    uint32_t width, uint32_t height, VkQueue graphicsQueue, VkCommandPool commandPool);
 
     /**
      * Resize render targets
@@ -63,6 +65,12 @@ public:
      * End geometry pass
      */
     void endGeometryPass(VkCommandBuffer commandBuffer);
+
+    /**
+     * Compute SSR (call after geometry pass, before lighting pass)
+     */
+    void computeSSR(VkCommandBuffer commandBuffer, VkImageView colorBuffer,
+                    const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix);
 
     /**
      * Render lighting pass (reads G-buffer, writes to swapchain image)
@@ -97,6 +105,7 @@ public:
     uint32_t getHeight() const { return m_height; }
     
     VulkanShadowMap& getShadowMap() { return m_shadowMap; }
+    VulkanSSR& getSSR() { return m_ssr; }
 
 private:
     bool loadShaders();
@@ -108,6 +117,7 @@ private:
 
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     VkFormat m_swapchainFormat = VK_FORMAT_UNDEFINED;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -133,4 +143,5 @@ private:
     // Advanced lighting system
     VulkanLightingPass m_lightingPass;
     VulkanShadowMap m_shadowMap;
+    VulkanSSR m_ssr;
 };

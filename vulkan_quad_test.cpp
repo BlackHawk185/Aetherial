@@ -43,8 +43,8 @@ int main() {
     
     // Initialize deferred renderer
     VulkanDeferred deferredRenderer;
-    if (!deferredRenderer.initialize(context.getDevice(), context.getAllocator(),
-                                     context.getSwapchainFormat(), 1280, 720)) {
+    if (!deferredRenderer.initialize(context.getDevice(), context.getAllocator(), context.pipelineCache,
+                                     context.getSwapchainFormat(), context.getRenderPass(), 1280, 720)) {
         std::cerr << "❌ Failed to initialize deferred renderer\n";
         context.cleanup();
         glfwDestroyWindow(window);

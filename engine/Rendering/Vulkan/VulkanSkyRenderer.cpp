@@ -310,7 +310,7 @@ bool VulkanSkyRenderer::createPipeline() {
     pipelineInfo.renderPass = m_context->getRenderPass();
     pipelineInfo.subpass = 0;
 
-    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS) {
+    if (vkCreateGraphicsPipelines(device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS) {
         std::cerr << "❌ Failed to create graphics pipeline" << std::endl;
         return false;
     }

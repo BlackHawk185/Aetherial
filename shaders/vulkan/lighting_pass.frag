@@ -1,5 +1,54 @@
 #version 450
 
+// PBR functions
+const float PI = 3.14159265359;
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+float distributionGGX(vec3 N, vec3 H, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+    return a2 / denom;
+}
+
+float geometrySchlickGGX(float NdotV, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    float denom = NdotV * (1.0 - k) + k;
+    return NdotV / denom;
+}
+
+float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    float ggx2 = geometrySchlickGGX(NdotV, roughness);
+    float ggx1 = geometrySchlickGGX(NdotL, roughness);
+    return ggx1 * ggx2;
+}
+
+vec3 calculatePBR(vec3 N, vec3 V, vec3 L, vec3 albedo, float metallic, float roughness, vec3 radiance) {
+    vec3 H = normalize(V + L);
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    float NDF = distributionGGX(N, H, roughness);
+    float G = geometrySmith(N, V, L, roughness);
+    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+    vec3 numerator = NDF * G * F;
+    float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.001;
+    vec3 specular = numerator / denominator;
+    vec3 kS = F;
+    vec3 kD = vec3(1.0) - kS;
+    kD *= 1.0 - metallic;
+    float NdotL = max(dot(N, L), 0.0);
+    vec3 diffuse = kD * albedo / PI;
+    return (diffuse + specular) * radiance * NdotL;
+}
+
 // Inputs
 layout(location = 0) in vec2 vTexCoord;
 
@@ -20,6 +69,9 @@ layout(set = 1, binding = 2) uniform CascadeData {
     vec4 cascadeOrthoSizes;  // x,y,z,w = sizes for cascades 0,1,2,3
     vec4 lightTexel;         // x = 1/shadowMapSize
 } cascade;
+
+// SSR texture (Set 1)
+layout(set = 1, binding = 3) uniform sampler2D uSSRReflections;
 
 // Push constants
 layout(push_constant) uniform LightingParams {
@@ -130,6 +182,7 @@ float sampleCascade(int cascadeIndex, vec3 worldPos, float bias, vec3 normal, ve
 }
 
 // Sample sun light (cascades 0 and 1)
+// Prefers cascade with actual shadow data (blocker-aware selection)
 float sampleSunLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
     float lightNear = sampleCascade(0, worldPos, bias, normal, lightDir);
     float lightFar = sampleCascade(1, worldPos, bias, normal, lightDir);
@@ -138,17 +191,31 @@ float sampleSunLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
     bool farValid = (lightFar >= 0.0);
     
     if (nearValid && farValid) {
-        // Blend cascades in transition zone
-        vec4 lightSpacePos = cascade.cascadeVP[0] * vec4(worldPos, 1.0);
-        vec3 ndc = lightSpacePos.xyz / lightSpacePos.w;
+        // Both cascades have data - check which has actual shadow (blocker present)
+        // If near cascade is fully lit (1.0), it means no blocker in near range
+        // Use far cascade if it has shadow data from distant blockers
+        const float FULLY_LIT_THRESHOLD = 0.95;
         
-        vec2 distToEdge = abs(ndc.xy);
-        float maxDist = max(distToEdge.x, distToEdge.y);
+        bool nearHasBlocker = (lightNear < FULLY_LIT_THRESHOLD);
+        bool farHasBlocker = (lightFar < FULLY_LIT_THRESHOLD);
         
-        float blendStart = 0.80;
-        float blendFactor = smoothstep(blendStart, 1.0, maxDist);
-        
-        return mix(lightNear, lightFar, blendFactor);
+        if (nearHasBlocker && farHasBlocker) {
+            // Both have blockers - blend in transition zone
+            vec4 lightSpacePos = cascade.cascadeVP[0] * vec4(worldPos, 1.0);
+            vec3 ndc = lightSpacePos.xyz / lightSpacePos.w;
+            vec2 distToEdge = abs(ndc.xy);
+            float maxDist = max(distToEdge.x, distToEdge.y);
+            float blendStart = 0.80;
+            float blendFactor = smoothstep(blendStart, 1.0, maxDist);
+            return mix(lightNear, lightFar, blendFactor);
+        } else if (nearHasBlocker) {
+            return lightNear;  // Near has shadow, use it
+        } else if (farHasBlocker) {
+            return lightFar;   // Only far has shadow (distant mountain)
+        } else {
+            // Both fully lit - use near for consistency
+            return lightNear;
+        }
     } else if (nearValid) {
         return lightNear;
     } else if (farValid) {
@@ -160,6 +227,7 @@ float sampleSunLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
 }
 
 // Sample moon light (cascades 2 and 3)
+// Prefers cascade with actual shadow data (blocker-aware selection)
 float sampleMoonLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
     float lightNear = sampleCascade(2, worldPos, bias, normal, lightDir);
     float lightFar = sampleCascade(3, worldPos, bias, normal, lightDir);
@@ -168,16 +236,29 @@ float sampleMoonLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
     bool farValid = (lightFar >= 0.0);
     
     if (nearValid && farValid) {
-        vec4 lightSpacePos = cascade.cascadeVP[2] * vec4(worldPos, 1.0);
-        vec3 ndc = lightSpacePos.xyz / lightSpacePos.w;
+        // Both cascades have data - check which has actual shadow (blocker present)
+        const float FULLY_LIT_THRESHOLD = 0.95;
         
-        vec2 distToEdge = abs(ndc.xy);
-        float maxDist = max(distToEdge.x, distToEdge.y);
+        bool nearHasBlocker = (lightNear < FULLY_LIT_THRESHOLD);
+        bool farHasBlocker = (lightFar < FULLY_LIT_THRESHOLD);
         
-        float blendStart = 0.80;
-        float blendFactor = smoothstep(blendStart, 1.0, maxDist);
-        
-        return mix(lightNear, lightFar, blendFactor);
+        if (nearHasBlocker && farHasBlocker) {
+            // Both have blockers - blend in transition zone
+            vec4 lightSpacePos = cascade.cascadeVP[2] * vec4(worldPos, 1.0);
+            vec3 ndc = lightSpacePos.xyz / lightSpacePos.w;
+            vec2 distToEdge = abs(ndc.xy);
+            float maxDist = max(distToEdge.x, distToEdge.y);
+            float blendStart = 0.80;
+            float blendFactor = smoothstep(blendStart, 1.0, maxDist);
+            return mix(lightNear, lightFar, blendFactor);
+        } else if (nearHasBlocker) {
+            return lightNear;  // Near has shadow, use it
+        } else if (farHasBlocker) {
+            return lightFar;   // Only far has shadow (distant mountain)
+        } else {
+            // Both fully lit - use near for consistency
+            return lightNear;
+        }
     } else if (nearValid) {
         return lightNear;
     } else if (farValid) {
@@ -190,68 +271,62 @@ float sampleMoonLight(vec3 worldPos, float bias, vec3 normal, vec3 lightDir) {
 
 void main() {
     // Read G-buffer
-    vec3 albedo = texture(gAlbedo, vTexCoord).rgb;
-    vec3 normal = texture(gNormal, vTexCoord).rgb;
+    vec4 albedoAO = texture(gAlbedo, vTexCoord);
+    vec3 albedo = albedoAO.rgb;
+    float ao = albedoAO.a;
+    vec4 normalRoughness = texture(gNormal, vTexCoord);
+    vec3 normal = normalRoughness.rgb;
+    float roughness = normalRoughness.a;
     vec3 worldPos = texture(gPosition, vTexCoord).rgb;
     vec4 metadata = texture(gMetadata, vTexCoord);
     float depth = texture(gDepth, vTexCoord).r;
     
-    // Skip sky (no geometry)
     if (depth >= 0.9999) {
         discard;
     }
     
     vec3 N = normalize(normal);
+    vec3 V = normalize(lighting.cameraPos.xyz - worldPos);
     float materialID = metadata.x;
     uint blockType = uint(materialID * 255.0 + 0.5);
     bool isWater = (blockType == 45u);
     
-    // Sample sun light - shadow map only, no ambient
     vec3 L_sun = normalize(-lighting.sunDirection.xyz);
     float bias_sun = 0.0005;
     float sunLightFactor = sampleSunLight(worldPos, bias_sun, N, lighting.sunDirection.xyz);
-    
-    // Apply cloud shadows
     float cloudShadow = sampleCloudShadow(worldPos, lighting.cameraPos.w);
     sunLightFactor *= (1.0 - cloudShadow);
     
-    // Sample moon light - shadow map only, no ambient
     vec3 L_moon = normalize(-lighting.moonDirection.xyz);
     float bias_moon = 0.0005;
     float moonLightFactor = sampleMoonLight(worldPos, bias_moon, N, lighting.moonDirection.xyz);
     
+    vec4 ssrSample = texture(uSSRReflections, vTexCoord);
+    vec3 ssrColor = ssrSample.rgb;
+    float ssrStrength = ssrSample.a;
+    
     vec3 finalColor;
     
     if (isWater) {
-        // Water rendering with reflections
-        vec3 V = normalize(lighting.cameraPos.xyz - worldPos);
-        
-        float fresnel = 0.9;
-        
-        vec3 R = reflect(-V, N);
-        float skyGradient = R.y * 0.5 + 0.5;
-        vec3 skyColor = mix(vec3(0.4, 0.7, 1.0), vec3(0.1, 0.3, 0.6), skyGradient);
-        
-        // Sun specular
-        vec3 H_sun = normalize(L_sun + V);
-        float specSun = pow(max(dot(N, H_sun), 0.0), 128.0) * sunLightFactor;
-        vec3 sunSpecular = lighting.sunColor.rgb * specSun * lighting.sunDirection.w * 2.0;
-        
-        // Moon specular
-        vec3 H_moon = normalize(L_moon + V);
-        float specMoon = pow(max(dot(N, H_moon), 0.0), 64.0) * moonLightFactor;
-        vec3 moonSpecular = lighting.moonColor.rgb * specMoon * lighting.moonDirection.w * 0.3;
-        
-        vec3 waterDiffuse = albedo * (sunLightFactor * lighting.sunDirection.w + 
-                                      moonLightFactor * lighting.moonDirection.w * 0.15);
-        
-        vec3 reflectionColor = skyColor * fresnel;
-        finalColor = mix(waterDiffuse, reflectionColor, 0.7) + sunSpecular + moonSpecular;
+        float waterMetallic = 0.02;
+        float waterRoughness = 0.1;
+        vec3 sunRadiance = lighting.sunColor.rgb * lighting.sunDirection.w * sunLightFactor;
+        vec3 moonRadiance = lighting.moonColor.rgb * lighting.moonDirection.w * 0.15 * moonLightFactor;
+        vec3 sunPBR = calculatePBR(N, V, L_sun, albedo, waterMetallic, waterRoughness, sunRadiance);
+        vec3 moonPBR = calculatePBR(N, V, L_moon, albedo, waterMetallic, waterRoughness, moonRadiance);
+        vec3 F0 = mix(vec3(0.04), albedo, waterMetallic);
+        vec3 F = fresnelSchlick(max(dot(N, V), 0.0), F0);
+        vec3 reflectionColor = mix(vec3(0.0), ssrColor, ssrStrength);
+        finalColor = sunPBR + moonPBR + reflectionColor * F;
     } else {
-        // Standard material - dark by default, lit where light hits
-        vec3 sunContribution = albedo * sunLightFactor * lighting.sunDirection.w;
-        vec3 moonContribution = albedo * moonLightFactor * lighting.moonDirection.w * 0.15;
-        finalColor = sunContribution + moonContribution;
+        float metallic = 0.0;
+        float effectiveRoughness = roughness;
+        vec3 sunRadiance = lighting.sunColor.rgb * lighting.sunDirection.w * sunLightFactor;
+        vec3 moonRadiance = lighting.moonColor.rgb * lighting.moonDirection.w * 0.15 * moonLightFactor;
+        vec3 sunPBR = calculatePBR(N, V, L_sun, albedo, metallic, effectiveRoughness, sunRadiance);
+        vec3 moonPBR = calculatePBR(N, V, L_moon, albedo, metallic, effectiveRoughness, moonRadiance);
+        vec3 reflectionTerm = ssrColor * ssrStrength * (1.0 - effectiveRoughness) * metallic;
+        finalColor = (sunPBR + moonPBR) * ao + reflectionTerm;
     }
     
     fragColor = vec4(finalColor, 1.0);

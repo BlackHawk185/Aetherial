@@ -2,14 +2,15 @@
 #include <iostream>
 #include <fstream>
 
-bool VulkanDeferred::initialize(VkDevice device, VmaAllocator allocator,
+bool VulkanDeferred::initialize(VkDevice device, VmaAllocator allocator, VkPipelineCache pipelineCache,
                                  VkFormat swapchainFormat, VkRenderPass swapchainRenderPass,
-                                 uint32_t width, uint32_t height)
+                                 uint32_t width, uint32_t height, VkQueue graphicsQueue, VkCommandPool commandPool)
 {
     destroy();
 
     m_device = device;
     m_allocator = allocator;
+    m_pipelineCache = pipelineCache;
     m_swapchainFormat = swapchainFormat;
     m_width = width;
     m_height = height;
@@ -42,12 +43,18 @@ bool VulkanDeferred::initialize(VkDevice device, VmaAllocator allocator,
     }
 
     // Initialize lighting pass (uses swapchain render pass for compatibility)
-    if (!m_lightingPass.initialize(device, allocator, m_lightingDescriptorLayout, swapchainFormat, swapchainRenderPass)) {
+    if (!m_lightingPass.initialize(device, allocator, pipelineCache, m_lightingDescriptorLayout, swapchainFormat, swapchainRenderPass)) {
         std::cerr << "❌ Failed to initialize lighting pass" << std::endl;
         return false;
     }
 
-    std::cout << "✅ VulkanDeferred initialized: " << m_width << "x" << m_height << std::endl;
+    // Initialize SSR
+    if (!m_ssr.initialize(device, allocator, pipelineCache, width, height, graphicsQueue, commandPool)) {
+        std::cerr << "❌ Failed to initialize SSR" << std::endl;
+        return false;
+    }
+
+    std::cout << "✅ VulkanDeferred initialized: " << m_width << "x" << m_height << " (with SSR)" << std::endl;
     return true;
 }
 
@@ -63,6 +70,11 @@ bool VulkanDeferred::resize(uint32_t width, uint32_t height) {
 
     // Resize G-buffer
     if (!m_gbuffer.resize(width, height)) {
+        return false;
+    }
+
+    // Resize SSR
+    if (!m_ssr.resize(width, height)) {
         return false;
     }
 
@@ -263,7 +275,7 @@ bool VulkanDeferred::createGeometryPipeline() {
     pipelineInfo.renderPass = m_gbuffer.getRenderPass();
     pipelineInfo.subpass = 0;
 
-    result = vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_geometryPipeline);
+    result = vkCreateGraphicsPipelines(m_device, m_pipelineCache, 1, &pipelineInfo, nullptr, &m_geometryPipeline);
     if (result != VK_SUCCESS) {
         std::cerr << "❌ Failed to create geometry pipeline" << std::endl;
         return false;
@@ -453,6 +465,18 @@ void VulkanDeferred::endGeometryPass(VkCommandBuffer commandBuffer) {
     m_gbuffer.transitionToShaderRead(commandBuffer);
 }
 
+void VulkanDeferred::computeSSR(VkCommandBuffer commandBuffer, VkImageView colorBuffer,
+                                const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix) {
+    m_ssr.compute(commandBuffer,
+                  m_gbuffer.getNormalView(),
+                  m_gbuffer.getPositionView(),
+                  m_gbuffer.getDepthView(),
+                  m_gbuffer.getMetadataView(),
+                  colorBuffer,
+                  viewMatrix,
+                  projectionMatrix);
+}
+
 void VulkanDeferred::renderLightingPass(VkCommandBuffer commandBuffer,
                                         VkImageView swapchainImageView,
                                         const LightingParams& params,
@@ -483,7 +507,7 @@ void VulkanDeferred::renderLightingPass(VkCommandBuffer commandBuffer,
 }
 
 bool VulkanDeferred::bindLightingTextures(VkImageView cloudNoiseTexture) {
-    return m_lightingPass.bindTextures(m_shadowMap, cloudNoiseTexture);
+    return m_lightingPass.bindTextures(m_shadowMap, cloudNoiseTexture, m_ssr.getOutputView());
 }
 
 void VulkanDeferred::destroy() {

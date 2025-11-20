@@ -49,11 +49,12 @@ public:
      * Initialize lighting pass
      * @param device Vulkan device
      * @param allocator VMA allocator
+     * @param pipelineCache Pipeline cache for faster pipeline creation
      * @param gBufferDescriptorLayout Layout for G-buffer textures (set 0)
      * @param outputFormat Format of final output image
      * @param externalRenderPass Optional render pass to use (if null, creates own)
      */
-    bool initialize(VkDevice device, VmaAllocator allocator,
+    bool initialize(VkDevice device, VmaAllocator allocator, VkPipelineCache pipelineCache,
                     VkDescriptorSetLayout gBufferDescriptorLayout,
                     VkFormat outputFormat,
                     VkRenderPass externalRenderPass = VK_NULL_HANDLE);
@@ -68,7 +69,7 @@ public:
     /**
      * Bind shadow map and cloud noise textures (call once after shadow map creation)
      */
-    bool bindTextures(const VulkanShadowMap& shadowMap, VkImageView cloudNoiseTexture);
+    bool bindTextures(const VulkanShadowMap& shadowMap, VkImageView cloudNoiseTexture, VkImageView ssrTexture);
 
     /**
      * Render lighting pass
@@ -92,12 +93,13 @@ private:
     bool createPipeline();
     bool createDescriptorLayouts();
     bool createUniformBuffer();
-    bool updateDescriptorSet(const VulkanShadowMap& shadowMap, VkImageView cloudNoiseTexture);
+    bool updateDescriptorSet(const VulkanShadowMap& shadowMap, VkImageView cloudNoiseTexture, VkImageView ssrTexture);
 
     VkShaderModule loadShaderModule(const std::string& filepath);
 
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     VkFormat m_outputFormat = VK_FORMAT_UNDEFINED;
 
     // Descriptor layouts
@@ -119,6 +121,7 @@ private:
     VkDescriptorSet m_lightingDescriptorSet = VK_NULL_HANDLE;
     VkSampler m_shadowSampler = VK_NULL_HANDLE;
     VkSampler m_cloudNoiseSampler = VK_NULL_HANDLE;
+    VkSampler m_ssrSampler = VK_NULL_HANDLE;
     
     // Cascade uniform buffer
     VulkanBuffer m_cascadeUniformBuffer;

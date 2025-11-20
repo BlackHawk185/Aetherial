@@ -363,9 +363,21 @@ void VoxelChunk::greedyMeshFace(std::vector<QuadFace>& quads, int face)
                 
                 uint8_t blockType = getVoxel(x, y, z);
                 
+                // Check if this is an OBJ block - don't merge, create 1x1x1 cube
+                const BlockTypeInfo* info = BlockTypeRegistry::getInstance().getBlockType(blockType);
+                bool isOBJBlock = (info && info->renderType == BlockRenderType::OBJ);
+                
                 // Determine merge dimensions based on face direction
                 int width = 1;
                 int height = 1;
+                
+                // Skip greedy merging for OBJ blocks
+                if (isOBJBlock) {
+                    visited[idx] = true;
+                    addQuad(quads, static_cast<float>(x), static_cast<float>(y),
+                           static_cast<float>(z), face, 1, 1, blockType);
+                    continue;
+                }
                 
                 // Expand width (horizontal for this face)
                 if (face == 0 || face == 1) // X faces: expand in Z direction (width), Y direction (height)

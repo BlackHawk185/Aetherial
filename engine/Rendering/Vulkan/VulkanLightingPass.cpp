@@ -3,7 +3,7 @@
 #include <fstream>
 #include <filesystem>
 
-bool VulkanLightingPass::initialize(VkDevice device, VmaAllocator allocator,
+bool VulkanLightingPass::initialize(VkDevice device, VmaAllocator allocator, VkPipelineCache pipelineCache,
                                     VkDescriptorSetLayout gBufferDescriptorLayout,
                                     VkFormat outputFormat,
                                     VkRenderPass externalRenderPass)
@@ -12,6 +12,7 @@ bool VulkanLightingPass::initialize(VkDevice device, VmaAllocator allocator,
 
     m_device = device;
     m_allocator = allocator;
+    m_pipelineCache = pipelineCache;
     m_gBufferLayout = gBufferDescriptorLayout;
     m_outputFormat = outputFormat;
 
@@ -67,8 +68,8 @@ VkShaderModule VulkanLightingPass::loadShaderModule(const std::string& filepath)
 }
 
 bool VulkanLightingPass::createDescriptorLayouts() {
-    // Set 1: Shadow map + cloud noise + cascade uniform
-    VkDescriptorSetLayoutBinding bindings[3] = {};
+    // Set 1: Shadow map + cloud noise + cascade uniform + SSR
+    VkDescriptorSetLayoutBinding bindings[4] = {};
     
     // Binding 0: Shadow map array (sampler2DArrayShadow)
     bindings[0].binding = 0;
@@ -87,9 +88,15 @@ bool VulkanLightingPass::createDescriptorLayouts() {
     bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[2].descriptorCount = 1;
     bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    
+    // Binding 3: SSR reflections (sampler2D)
+    bindings[3].binding = 3;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo layoutInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    layoutInfo.bindingCount = 3;
+    layoutInfo.bindingCount = 4;
     layoutInfo.pBindings = bindings;
 
     if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_lightingLayout) != VK_SUCCESS) {
@@ -100,7 +107,7 @@ bool VulkanLightingPass::createDescriptorLayouts() {
     // Create descriptor pool
     VkDescriptorPoolSize poolSizes[2] = {};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[0].descriptorCount = 2;  // Shadow map + cloud noise
+    poolSizes[0].descriptorCount = 3;  // Shadow map + cloud noise + SSR
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[1].descriptorCount = 1;  // Cascade uniform
 
@@ -265,7 +272,7 @@ bool VulkanLightingPass::createPipeline() {
     pipelineInfo.renderPass = m_renderPass;
     pipelineInfo.subpass = 0;
 
-    if (vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS) {
+    if (vkCreateGraphicsPipelines(m_device, m_pipelineCache, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS) {
         std::cerr << "❌ Failed to create lighting pipeline" << std::endl;
         return false;
     }
@@ -308,7 +315,7 @@ bool VulkanLightingPass::updateCloudNoiseDescriptor(VkImageView cloudNoiseTextur
     return true;
 }
 
-bool VulkanLightingPass::updateDescriptorSet(const VulkanShadowMap& shadowMap, VkImageView cloudNoiseTexture) {
+bool VulkanLightingPass::updateDescriptorSet(const VulkanShadowMap& shadowMap, VkImageView cloudNoiseTexture, VkImageView ssrTexture) {
     // Create shadow sampler (for sampler2DArrayShadow)
     if (m_shadowSampler == VK_NULL_HANDLE) {
         VkSamplerCreateInfo samplerInfo = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -342,7 +349,22 @@ bool VulkanLightingPass::updateDescriptorSet(const VulkanShadowMap& shadowMap, V
         }
     }
 
-    VkWriteDescriptorSet writes[3] = {};
+    // Create SSR sampler
+    if (m_ssrSampler == VK_NULL_HANDLE) {
+        VkSamplerCreateInfo samplerInfo = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+
+        if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_ssrSampler) != VK_SUCCESS) {
+            std::cerr << "❌ Failed to create SSR sampler" << std::endl;
+            return false;
+        }
+    }
+
+    VkWriteDescriptorSet writes[4] = {};
 
     // Binding 0: Shadow map array
     VkDescriptorImageInfo shadowInfo = {};
@@ -383,7 +405,20 @@ bool VulkanLightingPass::updateDescriptorSet(const VulkanShadowMap& shadowMap, V
     writes[2].descriptorCount = 1;
     writes[2].pBufferInfo = &bufferInfo;
 
-    vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
+    // Binding 3: SSR reflections
+    VkDescriptorImageInfo ssrInfo = {};
+    ssrInfo.sampler = m_ssrSampler;
+    ssrInfo.imageView = ssrTexture;
+    ssrInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = m_lightingDescriptorSet;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[3].descriptorCount = 1;
+    writes[3].pImageInfo = &ssrInfo;
+
+    vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
     return true;
 }
 
@@ -391,8 +426,8 @@ void VulkanLightingPass::updateCascadeUniforms(const CascadeUniforms& cascades) 
     m_cascadeUniformBuffer.upload(&cascades, sizeof(CascadeUniforms));
 }
 
-bool VulkanLightingPass::bindTextures(const VulkanShadowMap& shadowMap, VkImageView cloudNoiseTexture) {
-    return updateDescriptorSet(shadowMap, cloudNoiseTexture);
+bool VulkanLightingPass::bindTextures(const VulkanShadowMap& shadowMap, VkImageView cloudNoiseTexture, VkImageView ssrTexture) {
+    return updateDescriptorSet(shadowMap, cloudNoiseTexture, ssrTexture);
 }
 
 void VulkanLightingPass::render(VkCommandBuffer commandBuffer,
@@ -432,6 +467,11 @@ void VulkanLightingPass::destroy() {
     if (m_cloudNoiseSampler) {
         vkDestroySampler(m_device, m_cloudNoiseSampler, nullptr);
         m_cloudNoiseSampler = VK_NULL_HANDLE;
+    }
+
+    if (m_ssrSampler) {
+        vkDestroySampler(m_device, m_ssrSampler, nullptr);
+        m_ssrSampler = VK_NULL_HANDLE;
     }
 
     if (m_descriptorPool) {

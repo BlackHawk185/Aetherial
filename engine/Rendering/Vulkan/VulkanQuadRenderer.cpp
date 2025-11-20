@@ -554,7 +554,7 @@ void VulkanQuadRenderer::createPipeline() {
     pipelineInfo.renderPass = m_gbufferRenderPass;
     pipelineInfo.subpass = 0;
 
-    VkResult result = vkCreateGraphicsPipelines(m_context->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_gbufferPipeline);
+    VkResult result = vkCreateGraphicsPipelines(m_context->device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_gbufferPipeline);
     
     if (result != VK_SUCCESS) {
         std::cerr << "[VulkanQuadRenderer] Failed to create graphics pipeline\n";
@@ -715,7 +715,7 @@ void VulkanQuadRenderer::createSwapchainPipeline() {
     pipelineInfo.renderPass = m_context->getRenderPass();  // Use swapchain render pass
     pipelineInfo.subpass = 0;
     
-    VkResult result = vkCreateGraphicsPipelines(m_context->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_swapchainPipeline);
+    VkResult result = vkCreateGraphicsPipelines(m_context->device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_swapchainPipeline);
     if (result != VK_SUCCESS) {
         std::cerr << "[VulkanQuadRenderer] Failed to create swapchain pipeline, error=" << result << "\n";
         return;
@@ -856,7 +856,7 @@ void VulkanQuadRenderer::ensureDepthPipeline(VkRenderPass shadowRenderPass) {
     pipelineInfo.renderPass = shadowRenderPass;
     pipelineInfo.subpass = 0;
     
-    VkResult result = vkCreateGraphicsPipelines(m_context->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_depthOnlyPipeline);
+    VkResult result = vkCreateGraphicsPipelines(m_context->device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_depthOnlyPipeline);
     if (result != VK_SUCCESS) {
         std::cerr << "[VulkanQuadRenderer] Failed to create depth-only pipeline\n";
     }

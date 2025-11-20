@@ -431,7 +431,7 @@ bool VulkanTriangleRenderer::createGraphicsPipeline() {
     pipelineInfo.renderPass = m_context->getRenderPass();
     pipelineInfo.subpass = 0;
     
-    if (vkCreateGraphicsPipelines(m_context->getDevice(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_graphicsPipeline) != VK_SUCCESS) {
+    if (vkCreateGraphicsPipelines(m_context->getDevice(), m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_graphicsPipeline) != VK_SUCCESS) {
         std::cerr << "[Vulkan] Failed to create graphics pipeline\n";
         return false;
     }

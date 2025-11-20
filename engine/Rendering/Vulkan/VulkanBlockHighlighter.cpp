@@ -276,7 +276,7 @@ bool VulkanBlockHighlighter::createPipeline() {
     pipelineInfo.renderPass = m_context->getRenderPass();
     pipelineInfo.subpass = 0;
     
-    if (vkCreateGraphicsPipelines(m_context->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS) {
+    if (vkCreateGraphicsPipelines(m_context->device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS) {
         std::cerr << "[VulkanBlockHighlighter] Failed to create pipeline\n";
         return false;
     }

@@ -7,6 +7,7 @@
 #ifdef USE_VULKAN
 #include "../Rendering/Vulkan/VulkanContext.h"
 #include "../Rendering/Vulkan/VulkanQuadRenderer.h"
+#include "../Rendering/Vulkan/VulkanModelRenderer.h"
 #include "../Rendering/Vulkan/VulkanDeferred.h"
 #include "../Rendering/Vulkan/VulkanSkyRenderer.h"
 #include "../Rendering/Vulkan/VulkanCloudRenderer.h"
@@ -45,8 +46,9 @@
 // External systems
 extern TimeEffects* g_timeEffects;
 
-// Global Vulkan renderer pointer (for chunk mesh uploads)
+// Global Vulkan renderer pointers (for chunk mesh uploads)
 VulkanQuadRenderer* g_vulkanQuadRenderer = nullptr;
+VulkanModelRenderer* g_vulkanModelRenderer = nullptr;
 
 GameClient::GameClient()
 {
@@ -301,6 +303,14 @@ void GameClient::shutdown()
         std::cout << "VulkanQuadRenderer shutdown" << std::endl;
     }
     
+    if (m_vulkanModelRenderer)
+    {
+        m_vulkanModelRenderer->shutdown();
+        m_vulkanModelRenderer.reset();
+        g_vulkanModelRenderer = nullptr;
+        std::cout << "VulkanModelRenderer shutdown" << std::endl;
+    }
+    
     if (m_vulkanBlockHighlighter)
     {
         m_vulkanBlockHighlighter->shutdown();
@@ -498,9 +508,12 @@ bool GameClient::initializeVulkan()
     m_vulkanDeferred = std::make_unique<VulkanDeferred>();
     if (!m_vulkanDeferred->initialize(m_vulkanContext->getDevice(), 
                                       m_vulkanContext->getAllocator(),
+                                      m_vulkanContext->pipelineCache,
                                       m_vulkanContext->getSwapchainFormat(),
                                       m_vulkanContext->getRenderPass(),  // Use swapchain render pass
-                                      m_windowWidth, m_windowHeight))
+                                      m_windowWidth, m_windowHeight,
+                                      m_vulkanContext->getGraphicsQueue(),
+                                      m_vulkanContext->getCommandPool()))
     {
         std::cerr << "❌ Failed to initialize VulkanDeferred!" << std::endl;
         return false;
@@ -516,8 +529,15 @@ bool GameClient::initializeVulkan()
         std::cout << "✅ Cascade light maps bound to lighting pass" << std::endl;
     }
     
-    // TODO: Port other OpenGL renderers to Vulkan
-    // - Model instancing
+    // Initialize Vulkan model renderer (for GLB models) - requires G-Buffer render pass
+    m_vulkanModelRenderer = std::make_unique<VulkanModelRenderer>();
+    if (!m_vulkanModelRenderer->initialize(m_vulkanContext.get(), m_vulkanDeferred->getGeometryRenderPass()))
+    {
+        std::cerr << "❌ Failed to initialize VulkanModelRenderer!" << std::endl;
+        return false;
+    }
+    std::cout << "✅ VulkanModelRenderer initialized - GLB model instancing ready!" << std::endl;
+    g_vulkanModelRenderer = m_vulkanModelRenderer.get();
     
     // Initialize ImGui with Vulkan backend
     IMGUI_CHECKVERSION();
@@ -574,7 +594,7 @@ void GameClient::renderVulkan()
     glm::mat4 viewProjection = projectionMatrix * viewMatrix;
     
     // Update island transforms for Vulkan renderer (islands drift each frame)
-    if (m_vulkanQuadRenderer && m_clientWorld)
+    if (m_clientWorld)
     {
         auto* islandSystem = m_clientWorld->getIslandSystem();
         if (islandSystem)
@@ -582,7 +602,14 @@ void GameClient::renderVulkan()
             const auto& islands = islandSystem->getIslands();
             for (const auto& [islandID, island] : islands)
             {
-                m_vulkanQuadRenderer->updateIslandTransform(islandID, island.getTransformMatrix());
+                if (m_vulkanQuadRenderer)
+                {
+                    m_vulkanQuadRenderer->updateIslandTransform(islandID, island.getTransformMatrix());
+                }
+                if (m_vulkanModelRenderer)
+                {
+                    m_vulkanModelRenderer->updateIslandTransform(islandID, island.getTransformMatrix());
+                }
             }
         }
     }
@@ -622,17 +649,30 @@ void GameClient::renderVulkan()
     float cascadeSplits[4] = {50.0f, 200.0f, 800.0f, 3000.0f};
     float orthoSizes[4] = {100.0f, 400.0f, 1600.0f, 6000.0f};
     
+    // Depth ranges match ortho sizes for resolution efficiency
+    // Near cascades only render geometry within their effective range
+    // Far cascades capture distant geometry that near cascades miss
+    float depthRanges[4] = {
+        orthoSizes[0] * 1.5f,  // Near sun: ~150 blocks depth
+        orthoSizes[1] * 1.5f,  // Far sun: ~600 blocks depth
+        orthoSizes[2] * 1.5f,  // Near moon: ~2400 blocks depth
+        orthoSizes[3] * 1.5f   // Far moon: ~9000 blocks depth
+    };
+    
     for (int i = 0; i < 4; i++) {
         glm::vec3 lightDir = (i < 2) ? sunDirGLM : moonDirGLM;
         float splitDist = cascadeSplits[i];
         float orthoSize = orthoSizes[i];
+        float depthRange = depthRanges[i];
         
         // Light view: look from light direction toward camera
         glm::vec3 lightPos = camPos - lightDir * (splitDist * 0.5f);
         glm::mat4 lightView = glm::lookAt(lightPos, camPos, glm::vec3(0, 1, 0));
         
-        // Orthographic projection for directional light
-        glm::mat4 lightProj = glm::ortho(-orthoSize, orthoSize, -orthoSize, orthoSize, -orthoSize * 2.0f, orthoSize * 2.0f);
+        // Orthographic projection with depth range matching ortho size
+        // This prevents near cascades from wasting resolution on distant geometry
+        glm::mat4 lightProj = glm::ortho(-orthoSize, orthoSize, -orthoSize, orthoSize, 
+                                         -depthRange, depthRange);
         
         cascades.cascadeVP[i] = lightProj * lightView;
         cascades.cascadeOrthoSizes[i] = orthoSize;
@@ -668,6 +708,12 @@ void GameClient::renderVulkan()
         if (m_vulkanQuadRenderer)
         {
             m_vulkanQuadRenderer->renderToGBuffer(cmd, viewProjection, viewMatrix);
+        }
+        
+        // Render GLB models to G-buffer
+        if (m_vulkanModelRenderer)
+        {
+            m_vulkanModelRenderer->renderToGBuffer(cmd, viewProjection, viewMatrix);
         }
         
         m_vulkanDeferred->endGeometryPass(cmd);
@@ -1205,13 +1251,22 @@ void GameClient::handleWorldStateReceived(const WorldStateMessage& worldState)
 void GameClient::registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* island, uint32_t islandID, const Vec3& chunkCoord)
 {
     // Register with Vulkan renderer
-    if (m_vulkanQuadRenderer && chunk && island)
+    if (chunk && island)
     {
         // Calculate chunk offset in world units
         glm::vec3 chunkOffset(chunkCoord.x * VoxelChunk::SIZE,
                               chunkCoord.y * VoxelChunk::SIZE,
                               chunkCoord.z * VoxelChunk::SIZE);
-        m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
+        
+        if (m_vulkanQuadRenderer)
+        {
+            m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
+        }
+        
+        if (m_vulkanModelRenderer)
+        {
+            m_vulkanModelRenderer->updateChunkInstances(chunk, islandID, chunkOffset);
+        }
         
         // Generate mesh async - uploads when ready
         chunk->generateMeshAsync();
@@ -1320,6 +1375,10 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
         // Update Vulkan renderer with island transform
         if (m_vulkanQuadRenderer) {
             m_vulkanQuadRenderer->updateIslandTransform(islandID, island->getTransformMatrix());
+            if (m_vulkanModelRenderer)
+            {
+                m_vulkanModelRenderer->updateIslandTransform(islandID, island->getTransformMatrix());
+            }
         }
     }
 
@@ -1337,16 +1396,21 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
         chunk->setRawVoxelData(voxelData, dataSize);
         
         // Register chunk with Vulkan renderer
+        glm::vec3 chunkOffset(chunkCoord.x * VoxelChunk::SIZE,
+                              chunkCoord.y * VoxelChunk::SIZE,
+                              chunkCoord.z * VoxelChunk::SIZE);
+        
         if (m_vulkanQuadRenderer) {
-            glm::vec3 chunkOffset(chunkCoord.x * VoxelChunk::SIZE,
-                                  chunkCoord.y * VoxelChunk::SIZE,
-                                  chunkCoord.z * VoxelChunk::SIZE);
             m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
-            
-            // Generate mesh async - uploads when ready
-            chunk->generateMeshAsync();
-            m_chunksWithPendingMeshes.push_back(chunk);
         }
+        
+        if (m_vulkanModelRenderer) {
+            m_vulkanModelRenderer->updateChunkInstances(chunk, islandID, chunkOffset);
+        }
+        
+        // Generate mesh async - uploads when ready
+        chunk->generateMeshAsync();
+        m_chunksWithPendingMeshes.push_back(chunk);
     }
     else
     {

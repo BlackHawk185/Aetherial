@@ -34,12 +34,14 @@ add_library(engine STATIC
     Rendering/Vulkan/VulkanContext.cpp
     Rendering/Vulkan/VulkanTriangleRenderer.cpp
     Rendering/Vulkan/VulkanQuadRenderer.cpp
+    Rendering/Vulkan/VulkanModelRenderer.cpp
     Rendering/Vulkan/VulkanBlockHighlighter.cpp
     Rendering/Vulkan/VulkanImage.cpp
     Rendering/Vulkan/VulkanGBuffer.cpp
     Rendering/Vulkan/VulkanDeferred.cpp
     Rendering/Vulkan/VulkanShadowMap.cpp
     Rendering/Vulkan/VulkanLightingPass.cpp
+    Rendering/Vulkan/VulkanSSR.cpp
     Rendering/Vulkan/VulkanSkyRenderer.cpp
     Rendering/Vulkan/VulkanCloudRenderer.cpp
     
