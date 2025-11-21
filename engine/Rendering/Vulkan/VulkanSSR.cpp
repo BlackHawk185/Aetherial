@@ -265,12 +265,14 @@ bool VulkanSSR::createDescriptorSet() {
 
 void VulkanSSR::compute(VkCommandBuffer cmd,
                         VkImageView gNormal, VkImageView gPosition, VkImageView gDepth,
-                        VkImageView gMetadata, VkImageView colorBuffer,
+                        VkImageView gMetadata, VkImageView hdrBuffer,
                         const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix) {
+    VkImageView reflectionSource = hdrBuffer;
     VkDescriptorImageInfo imageInfos[6] = {};
-    VkImageView views[5] = {gNormal, gPosition, gDepth, gMetadata, colorBuffer};
+    VkImageView views[5] = {gNormal, gPosition, gDepth, gMetadata, reflectionSource};
     for (int i = 0; i < 5; i++) {
-        imageInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        // Depth buffer uses DEPTH_STENCIL_READ_ONLY_OPTIMAL, others use SHADER_READ_ONLY_OPTIMAL
+        imageInfos[i].imageLayout = (i == 2) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         imageInfos[i].imageView = views[i];
         imageInfos[i].sampler = m_sampler;
     }

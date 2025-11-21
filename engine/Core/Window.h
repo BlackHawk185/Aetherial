@@ -74,6 +74,7 @@ public:
     void setKeyCallback(std::function<void(int, int, int, int)> callback) { m_keyCallback = callback; }
     void setMouseCallback(std::function<void(double, double)> callback) { m_mouseCallback = callback; }
     void setResizeCallback(std::function<void(int, int)> callback) { m_resizeCallback = callback; }
+    void setScrollCallback(std::function<void(double, double)> callback) { m_scrollCallback = callback; }
 
 private:
     GLFWwindow* m_window;
@@ -85,11 +86,13 @@ private:
     std::function<void(int, int, int, int)> m_keyCallback;      // key, scancode, action, mods
     std::function<void(double, double)> m_mouseCallback;        // xpos, ypos
     std::function<void(int, int)> m_resizeCallback;             // width, height
+    std::function<void(double, double)> m_scrollCallback;       // xoffset, yoffset
 
     // Static GLFW callbacks (forward to instance methods)
     static void glfwKeyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
     static void glfwCursorPosCallback(GLFWwindow* window, double xpos, double ypos);
     static void glfwFramebufferSizeCallback(GLFWwindow* window, int width, int height);
+    static void glfwScrollCallback(GLFWwindow* window, double xoffset, double yoffset);
     static void glfwErrorCallback(int error, const char* description);
 
     // Internal methods

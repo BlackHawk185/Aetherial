@@ -29,6 +29,10 @@
 // ENet networking
 #include <enet/enet.h>
 
+// Vulkan (for layout tracker)
+#include <vulkan/vulkan.h>
+#include "Rendering/Vulkan/VulkanLayoutTracker.h"
+
 // Engine-wide macros and config
 // Project headers should be included in individual source files after pch.h
 // to avoid circular dependencies. Add only stable, external headers here.

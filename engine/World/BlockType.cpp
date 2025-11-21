@@ -43,27 +43,28 @@ void BlockTypeRegistry::initializeDefaultBlocks() {
     registerBlockType(BlockID::AIR, "air", BlockRenderType::VOXEL, "", BlockProperties::Air());
     
     // === NATURAL TERRAIN BLOCKS ===
-    registerBlockType(BlockID::STONE, "stone", BlockRenderType::VOXEL, "", BlockProperties::Solid(1.5f));
-    registerBlockType(BlockID::DIRT, "dirt", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.5f));
-    registerBlockType(BlockID::GRAVEL, "gravel", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.6f));
-    registerBlockType(BlockID::CLAY, "clay", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.6f));
-    registerBlockType(BlockID::MOSS, "moss", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.3f));
-    registerBlockType(BlockID::SAND, "sand", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.5f));
+    // Durability: dirt=1, soft blocks=2, stone=3, hard stone=5, ores=5-7, obsidian=20
+    registerBlockType(BlockID::STONE, "stone", BlockRenderType::VOXEL, "", BlockProperties::Solid(1.5f, 3));
+    registerBlockType(BlockID::DIRT, "dirt", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.5f, 1));
+    registerBlockType(BlockID::GRAVEL, "gravel", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.6f, 2));
+    registerBlockType(BlockID::CLAY, "clay", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.6f, 2));
+    registerBlockType(BlockID::MOSS, "moss", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.3f, 1));
+    registerBlockType(BlockID::SAND, "sand", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.5f, 1));
     
     // === WOOD/TREE BLOCKS ===
-    registerBlockType(BlockID::WOOD_OAK, "wood_oak", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f));
-    registerBlockType(BlockID::WOOD_BIRCH, "wood_birch", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f));
-    registerBlockType(BlockID::WOOD_PINE, "wood_pine", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f));
-    registerBlockType(BlockID::WOOD_JUNGLE, "wood_jungle", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f));
-    registerBlockType(BlockID::WOOD_PALM, "wood_palm", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f));
+    registerBlockType(BlockID::WOOD_OAK, "wood_oak", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f, 3));
+    registerBlockType(BlockID::WOOD_BIRCH, "wood_birch", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f, 3));
+    registerBlockType(BlockID::WOOD_PINE, "wood_pine", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f, 3));
+    registerBlockType(BlockID::WOOD_JUNGLE, "wood_jungle", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f, 3));
+    registerBlockType(BlockID::WOOD_PALM, "wood_palm", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f, 3));
     
-    BlockProperties leavesProps = BlockProperties::Transparent(0.3f);
+    BlockProperties leavesProps = BlockProperties::Transparent(0.3f, 1);
     registerBlockType(BlockID::LEAVES_GREEN, "leaves_green", BlockRenderType::VOXEL, "", leavesProps);
     registerBlockType(BlockID::LEAVES_DARK, "leaves_dark", BlockRenderType::VOXEL, "", leavesProps);
     registerBlockType(BlockID::LEAVES_PALM, "leaves_palm", BlockRenderType::VOXEL, "", leavesProps);
     
     // === DECORATIVE/OBJ BLOCKS ===
-    BlockProperties grassProps = BlockProperties::Transparent(0.1f);
+    BlockProperties grassProps = BlockProperties::Transparent(0.1f, 1);
     grassProps.requiresSupport = true;
     registerBlockType(BlockID::DECOR_GRASS, "decor_grass", BlockRenderType::OBJ, 
                      "assets/models/grass.glb", grassProps);
@@ -73,108 +74,114 @@ void BlockTypeRegistry::initializeDefaultBlocks() {
                      BlockProperties::QuantumFieldGenerator());
     
     // === ICE & SNOW BLOCKS ===
-    registerBlockType(BlockID::ICE, "ice", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.5f));
-    registerBlockType(BlockID::PACKED_ICE, "packed_ice", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.9f));
-    registerBlockType(BlockID::SNOW, "snow", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.2f));
+    registerBlockType(BlockID::ICE, "ice", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.5f, 2));
+    registerBlockType(BlockID::PACKED_ICE, "packed_ice", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.9f, 3));
+    registerBlockType(BlockID::SNOW, "snow", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.2f, 1));
     
     // === STONE VARIANTS ===
     // Sandstone: Formed from compressed sand (Sand recipe)
-    registerBlockType(BlockID::SANDSTONE, "sandstone", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.8f));
+    registerBlockType(BlockID::SANDSTONE, "sandstone", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.8f, 3));
     
     // Granite: Igneous rock, harder than stone
-    registerBlockType(BlockID::GRANITE, "granite", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f));
+    registerBlockType(BlockID::GRANITE, "granite", BlockRenderType::VOXEL, "", BlockProperties::Solid(2.0f, 5));
     
     // Basalt: Volcanic rock (Lava Rock + Stone recipe)
-    registerBlockType(BlockID::BASALT, "basalt", BlockRenderType::VOXEL, "", BlockProperties::Solid(1.8f));
+    registerBlockType(BlockID::BASALT, "basalt", BlockRenderType::VOXEL, "", BlockProperties::Solid(1.8f, 5));
     
     // Limestone: Sedimentary rock (Clay + Stone recipe)
-    registerBlockType(BlockID::LIMESTONE, "limestone", BlockRenderType::VOXEL, "", BlockProperties::Solid(1.3f));
+    registerBlockType(BlockID::LIMESTONE, "limestone", BlockRenderType::VOXEL, "", BlockProperties::Solid(1.3f, 3));
     
     // Marble: Metamorphic limestone (Limestone + Heat recipe)
-    registerBlockType(BlockID::MARBLE, "marble", BlockRenderType::VOXEL, "", BlockProperties::Solid(1.7f));
+    registerBlockType(BlockID::MARBLE, "marble", BlockRenderType::VOXEL, "", BlockProperties::Solid(1.7f, 4));
     
     // Obsidian: Volcanic glass - extremely hard (Lava + Water recipe)
-    registerBlockType(BlockID::OBSIDIAN, "obsidian", BlockRenderType::VOXEL, "", BlockProperties::Solid(50.0f));
+    registerBlockType(BlockID::OBSIDIAN, "obsidian", BlockRenderType::VOXEL, "", BlockProperties::Solid(50.0f, 20));
     
     // === VOLCANIC BLOCKS ===
-    registerBlockType(BlockID::LAVA_ROCK, "lava_rock", BlockRenderType::VOXEL, "", BlockProperties::Solid(1.2f));
-    registerBlockType(BlockID::VOLCANIC_ASH, "volcanic_ash", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.3f));
+    registerBlockType(BlockID::LAVA_ROCK, "lava_rock", BlockRenderType::VOXEL, "", BlockProperties::Solid(1.2f, 3));
+    registerBlockType(BlockID::VOLCANIC_ASH, "volcanic_ash", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.3f, 1));
     
     // Magma: Glowing molten rock (Lava Rock + Heat recipe)
     BlockProperties magmaProps = BlockProperties::LightSource(12, 1.5f);
+    magmaProps.durability = 4;
     registerBlockType(BlockID::MAGMA, "magma", BlockRenderType::VOXEL, "", magmaProps);
     
     // Lava: Flowing molten rock (Magma + Heat recipe)
     BlockProperties lavaProps = BlockProperties::LightSource(15, 0.1f);
     lavaProps.isTransparent = true;
+    lavaProps.durability = 1;
     registerBlockType(BlockID::LAVA, "lava", BlockRenderType::VOXEL, "", lavaProps);
     
     // === BASE ORES ===
     // Coal: Basic fuel (Stone + Carbon recipe)
-    registerBlockType(BlockID::COAL, "coal", BlockRenderType::VOXEL, "", BlockProperties::Solid(3.0f));
+    registerBlockType(BlockID::COAL, "coal", BlockRenderType::VOXEL, "", BlockProperties::Solid(3.0f, 5));
     
     // Iron: Common metal (Stone + Iron Ore recipe)
-    registerBlockType(BlockID::IRON_BLOCK, "iron_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(5.0f));
+    registerBlockType(BlockID::IRON_BLOCK, "iron_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(5.0f, 7));
     
     // Copper: Conductive metal (Stone + Copper Ore recipe)
-    registerBlockType(BlockID::COPPER_BLOCK, "copper_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(3.5f));
+    registerBlockType(BlockID::COPPER_BLOCK, "copper_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(3.5f, 5));
     
     // Gold: Precious metal (Stone + Gold Ore recipe)
-    registerBlockType(BlockID::GOLD_BLOCK, "gold_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(3.0f));
+    registerBlockType(BlockID::GOLD_BLOCK, "gold_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(3.0f, 5));
     
     // === PRECIOUS GEMS ===
     // Diamond: Hardest natural material (Coal + Extreme Pressure recipe)
-    registerBlockType(BlockID::DIAMOND_BLOCK, "diamond_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(10.0f));
+    registerBlockType(BlockID::DIAMOND_BLOCK, "diamond_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(10.0f, 15));
     
     // Emerald: Rare green gem (Stone + Beryllium recipe)
-    registerBlockType(BlockID::EMERALD_BLOCK, "emerald_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(8.0f));
+    registerBlockType(BlockID::EMERALD_BLOCK, "emerald_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(8.0f, 10));
     
     // Ruby: Red gem (Limestone + Chromium recipe)
-    registerBlockType(BlockID::RUBY_BLOCK, "ruby_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(9.0f));
+    registerBlockType(BlockID::RUBY_BLOCK, "ruby_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(9.0f, 12));
     
     // Sapphire: Blue gem (Limestone + Titanium recipe)
-    registerBlockType(BlockID::SAPPHIRE_BLOCK, "sapphire_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(9.0f));
+    registerBlockType(BlockID::SAPPHIRE_BLOCK, "sapphire_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(9.0f, 12));
     
     // Amethyst: Purple crystal (Quartz + Iron recipe)
-    registerBlockType(BlockID::AMETHYST, "amethyst", BlockRenderType::VOXEL, "", BlockProperties::Solid(7.0f));
+    registerBlockType(BlockID::AMETHYST, "amethyst", BlockRenderType::VOXEL, "", BlockProperties::Solid(7.0f, 8));
     
     // Quartz: Clear crystal (Sand + Pressure recipe)
-    registerBlockType(BlockID::QUARTZ, "quartz", BlockRenderType::VOXEL, "", BlockProperties::Solid(7.0f));
+    registerBlockType(BlockID::QUARTZ, "quartz", BlockRenderType::VOXEL, "", BlockProperties::Solid(7.0f, 8));
     
     // === CRYSTAL BLOCKS (Magical/Elemental) ===
     // Blue Crystal: Water-attuned (Water + Quartz recipe)
     BlockProperties blueCrystalProps = BlockProperties::LightSource(8, 6.0f);
     blueCrystalProps.isTransparent = true;
+    blueCrystalProps.durability = 6;
     registerBlockType(BlockID::CRYSTAL_BLUE, "crystal_blue", BlockRenderType::VOXEL, "", blueCrystalProps);
     
     // Green Crystal: Nature-attuned (Moss + Quartz recipe)
     BlockProperties greenCrystalProps = BlockProperties::LightSource(8, 6.0f);
     greenCrystalProps.isTransparent = true;
+    greenCrystalProps.durability = 6;
     registerBlockType(BlockID::CRYSTAL_GREEN, "crystal_green", BlockRenderType::VOXEL, "", greenCrystalProps);
     
     // Purple Crystal: Arcane-attuned (Amethyst + Quartz recipe)
     BlockProperties purpleCrystalProps = BlockProperties::LightSource(8, 6.0f);
     purpleCrystalProps.isTransparent = true;
+    purpleCrystalProps.durability = 6;
     registerBlockType(BlockID::CRYSTAL_PURPLE, "crystal_purple", BlockRenderType::VOXEL, "", purpleCrystalProps);
     
     // Pink Crystal: Life-attuned (Ruby + Quartz recipe)
     BlockProperties pinkCrystalProps = BlockProperties::LightSource(8, 6.0f);
     pinkCrystalProps.isTransparent = true;
+    pinkCrystalProps.durability = 6;
     registerBlockType(BlockID::CRYSTAL_PINK, "crystal_pink", BlockRenderType::VOXEL, "", pinkCrystalProps);
     
     // === SPECIAL MATERIALS ===
     // Salt: Preservative and seasoning (Water evaporation recipe)
-    registerBlockType(BlockID::SALT_BLOCK, "salt_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.5f));
+    registerBlockType(BlockID::SALT_BLOCK, "salt_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.5f, 2));
     
     // Mushroom Block: Organic material (Moss + Darkness recipe)
-    registerBlockType(BlockID::MUSHROOM_BLOCK, "mushroom_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.2f));
+    registerBlockType(BlockID::MUSHROOM_BLOCK, "mushroom_block", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.2f, 1));
     
     // Coral: Marine structure (Water + Limestone recipe)
-    registerBlockType(BlockID::CORAL, "coral", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.4f));
+    registerBlockType(BlockID::CORAL, "coral", BlockRenderType::VOXEL, "", BlockProperties::Solid(0.4f, 2));
     
     // === FLUIDS ===
     // Water: Essential liquid
-    BlockProperties waterProps = BlockProperties::Transparent(0.1f);
+    BlockProperties waterProps = BlockProperties::Transparent(0.1f, 1);
     waterProps.isTransparent = true;
     registerBlockType(BlockID::WATER, "water", BlockRenderType::OBJ, "assets/models/water.glb", waterProps);
     

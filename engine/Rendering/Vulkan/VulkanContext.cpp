@@ -167,9 +167,15 @@ bool VulkanContext::createLogicalDevice() {
     
     vkb::PhysicalDevice vkbPhysicalDevice = physRet.value();
     
+    // Enable Vulkan 1.3 features for dynamic rendering
+    VkPhysicalDeviceVulkan13Features vulkan13Features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+    vulkan13Features.dynamicRendering = VK_TRUE;
+    vulkan13Features.synchronization2 = VK_TRUE;
+    
     // Enable Vulkan 1.1 features for shader draw parameters
     VkPhysicalDeviceVulkan11Features vulkan11Features = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
     vulkan11Features.shaderDrawParameters = VK_TRUE;
+    vulkan11Features.pNext = &vulkan13Features;
     
     // Query device features to enable multi-draw indirect
     VkPhysicalDeviceFeatures supportedFeatures;
@@ -197,6 +203,8 @@ bool VulkanContext::createLogicalDevice() {
     std::cout << "  multiDrawIndirect: " << (deviceFeatures2.features.multiDrawIndirect ? "YES" : "NO") << "\n";
     std::cout << "  drawIndirectFirstInstance: " << (deviceFeatures2.features.drawIndirectFirstInstance ? "YES" : "NO") << "\n";
     std::cout << "  shaderDrawParameters (VK1.1): " << (vulkan11Features.shaderDrawParameters ? "YES" : "NO") << "\n";
+    std::cout << "  dynamicRendering (VK1.3): " << (vulkan13Features.dynamicRendering ? "YES" : "NO") << "\n";
+    std::cout << "  synchronization2 (VK1.3): " << (vulkan13Features.synchronization2 ? "YES" : "NO") << "\n";
     
     // Get queues
     auto graphicsQueueRet = vkbDevice.get_queue(vkb::QueueType::graphics);
@@ -212,7 +220,8 @@ bool VulkanContext::createLogicalDevice() {
         std::cerr << "[Vulkan] Failed to get graphics queue family\n";
         return false;
     }
-    graphicsQueueFamily = graphicsQueueFamilyRet.value();
+    m_graphicsFamily = graphicsQueueFamilyRet.value();
+    graphicsQueueFamily = m_graphicsFamily;
     
     auto presentQueueRet = vkbDevice.get_queue(vkb::QueueType::present);
     if (!presentQueueRet) {
@@ -314,15 +323,15 @@ bool VulkanContext::createRenderPass() {
     colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     
-    // Depth attachment
+    // Depth attachment (load from G-buffer for depth testing)
     VkAttachmentDescription depthAttachment{};
     depthAttachment.format = m_depthFormat;
     depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
     depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     
     VkAttachmentReference colorAttachmentRef{};
@@ -508,21 +517,46 @@ bool VulkanContext::beginFrame(uint32_t& imageIndex, bool startRenderPass) {
 }
 
 void VulkanContext::beginRenderPass(VkCommandBuffer cmd, uint32_t imageIndex) {
-    VkRenderPassBeginInfo renderPassInfo{};
-    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    renderPassInfo.renderPass = m_renderPass;
-    renderPassInfo.framebuffer = m_swapchainFramebuffers[imageIndex];
-    renderPassInfo.renderArea.offset = {0, 0};
-    renderPassInfo.renderArea.extent = m_swapchainExtent;
+    // Track swapchain pass depth expectations
+    VulkanLayoutTracker::getInstance().recordRenderPassBegin(
+        m_depthImage, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, "Swapchain pass");
     
-    VkClearValue clearValues[2];
-    clearValues[0].color = {{0.53f, 0.81f, 0.92f, 1.0f}};  // Sky blue
-    clearValues[1].depthStencil = {1.0f, 0};
+    // Transition swapchain image from UNDEFINED/PRESENT_SRC to COLOR_ATTACHMENT_OPTIMAL
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = m_swapchainImages[imageIndex];
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     
-    renderPassInfo.clearValueCount = 2;
-    renderPassInfo.pClearValues = clearValues;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
     
-    vkCmdBeginRenderPass(cmd, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+    VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttachment.imageView = m_swapchainImageViews[imageIndex];
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.clearValue.color = {{0.53f, 0.81f, 0.92f, 1.0f}};
+    
+    VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depthAttachment.imageView = m_depthImageView;
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;  // READ_ONLY for depth testing
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;  // Load existing depth from G-buffer pass
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.clearValue.depthStencil = {1.0f, 0};
+
+    VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderingInfo.renderArea = {{0, 0}, m_swapchainExtent};
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachment;
+    renderingInfo.pDepthAttachment = &depthAttachment;
+
+    vkCmdBeginRendering(cmd, &renderingInfo);
 }
 
 void VulkanContext::endFrame(uint32_t imageIndex) {
@@ -587,10 +621,31 @@ void VulkanContext::endFrame(uint32_t imageIndex, bool endRenderPass) {
 }
 
 VkCommandBuffer VulkanContext::beginSingleTimeCommands() {
+    std::thread::id threadId = std::this_thread::get_id();
+    VkCommandPool pool;
+    
+    {
+        std::lock_guard<std::mutex> lock(m_poolMapMutex);
+        auto it = m_threadCommandPools.find(threadId);
+        if (it == m_threadCommandPools.end()) {
+            VkCommandPoolCreateInfo poolInfo{};
+            poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            poolInfo.queueFamilyIndex = m_graphicsFamily;
+            poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            
+            if (vkCreateCommandPool(m_device, &poolInfo, nullptr, &pool) != VK_SUCCESS) {
+                return VK_NULL_HANDLE;
+            }
+            m_threadCommandPools[threadId] = pool;
+        } else {
+            pool = it->second;
+        }
+    }
+    
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = m_commandPool;
+    allocInfo.commandPool = pool;
     allocInfo.commandBufferCount = 1;
 
     VkCommandBuffer commandBuffer;
@@ -599,7 +654,6 @@ VkCommandBuffer VulkanContext::beginSingleTimeCommands() {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
     vkBeginCommandBuffer(commandBuffer, &beginInfo);
 
     return commandBuffer;
@@ -608,15 +662,23 @@ VkCommandBuffer VulkanContext::beginSingleTimeCommands() {
 void VulkanContext::endSingleTimeCommands(VkCommandBuffer commandBuffer) {
     vkEndCommandBuffer(commandBuffer);
 
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence;
+    vkCreateFence(m_device, &fenceInfo, nullptr, &fence);
+
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
 
-    vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_graphicsQueue);
-
-    vkFreeCommandBuffers(m_device, m_commandPool, 1, &commandBuffer);
+    vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence);
+    vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(m_device, fence, nullptr);
+    
+    std::thread::id threadId = std::this_thread::get_id();
+    VkCommandPool pool = m_threadCommandPools[threadId];
+    vkFreeCommandBuffers(m_device, pool, 1, &commandBuffer);
 }
 
 VulkanQueueFamilyIndices VulkanContext::findQueueFamilies(VkPhysicalDevice device) {
@@ -900,6 +962,12 @@ void VulkanContext::cleanup() {
     }
     
     vkDestroyCommandPool(m_device, m_commandPool, nullptr);
+    
+    for (auto& pair : m_threadCommandPools) {
+        vkDestroyCommandPool(m_device, pair.second, nullptr);
+    }
+    m_threadCommandPools.clear();
+    
     vkDestroyRenderPass(m_device, m_renderPass, nullptr);
     
     if (m_pipelineCache != VK_NULL_HANDLE) {

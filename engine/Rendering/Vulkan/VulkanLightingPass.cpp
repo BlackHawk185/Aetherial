@@ -5,8 +5,7 @@
 
 bool VulkanLightingPass::initialize(VkDevice device, VmaAllocator allocator, VkPipelineCache pipelineCache,
                                     VkDescriptorSetLayout gBufferDescriptorLayout,
-                                    VkFormat outputFormat,
-                                    VkRenderPass externalRenderPass)
+                                    VkFormat outputFormat)
 {
     destroy();
 
@@ -25,16 +24,6 @@ bool VulkanLightingPass::initialize(VkDevice device, VmaAllocator allocator, VkP
     }
 
     if (!createDescriptorLayouts()) return false;
-    
-    // Use external render pass if provided, otherwise create own
-    if (externalRenderPass != VK_NULL_HANDLE) {
-        m_renderPass = externalRenderPass;
-        m_ownsRenderPass = false;
-    } else {
-        if (!createRenderPass()) return false;
-        m_ownsRenderPass = true;
-    }
-    
     if (!createPipeline()) return false;
 
     std::cout << "✅ VulkanLightingPass initialized (cascade light maps enabled)" << std::endl;
@@ -135,40 +124,7 @@ bool VulkanLightingPass::createDescriptorLayouts() {
     return true;
 }
 
-bool VulkanLightingPass::createRenderPass() {
-    // Single color attachment (HDR output)
-    VkAttachmentDescription colorAttachment = {};
-    colorAttachment.format = m_outputFormat;
-    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-    VkAttachmentReference colorRef = {};
-    colorRef.attachment = 0;
-    colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-    VkSubpassDescription subpass = {};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &colorRef;
-
-    VkRenderPassCreateInfo renderPassInfo = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    renderPassInfo.attachmentCount = 1;
-    renderPassInfo.pAttachments = &colorAttachment;
-    renderPassInfo.subpassCount = 1;
-    renderPassInfo.pSubpasses = &subpass;
-
-    if (vkCreateRenderPass(m_device, &renderPassInfo, nullptr, &m_renderPass) != VK_SUCCESS) {
-        std::cerr << "❌ Failed to create lighting render pass" << std::endl;
-        return false;
-    }
-
-    return true;
-}
+// createRenderPass removed - using dynamic rendering
 
 bool VulkanLightingPass::createPipeline() {
     // Load shaders
@@ -257,7 +213,14 @@ bool VulkanLightingPass::createPipeline() {
     dynamicState.dynamicStateCount = 2;
     dynamicState.pDynamicStates = dynamicStates;
 
+    // Dynamic rendering: specify HDR format
+    VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachmentFormats = &m_outputFormat;
+    renderingInfo.depthAttachmentFormat = VK_FORMAT_D24_UNORM_S8_UINT;
+
     VkGraphicsPipelineCreateInfo pipelineInfo = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipelineInfo.pNext = &renderingInfo;
     pipelineInfo.stageCount = 2;
     pipelineInfo.pStages = shaderStages;
     pipelineInfo.pVertexInputState = &vertexInputInfo;
@@ -269,8 +232,6 @@ bool VulkanLightingPass::createPipeline() {
     pipelineInfo.pColorBlendState = &colorBlending;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = m_pipelineLayout;
-    pipelineInfo.renderPass = m_renderPass;
-    pipelineInfo.subpass = 0;
 
     if (vkCreateGraphicsPipelines(m_device, m_pipelineCache, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS) {
         std::cerr << "❌ Failed to create lighting pipeline" << std::endl;
@@ -367,10 +328,11 @@ bool VulkanLightingPass::updateDescriptorSet(const VulkanShadowMap& shadowMap, V
     VkWriteDescriptorSet writes[4] = {};
 
     // Binding 0: Shadow map array
+    // NOTE: Shadow map is UNDEFINED at init, will be updated before first use
     VkDescriptorImageInfo shadowInfo = {};
     shadowInfo.sampler = m_shadowSampler;
     shadowInfo.imageView = shadowMap.getView();
-    shadowInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    shadowInfo.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = m_lightingDescriptorSet;
@@ -497,10 +459,7 @@ void VulkanLightingPass::destroy() {
         m_lightingLayout = VK_NULL_HANDLE;
     }
 
-    if (m_renderPass && m_ownsRenderPass) {
-        vkDestroyRenderPass(m_device, m_renderPass, nullptr);
-        m_renderPass = VK_NULL_HANDLE;
-    }
+
 
     if (m_fragShader) {
         vkDestroyShaderModule(m_device, m_fragShader, nullptr);

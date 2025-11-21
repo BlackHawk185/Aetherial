@@ -96,9 +96,9 @@ void main() {
     // Reconstruct ray direction
     vec3 rayDir = normalize(sceneWorldPos - cameraPos);
     
-    // Simple forward raymarching (no height culling)
+    // Raymarch through full distance (composite depth test handles occlusion)
     float tMin = 0.0;
-    float tMax = min(MAX_DISTANCE, sceneDistance);
+    float tMax = MAX_DISTANCE;
     
     // Raymarch through cloud layer
     float timeOfDay = params.cloudParams.w;
@@ -142,5 +142,8 @@ void main() {
     }
     
     float alpha = 1.0 - transmittance;
+    
+    if (alpha < 0.01) discard;
+    
     FragColor = vec4(cloudColor, alpha);
 }

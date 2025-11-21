@@ -40,7 +40,7 @@ public:
     void renderToGBuffer(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::mat4& view);
     
     // Depth-only rendering for shadow cascades (Phase 4)
-    void renderDepthOnly(VkCommandBuffer cmd, VkRenderPass shadowRenderPass, const glm::mat4& lightViewProjection);
+    void renderDepthOnly(VkCommandBuffer cmd, const glm::mat4& lightViewProjection);
     
     // Phase 2 testing: render to swapchain (simplified, no G-buffer)
     void renderToSwapchain(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::mat4& view);
@@ -115,7 +115,7 @@ private:
     void createPipeline();
     void createSwapchainPipeline();  // Phase 2 testing
     void createDepthOnlyPipeline();  // Phase 4: shadow map rendering (stub)
-    void ensureDepthPipeline(VkRenderPass shadowRenderPass);  // Lazy creation with render pass
+    void ensureDepthPipeline();  // Lazy creation for dynamic rendering
     void createDescriptorPool();
     void updateDescriptorSets();
     bool loadBlockTextureArray();

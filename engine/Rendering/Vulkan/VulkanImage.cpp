@@ -63,6 +63,7 @@ bool VulkanImage::createArray(VmaAllocator allocator, uint32_t width, uint32_t h
     m_layers = layers;
     m_format = format;
     m_aspect = aspect;
+    m_currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     // Get device from allocator
     VmaAllocatorInfo allocInfo;
@@ -164,6 +165,15 @@ void VulkanImage::transitionLayout(VkCommandBuffer commandBuffer,
                          0, nullptr, 0, nullptr, 1, &barrier);
 }
 
+void VulkanImage::transitionTo(VkCommandBuffer cmd, VkImageLayout newLayout,
+                               VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
+    if (!m_image) return;
+    if (m_currentLayout == newLayout) return; // Already in target layout
+    
+    transitionLayout(cmd, m_currentLayout, newLayout, srcStage, dstStage);
+    m_currentLayout = newLayout;
+}
+
 void VulkanImage::destroy() {
     if (m_view != VK_NULL_HANDLE && m_device != VK_NULL_HANDLE) {
         vkDestroyImageView(m_device, m_view, nullptr);
@@ -181,4 +191,5 @@ void VulkanImage::destroy() {
     m_width = 0;
     m_height = 0;
     m_layers = 1;
+    m_currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 }

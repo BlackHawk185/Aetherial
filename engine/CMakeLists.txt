@@ -15,6 +15,7 @@ add_library(engine STATIC
     World/IslandChunkSystem.cpp
     World/VoxelRaycaster.cpp
     World/BlockType.cpp
+    World/BlockDamageTracker.cpp
     World/ConnectivityAnalyzer.cpp
     World/ElementRecipes.cpp
     World/VoronoiIslandPlacer.cpp
@@ -40,7 +41,6 @@ add_library(engine STATIC
     Rendering/Vulkan/VulkanGBuffer.cpp
     Rendering/Vulkan/VulkanDeferred.cpp
     Rendering/Vulkan/VulkanShadowMap.cpp
-    Rendering/Vulkan/VulkanLightingPass.cpp
     Rendering/Vulkan/VulkanSSR.cpp
     Rendering/Vulkan/VulkanSkyRenderer.cpp
     Rendering/Vulkan/VulkanCloudRenderer.cpp

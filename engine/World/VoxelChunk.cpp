@@ -83,6 +83,14 @@ void VoxelChunk::setRawVoxelData(const uint8_t* data, uint32_t size)
                 
                 const BlockTypeInfo* blockInfo = registry.getBlockType(blockType);
                 if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
+                    // Water culling: only render if air above (prevent vertical stacking reflections)
+                    if (blockType == BlockID::WATER) {
+                        uint8_t blockAbove = (y + 1 < SIZE) ? getVoxel(x, y + 1, z) : BlockID::AIR;
+                        if (blockAbove != BlockID::AIR) {
+                            continue;  // Water is occluded by block above, skip rendering
+                        }
+                    }
+                    
                     glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
                     m_modelInstances[blockType].push_back(pos);
                 }
@@ -951,8 +959,47 @@ void VoxelChunk::setVoxelWithQuadManipulation(int x, int y, int z, uint8_t type)
     }
     
     if (newBlockInfo && newBlockInfo->renderType == BlockRenderType::OBJ) {
-        glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-        m_modelInstances[type].push_back(pos);
+        // Water culling: only render if air above
+        bool shouldRender = true;
+        if (type == BlockID::WATER) {
+            uint8_t blockAbove = (y + 1 < SIZE) ? getVoxel(x, y + 1, z) : BlockID::AIR;
+            shouldRender = (blockAbove == BlockID::AIR);
+        }
+        
+        if (shouldRender) {
+            glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+            m_modelInstances[type].push_back(pos);
+        }
+    }
+    
+    // If we removed a block, check if water below should now be visible
+    if (oldType != BlockID::AIR && type == BlockID::AIR && y > 0) {
+        uint8_t blockBelow = getVoxel(x, y - 1, z);
+        if (blockBelow == BlockID::WATER) {
+            const BlockTypeInfo* waterInfo = registry.getBlockType(BlockID::WATER);
+            if (waterInfo && waterInfo->renderType == BlockRenderType::OBJ) {
+                // Water below now has air above - make it visible
+                glm::vec3 posBelow(static_cast<float>(x), static_cast<float>(y - 1), static_cast<float>(z));
+                auto& waterInstances = m_modelInstances[BlockID::WATER];
+                // Check if not already present
+                if (std::find(waterInstances.begin(), waterInstances.end(), posBelow) == waterInstances.end()) {
+                    waterInstances.push_back(posBelow);
+                }
+            }
+        }
+    }
+    
+    // If we placed a block on top of water, hide the water below
+    if (type != BlockID::AIR && oldType == BlockID::AIR && y > 0) {
+        uint8_t blockBelow = getVoxel(x, y - 1, z);
+        if (blockBelow == BlockID::WATER) {
+            glm::vec3 posBelow(static_cast<float>(x), static_cast<float>(y - 1), static_cast<float>(z));
+            auto it = m_modelInstances.find(BlockID::WATER);
+            if (it != m_modelInstances.end()) {
+                auto& instances = it->second;
+                instances.erase(std::remove(instances.begin(), instances.end(), posBelow), instances.end());
+            }
+        }
     }
     
     auto mesh = getRenderMesh();

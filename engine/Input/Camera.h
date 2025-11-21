@@ -19,6 +19,7 @@ public:
     glm::mat4 getViewMatrix();
     void getProjectionMatrix(float* matrix, float aspect);
     glm::mat4 getProjectionMatrix(float aspect);
+    glm::mat4 getWideFOVProjectionMatrix(float aspect);  // Wide FOV for SSR data
     
     // Frustum calculation for culling
     void updateFrustum(float aspect);

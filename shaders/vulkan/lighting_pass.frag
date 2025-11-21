@@ -73,14 +73,12 @@ layout(set = 1, binding = 2) uniform CascadeData {
 // SSR texture (Set 1)
 layout(set = 1, binding = 3) uniform sampler2D uSSRReflections;
 
-// Push constants
 layout(push_constant) uniform LightingParams {
-    vec4 sunDirection;     // xyz = direction, w = intensity
-    vec4 moonDirection;    // xyz = direction, w = intensity
-    vec4 sunColor;         // rgb = color
-    vec4 moonColor;        // rgb = color
-    vec4 cameraPos;        // xyz = position, w = timeOfDay
-    vec4 cascadeParams;    // x = ditherStrength, y = enableCloudShadows
+    vec4 sunDirection;
+    vec4 moonDirection;
+    vec4 sunColor;
+    vec4 moonColor;
+    vec4 cameraPos;
 } lighting;
 
 // Output
@@ -114,9 +112,8 @@ const vec2 POISSON[32] = vec2[32](
     vec2(-0.42024112, -0.88588715), vec2(0.02940664, 0.94268930)
 );
 
-// Sample cloud shadow occlusion
 float sampleCloudShadow(vec3 worldPos, float time) {
-    if (lighting.cascadeParams.y < 0.5) return 0.0;
+    return 0.0;
     
     const int SHADOW_SAMPLES = 6;
     float totalOcclusion = 0.0;
@@ -275,10 +272,12 @@ void main() {
     vec3 albedo = albedoAO.rgb;
     float ao = albedoAO.a;
     vec4 normalRoughness = texture(gNormal, vTexCoord);
-    vec3 normal = normalRoughness.rgb;
+    vec3 normal = normalRoughness.rgb * 2.0 - 1.0;  // Decode [0,1] to [-1,1]
     float roughness = normalRoughness.a;
     vec3 worldPos = texture(gPosition, vTexCoord).rgb;
     vec4 metadata = texture(gMetadata, vTexCoord);
+    float metallic = metadata.r;
+    float materialFlag = metadata.g;
     float depth = texture(gDepth, vTexCoord).r;
     
     if (depth >= 0.9999) {
@@ -287,9 +286,10 @@ void main() {
     
     vec3 N = normalize(normal);
     vec3 V = normalize(lighting.cameraPos.xyz - worldPos);
-    float materialID = metadata.x;
-    uint blockType = uint(materialID * 255.0 + 0.5);
-    bool isWater = (blockType == 45u);
+    // Water detection: OBJ water (materialFlag > 0.5) OR voxel water (blockType 45 = 0.176)
+    bool isWaterOBJ = (materialFlag > 0.5);
+    bool isWaterVoxel = (metadata.r > 0.17 && metadata.r < 0.18);
+    bool isWater = isWaterOBJ || isWaterVoxel;
     
     vec3 L_sun = normalize(-lighting.sunDirection.xyz);
     float bias_sun = 0.0005;
@@ -308,24 +308,32 @@ void main() {
     vec3 finalColor;
     
     if (isWater) {
-        float waterMetallic = 0.02;
-        float waterRoughness = 0.1;
-        vec3 sunRadiance = lighting.sunColor.rgb * lighting.sunDirection.w * sunLightFactor;
-        vec3 moonRadiance = lighting.moonColor.rgb * lighting.moonDirection.w * 0.15 * moonLightFactor;
-        vec3 sunPBR = calculatePBR(N, V, L_sun, albedo, waterMetallic, waterRoughness, sunRadiance);
-        vec3 moonPBR = calculatePBR(N, V, L_moon, albedo, waterMetallic, waterRoughness, moonRadiance);
-        vec3 F0 = mix(vec3(0.04), albedo, waterMetallic);
-        vec3 F = fresnelSchlick(max(dot(N, V), 0.0), F0);
-        vec3 reflectionColor = mix(vec3(0.0), ssrColor, ssrStrength);
-        finalColor = sunPBR + moonPBR + reflectionColor * F;
+        // Water outputs base lit color only - SSR will be composited on top later
+        // This prevents double-reflection since SSR samples this lit output
+        
+        // Sun specular
+        vec3 H_sun = normalize(L_sun + V);
+        float specSun = pow(max(dot(N, H_sun), 0.0), 256.0) * sunLightFactor;
+        vec3 sunSpecular = lighting.sunColor.rgb * specSun * lighting.sunDirection.w * 3.0;
+        
+        // Moon specular
+        vec3 H_moon = normalize(L_moon + V);
+        float specMoon = pow(max(dot(N, H_moon), 0.0), 128.0) * moonLightFactor;
+        vec3 moonSpecular = lighting.moonColor.rgb * specMoon * lighting.moonDirection.w * 0.5;
+        
+        // Water diffuse (base color tinted by lighting)
+        vec3 waterDiffuse = albedo * (sunLightFactor * lighting.sunDirection.w + moonLightFactor * lighting.moonDirection.w * 0.15);
+        
+        // Output: lit water base + speculars (no reflections here, added by composition)
+        finalColor = waterDiffuse + sunSpecular + moonSpecular;
     } else {
-        float metallic = 0.0;
         float effectiveRoughness = roughness;
         vec3 sunRadiance = lighting.sunColor.rgb * lighting.sunDirection.w * sunLightFactor;
         vec3 moonRadiance = lighting.moonColor.rgb * lighting.moonDirection.w * 0.15 * moonLightFactor;
         vec3 sunPBR = calculatePBR(N, V, L_sun, albedo, metallic, effectiveRoughness, sunRadiance);
         vec3 moonPBR = calculatePBR(N, V, L_moon, albedo, metallic, effectiveRoughness, moonRadiance);
-        vec3 reflectionTerm = ssrColor * ssrStrength * (1.0 - effectiveRoughness) * metallic;
+        // Apply SSR only to metallic surfaces, NOT water (SSR for water happens in composite pass)
+        vec3 reflectionTerm = vec3(0.0);
         finalColor = (sunPBR + moonPBR) * ao + reflectionTerm;
     }
     

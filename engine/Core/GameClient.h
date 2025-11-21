@@ -6,6 +6,7 @@
 #include "../Input/PlayerController.h"
 #include "../World/VoxelRaycaster.h"
 #include "../World/ElementRecipes.h"  // NEW: Element-based crafting system
+#include "../World/BlockDamageTracker.h"  // NEW: Multi-hit block breaking system
 #include "../Network/NetworkManager.h"  // Re-enabled with ENet integration working
 #include "../Time/DayNightController.h"  // NEW: Simplified day/night cycle
 #include <memory>
@@ -167,11 +168,37 @@ private:
     
     // Input state
     struct InputState {
-        bool leftMousePressed = false;
-        bool rightMousePressed = false;
+        bool leftMouseWasPressed = false;  // Previous frame state for edge detection
+        bool rightMouseWasPressed = false; // Previous frame state for edge detection
         float raycastTimer = 0.0f;
         RayHit cachedTargetBlock;  // Cache raycast results for performance
+        
+        // Freeplace reticle system
+        float reticleDistance = 5.0f;  // Distance from camera along forward vector
+        Vec3 reticleWorldPos;          // Current reticle position in world space
+        bool reticleHasTarget = false; // Whether reticle found a valid placement target
+        Vec3 reticleSnapPos;           // Snapped placement position
+        uint32_t reticleIslandID = 0;  // Island for placement
+        
+        // Hold detection for geometry mode
+        float leftHoldTimer = 0.0f;    // Time LMB has been held
+        float rightHoldTimer = 0.0f;   // Time RMB has been held
+        const float holdThreshold = 0.10f; // 100ms to distinguish tap from hold
+        
+        // Lock state (geometry definition)
+        bool hasLockA = false;         // Lock A defined
+        bool hasLockB = false;         // Lock B defined
+        Vec3 lockAPos;                 // Position of Lock A in island-local coords
+        Vec3 lockBPos;                 // Position of Lock B in island-local coords
+        uint32_t lockAIslandID = 0;    // Island ID for Lock A
+        uint32_t lockBIslandID = 0;    // Island ID for Lock B
+        
+        // Auto-operation rate (when both locks defined)
+        const float autoOperationRate = 0.333f;  // 3 blocks per second = 333ms per block
     } m_inputState;
+    
+    // Block damage tracking (multi-hit breaking)
+    BlockDamageTracker m_blockDamage;
     
     // Client-side prediction tracking
     struct PendingVoxelChange {

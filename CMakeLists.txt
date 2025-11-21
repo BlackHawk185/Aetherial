@@ -58,6 +58,8 @@ set(REQUIRED_VULKAN_SHADERS
     ssr.comp
     model_instance.vert
     model_instance.frag
+    composite.vert
+    composite.frag
 )
 
 # Verify all required shaders exist in source

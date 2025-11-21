@@ -62,11 +62,10 @@ public:
     void destroy();
 
     // Accessors
-    VkRenderPass getRenderPass() const { return m_renderPass; }
-    VkFramebuffer getFramebuffer(uint32_t cascadeIndex) const { 
-        return m_framebuffers[cascadeIndex]; 
-    }
     VkImageView getView() const { return m_shadowImage.getView(); }
+    VkImageView getCascadeView(uint32_t cascadeIndex) const { 
+        return m_cascadeImageViews[cascadeIndex]; 
+    }
     VkImageView getShadowMapImageView() const { return m_shadowImage.getView(); }
     VkSampler getShadowSampler() const { return m_shadowSampler; }
     
@@ -78,8 +77,7 @@ public:
 
 private:
     bool createShadowImage();
-    bool createRenderPass();
-    bool createFramebuffers();
+    bool createCascadeViews();
     bool createSampler();
 
     VkDevice m_device = VK_NULL_HANDLE;
@@ -90,12 +88,8 @@ private:
     // Shadow map image array (depth texture with multiple layers)
     VulkanImage m_shadowImage;
     
-    // Per-cascade framebuffers and image views
+    // Per-cascade image views (for individual rendering)
     std::vector<VkImageView> m_cascadeImageViews;
-    std::vector<VkFramebuffer> m_framebuffers;
-    
-    // Render pass for depth-only rendering
-    VkRenderPass m_renderPass = VK_NULL_HANDLE;
     
     // Shadow sampler (with PCF and border clamp)
     VkSampler m_shadowSampler = VK_NULL_HANDLE;

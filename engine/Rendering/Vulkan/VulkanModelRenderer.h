@@ -6,8 +6,10 @@
 #include <glm/glm.hpp>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <string>
+#include <mutex>
 #include "VulkanBuffer.h"
 #include "../../Assets/GLBLoader.h"
 
@@ -19,7 +21,7 @@ public:
     VulkanModelRenderer();
     ~VulkanModelRenderer();
 
-    bool initialize(VulkanContext* ctx, VkRenderPass gbufferRenderPass);
+    bool initialize(VulkanContext* ctx);
     void shutdown();
 
     // Model loading (called once per block type)
@@ -61,6 +63,8 @@ private:
     
     // Model cache - one entry per BlockID that uses OBJ render type
     std::unordered_map<uint8_t, ModelData> m_models;
+    std::unordered_set<uint8_t> m_loadingModels;  // Track models currently being loaded
+    std::mutex m_modelsMutex;  // Protect model cache and loading set
     
     // Per-chunk instance tracking
     std::unordered_map<VoxelChunk*, std::vector<DrawBatch>> m_chunkBatches;
@@ -79,7 +83,7 @@ private:
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
-    VkRenderPass m_gbufferRenderPass = VK_NULL_HANDLE;
+
     
     // Helper functions
     void createMagentaCube(uint8_t blockID);

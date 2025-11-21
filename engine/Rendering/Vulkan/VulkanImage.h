@@ -66,6 +66,14 @@ public:
     uint32_t getHeight() const { return m_height; }
     uint32_t getLayers() const { return m_layers; }
     bool isValid() const { return m_image != VK_NULL_HANDLE; }
+    
+    // Layout tracking
+    VkImageLayout getCurrentLayout() const { return m_currentLayout; }
+    void setCurrentLayout(VkImageLayout layout) { m_currentLayout = layout; }
+    
+    // State-aware transition (uses tracked current layout)
+    void transitionTo(VkCommandBuffer cmd, VkImageLayout newLayout, 
+                      VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage);
 
 private:
     VkImage m_image = VK_NULL_HANDLE;
@@ -78,5 +86,6 @@ private:
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     uint32_t m_layers = 1;
+    VkImageLayout m_currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags m_aspect = 0;
 };

@@ -28,7 +28,7 @@ public:
 
     void compute(VkCommandBuffer cmd, 
                  VkImageView gNormal, VkImageView gPosition, VkImageView gDepth, 
-                 VkImageView gMetadata, VkImageView colorBuffer,
+                 VkImageView gMetadata, VkImageView hdrBuffer,
                  const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix);
 
     VkImageView getOutputView() const { return m_reflectionImage.getView(); }

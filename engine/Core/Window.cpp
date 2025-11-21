@@ -118,6 +118,7 @@ bool Window::setupCallbacks() {
     glfwSetKeyCallback(m_window, glfwKeyCallback);
     glfwSetCursorPosCallback(m_window, glfwCursorPosCallback);
     glfwSetFramebufferSizeCallback(m_window, glfwFramebufferSizeCallback);
+    glfwSetScrollCallback(m_window, glfwScrollCallback);
 
     return true;
 }
@@ -163,6 +164,13 @@ void Window::glfwFramebufferSizeCallback(GLFWwindow* window, int width, int heig
         if (windowInstance->m_resizeCallback) {
             windowInstance->m_resizeCallback(width, height);
         }
+    }
+}
+
+void Window::glfwScrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
+    Window* windowInstance = static_cast<Window*>(glfwGetWindowUserPointer(window));
+    if (windowInstance && windowInstance->m_scrollCallback) {
+        windowInstance->m_scrollCallback(xoffset, yoffset);
     }
 }
 

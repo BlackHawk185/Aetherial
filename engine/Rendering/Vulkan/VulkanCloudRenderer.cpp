@@ -453,8 +453,17 @@ bool VulkanCloudRenderer::createPipeline() {
     dynamicState.dynamicStateCount = 2;
     dynamicState.pDynamicStates = dynamicStates;
 
-    // Create pipeline
+    // Create pipeline with dynamic rendering
+    VkFormat swapchainFormat = m_context->getSwapchainFormat();
+    VkFormat depthFormat = m_context->getDepthFormat();
+    
+    VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachmentFormats = &swapchainFormat;
+    renderingInfo.depthAttachmentFormat = depthFormat;  // Must match render pass depth format even if depth testing disabled
+    
     VkGraphicsPipelineCreateInfo pipelineInfo = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipelineInfo.pNext = &renderingInfo;
     pipelineInfo.stageCount = 2;
     pipelineInfo.pStages = shaderStages;
     pipelineInfo.pVertexInputState = &vertexInputInfo;
@@ -466,8 +475,6 @@ bool VulkanCloudRenderer::createPipeline() {
     pipelineInfo.pColorBlendState = &colorBlending;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = m_pipelineLayout;
-    pipelineInfo.renderPass = m_renderPass;
-    pipelineInfo.subpass = 0;
 
     result = vkCreateGraphicsPipelines(m_device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_pipeline);
     if (result != VK_SUCCESS) {
@@ -495,8 +502,13 @@ void VulkanCloudRenderer::render(VkCommandBuffer cmd, VkImageView depthTexture,
     }
     
     // Update depth texture in descriptor set (dynamic)
+    VulkanLayoutTracker::getInstance().recordDescriptorWrite(
+        depthTexture,
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        "VulkanCloudRenderer: Depth descriptor update");
+    
     VkDescriptorImageInfo depthImageInfo = {};
-    depthImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    depthImageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
     depthImageInfo.imageView = depthTexture;
     depthImageInfo.sampler = m_depthSampler;
 

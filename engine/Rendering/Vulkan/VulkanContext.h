@@ -9,6 +9,9 @@
 #include <GLFW/glfw3.h>
 #include <vector>
 #include <optional>
+#include <mutex>
+#include <unordered_map>
+#include <thread>
 
 struct VulkanQueueFamilyIndices {
     std::optional<uint32_t> graphicsFamily;
@@ -58,6 +61,7 @@ public:
     VkFormat getSwapchainImageFormat() const { return m_swapchainImageFormat; }
     VkFormat getSwapchainFormat() const { return m_swapchainImageFormat; }
     VmaAllocator getAllocator() const { return m_allocator; }
+    VkImage getSwapchainImage(uint32_t index) const { return m_swapchainImages[index]; }
     VkImageView getSwapchainImageView(uint32_t index) const { return m_swapchainImageViews[index]; }
     VkImageView getDepthImageView() const { return m_depthImageView; }
     VkImage getDepthImage() const { return m_depthImage; }
@@ -124,6 +128,7 @@ private:
     
     VkQueue m_graphicsQueue = VK_NULL_HANDLE;
     VkQueue m_presentQueue = VK_NULL_HANDLE;
+    uint32_t m_graphicsFamily = 0;
     
     VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
     std::vector<VkImage> m_swapchainImages;
@@ -142,6 +147,8 @@ private:
     
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> m_commandBuffers;
+    std::unordered_map<std::thread::id, VkCommandPool> m_threadCommandPools;
+    std::mutex m_poolMapMutex;
     
     VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     

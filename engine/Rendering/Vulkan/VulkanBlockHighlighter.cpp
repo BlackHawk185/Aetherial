@@ -260,8 +260,17 @@ bool VulkanBlockHighlighter::createPipeline() {
     dynamicState.dynamicStateCount = 2;
     dynamicState.pDynamicStates = dynamicStates;
     
+    VkFormat swapchainFormat = m_context->getSwapchainFormat();
+    VkFormat depthFormat = m_context->getDepthFormat();
+    
+    VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachmentFormats = &swapchainFormat;
+    renderingInfo.depthAttachmentFormat = depthFormat;
+    
     VkGraphicsPipelineCreateInfo pipelineInfo = {};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingInfo;
     pipelineInfo.stageCount = 2;
     pipelineInfo.pStages = stages;
     pipelineInfo.pVertexInputState = &vertexInput;
@@ -273,8 +282,6 @@ bool VulkanBlockHighlighter::createPipeline() {
     pipelineInfo.pColorBlendState = &colorBlend;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = m_pipelineLayout;
-    pipelineInfo.renderPass = m_context->getRenderPass();
-    pipelineInfo.subpass = 0;
     
     if (vkCreateGraphicsPipelines(m_context->device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS) {
         std::cerr << "[VulkanBlockHighlighter] Failed to create pipeline\n";

@@ -412,6 +412,16 @@ bool GameClient::initializeWindow()
 
     // Set resize callback to update camera/aspect
     m_window->setResizeCallback([this](int width, int height) { this->onWindowResize(width, height); });
+    
+    // Set scroll callback for reticle distance adjustment
+    m_window->setScrollCallback([this](double /*xoffset*/, double yoffset) {
+        // Adjust reticle distance (yoffset is positive for scroll up, negative for scroll down)
+        const float scrollSensitivity = 0.5f;
+        m_inputState.reticleDistance += static_cast<float>(yoffset) * scrollSensitivity;
+        
+        // Clamp to reasonable range
+        m_inputState.reticleDistance = glm::clamp(m_inputState.reticleDistance, 1.0f, 50.0f);
+    });
 
     // Set up mouse capture on underlying GLFW window
     glfwSetInputMode(m_window->getHandle(), GLFW_CURSOR, GLFW_CURSOR_DISABLED);
@@ -510,10 +520,10 @@ bool GameClient::initializeVulkan()
                                       m_vulkanContext->getAllocator(),
                                       m_vulkanContext->pipelineCache,
                                       m_vulkanContext->getSwapchainFormat(),
-                                      m_vulkanContext->getRenderPass(),  // Use swapchain render pass
                                       m_windowWidth, m_windowHeight,
                                       m_vulkanContext->getGraphicsQueue(),
-                                      m_vulkanContext->getCommandPool()))
+                                      m_vulkanContext->getCommandPool(),
+                                      m_vulkanContext.get()))
     {
         std::cerr << "❌ Failed to initialize VulkanDeferred!" << std::endl;
         return false;
@@ -531,7 +541,7 @@ bool GameClient::initializeVulkan()
     
     // Initialize Vulkan model renderer (for GLB models) - requires G-Buffer render pass
     m_vulkanModelRenderer = std::make_unique<VulkanModelRenderer>();
-    if (!m_vulkanModelRenderer->initialize(m_vulkanContext.get(), m_vulkanDeferred->getGeometryRenderPass()))
+    if (!m_vulkanModelRenderer->initialize(m_vulkanContext.get()))
     {
         std::cerr << "❌ Failed to initialize VulkanModelRenderer!" << std::endl;
         return false;
@@ -550,7 +560,13 @@ bool GameClient::initializeVulkan()
     // Initialize GLFW backend for Vulkan
     ImGui_ImplGlfw_InitForVulkan(m_window->getHandle(), true);
     
-    // Initialize Vulkan backend for ImGui
+    // Initialize Vulkan backend for ImGui with dynamic rendering
+    VkFormat swapchainFormat = m_vulkanContext->getSwapchainFormat();
+    VkPipelineRenderingCreateInfo imguiRenderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    imguiRenderingInfo.colorAttachmentCount = 1;
+    imguiRenderingInfo.pColorAttachmentFormats = &swapchainFormat;
+    imguiRenderingInfo.depthAttachmentFormat = m_vulkanContext->getDepthFormat();
+    
     ImGui_ImplVulkan_InitInfo init_info = {};
     init_info.Instance = m_vulkanContext->instance;
     init_info.PhysicalDevice = m_vulkanContext->physicalDevice;
@@ -559,7 +575,8 @@ bool GameClient::initializeVulkan()
     init_info.Queue = m_vulkanContext->graphicsQueue;
     init_info.PipelineCache = VK_NULL_HANDLE;
     init_info.DescriptorPool = m_vulkanContext->descriptorPool;
-    init_info.RenderPass = m_vulkanContext->renderPass;
+    init_info.UseDynamicRendering = true;
+    init_info.PipelineRenderingCreateInfo = imguiRenderingInfo;
     init_info.MinImageCount = 2;
     init_info.ImageCount = static_cast<uint32_t>(m_vulkanContext->swapchainImages.size());
     init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
@@ -590,8 +607,10 @@ void GameClient::renderVulkan()
     // Calculate camera matrices
     float aspect = static_cast<float>(m_windowWidth) / static_cast<float>(m_windowHeight);
     glm::mat4 projectionMatrix = m_playerController.getCamera().getProjectionMatrix(aspect);
+    glm::mat4 wideFOVProjectionMatrix = m_playerController.getCamera().getWideFOVProjectionMatrix(aspect);
     glm::mat4 viewMatrix = m_playerController.getCamera().getViewMatrix();
     glm::mat4 viewProjection = projectionMatrix * viewMatrix;
+    glm::mat4 wideViewProjection = wideFOVProjectionMatrix * viewMatrix;
     
     // Update island transforms for Vulkan renderer (islands drift each frame)
     if (m_clientWorld)
@@ -640,7 +659,7 @@ void GameClient::renderVulkan()
     // PASS 0: SHADOW MAPS (Cascaded Light Maps)
     // ========================================
     // Calculate cascade matrices from camera frustum and sun direction
-    VulkanLightingPass::CascadeUniforms cascades{};
+    VulkanDeferred::CascadeUniforms cascades{};
     glm::vec3 camPos(m_playerController.getCamera().position.x,
                      m_playerController.getCamera().position.y,
                      m_playerController.getCamera().position.z);
@@ -688,7 +707,7 @@ void GameClient::renderVulkan()
             shadowMap.beginCascadeRender(cmd, i);
             
             // Render geometry from light's perspective
-            m_vulkanQuadRenderer->renderDepthOnly(cmd, shadowMap.getRenderPass(), cascades.cascadeVP[i]);
+            m_vulkanQuadRenderer->renderDepthOnly(cmd, cascades.cascadeVP[i]);
             
             shadowMap.endCascadeRender(cmd, i);
         }
@@ -702,49 +721,127 @@ void GameClient::renderVulkan()
     // ========================================
     if (m_vulkanDeferred)
     {
-        m_vulkanDeferred->beginGeometryPass(cmd);
+        // Depth layout cycle: Frame 0 needs explicit UNDEFINED->ATTACHMENT transition before G-buffer
+        // Subsequent frames: READ_ONLY->ATTACHMENT transition before G-buffer
+        static bool firstFrame = true;
         
-        // Render voxels to G-buffer
-        if (m_vulkanQuadRenderer)
-        {
-            m_vulkanQuadRenderer->renderToGBuffer(cmd, viewProjection, viewMatrix);
+        // Debug: Check what layout tracker thinks depth is in
+        auto& tracker = VulkanLayoutTracker::getInstance();
+        VkImageLayout currentTrackedLayout = tracker.getCurrentLayout(m_vulkanContext->getDepthImage());
+        if (tracker.m_verbose) {
+            printf("[LayoutTracker] GameClient before G-buffer: firstFrame=%d, tracker says depth is %s\n",
+                   firstFrame, tracker.getLayoutName(currentTrackedLayout));
         }
         
-        // Render GLB models to G-buffer
+        if (firstFrame) {
+            // Frame 0: Explicit barrier to transition UNDEFINED -> ATTACHMENT before G-buffer
+            // Cannot use UNDEFINED in VkRenderingAttachmentInfo (Vulkan spec VUID-VkRenderingAttachmentInfo-imageView-06135)
+            VulkanLayoutTracker::getInstance().recordTransition(
+                m_vulkanContext->getDepthImage(),
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                "GameClient: Frame 0 (UNDEFINED->ATTACHMENT before G-buffer)");
+            
+            VkImageMemoryBarrier depthToAttachment{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            depthToAttachment.srcAccessMask = 0;  // No prior access
+            depthToAttachment.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            depthToAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            depthToAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depthToAttachment.image = m_vulkanContext->getDepthImage();
+            depthToAttachment.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            depthToAttachment.subresourceRange.levelCount = 1;
+            depthToAttachment.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &depthToAttachment);
+            firstFrame = false;
+        } else {
+            // Frame 1+: Explicit barrier to transition READ_ONLY -> ATTACHMENT before G-buffer
+            VulkanLayoutTracker::getInstance().recordTransition(
+                m_vulkanContext->getDepthImage(),
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                "GameClient: Before G-buffer (READ_ONLY->ATTACHMENT)");
+            
+            VkImageMemoryBarrier depthToAttachment{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            depthToAttachment.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            depthToAttachment.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            depthToAttachment.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+            depthToAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depthToAttachment.image = m_vulkanContext->getDepthImage();
+            depthToAttachment.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            depthToAttachment.subresourceRange.levelCount = 1;
+            depthToAttachment.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &depthToAttachment);
+        }
+        
+        // G-buffer always receives depth in ATTACHMENT layout (transitioned above)
+        // Use wide FOV for rendering to capture more geometry for SSR
+        m_vulkanDeferred->beginGeometryPass(cmd, m_vulkanContext->getDepthImage(), m_vulkanContext->getDepthImageView(), 
+                                           VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        
+        // Render voxels to G-buffer (with wide FOV for SSR data)
+        if (m_vulkanQuadRenderer)
+        {
+            m_vulkanQuadRenderer->renderToGBuffer(cmd, wideViewProjection, viewMatrix);
+        }
+        
+        // Render GLB models to G-buffer (with wide FOV for SSR data)
         if (m_vulkanModelRenderer)
         {
-            m_vulkanModelRenderer->renderToGBuffer(cmd, viewProjection, viewMatrix);
+            m_vulkanModelRenderer->renderToGBuffer(cmd, wideViewProjection, viewMatrix);
         }
         
         m_vulkanDeferred->endGeometryPass(cmd);
+        
+        // Transition depth to read-only for lighting pass (descriptor read)
+        VulkanLayoutTracker::getInstance().recordTransition(
+            m_vulkanContext->getDepthImage(),
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            "GameClient: After G-buffer");
+        
+        VkImageMemoryBarrier depthBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        depthBarrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        depthBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        depthBarrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthBarrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        depthBarrier.image = m_vulkanContext->getDepthImage();
+        depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        depthBarrier.subresourceRange.levelCount = 1;
+        depthBarrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &depthBarrier);
+        
+        // Update depth descriptor to match new layout (first time only writes descriptor)
+        static bool depthDescriptorWritten = false;
+        if (!depthDescriptorWritten) {
+            VulkanLayoutTracker::getInstance().recordDescriptorWrite(
+                m_vulkanContext->getDepthImageView(),
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                "GameClient: FIRST depth descriptor write");
+            depthDescriptorWritten = true;
+        }
+        
+        VkDescriptorImageInfo depthInfo = {};
+        depthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        depthInfo.imageView = m_vulkanContext->getDepthImageView();
+        depthInfo.sampler = m_vulkanDeferred->getGBufferSampler();
+        
+        VkWriteDescriptorSet depthWrite = {};
+        depthWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        depthWrite.dstSet = m_vulkanDeferred->getLightingDescriptorSet();
+        depthWrite.dstBinding = 4;
+        depthWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        depthWrite.descriptorCount = 1;
+        depthWrite.pImageInfo = &depthInfo;
+        
+        vkUpdateDescriptorSets(m_vulkanContext->device, 1, &depthWrite, 0, nullptr);
     }
     
     // ========================================
-    // PASS 1.5: SCREEN SPACE REFLECTIONS (Compute SSR from G-buffer)
+    // PASS 1.5: LIGHTING TO HDR (ALL geometry including water)
     // ========================================
-    if (m_vulkanDeferred)
-    {
-        // Use G-buffer albedo as color input for SSR (it has SAMPLED_BIT unlike swapchain)
-        VkImageView colorBuffer = m_vulkanDeferred->getAlbedoView();
-        m_vulkanDeferred->computeSSR(cmd, colorBuffer, viewMatrix, projectionMatrix);
-    }
-    
-    // ========================================
-    // PASS 2: LIGHTING (Read G-buffer, write to swapchain)
-    // ========================================
-    
-    // Start swapchain render pass for final composition
-    m_vulkanContext->beginRenderPass(cmd, imageIndex);
-    
-    // Render skybox first (no lighting needed)
-    if (m_vulkanSkyRenderer)
-    {
-        m_vulkanSkyRenderer->render(cmd, sunDirGLM, sunIntensity, moonDirGLM, moonIntensity,
-                                   viewMatrix, projectionMatrix, timeOfDay);
-    }
-    
-    // Apply deferred lighting (reads G-buffer, applies sun/moon, writes to swapchain)
-    // Lighting pass now uses swapchain render pass, so it works inside this render pass
     if (m_vulkanDeferred)
     {
         VulkanDeferred::LightingParams lightingParams;
@@ -759,30 +856,36 @@ void GameClient::renderVulkan()
             timeOfDay
         );
         
-        // Get cloud noise texture for volumetric shadows
         VkImageView cloudNoise = m_vulkanCloudRenderer ? m_vulkanCloudRenderer->getNoiseTextureView() : VK_NULL_HANDLE;
-        VkImageView swapchainView = m_vulkanContext->getSwapchainImageView(imageIndex);
-        
-        m_vulkanDeferred->renderLightingPass(cmd, swapchainView, lightingParams, cascades, cloudNoise);
+        m_vulkanDeferred->renderLightingToHDR(cmd, lightingParams, cascades, cloudNoise);
     }
     
-    // Render block highlight (yellow wireframe cube on selected block)
-    if (m_vulkanBlockHighlighter && m_inputState.cachedTargetBlock.hit)
+    // ========================================
+    // PASS 1.6: SSR COMPUTE (raymarches lit HDR buffer for reflections)
+    // Runs AFTER lighting to capture lit scene colors
+    // ========================================
+    if (m_vulkanDeferred)
     {
-        auto& islands = m_clientWorld->getIslandSystem()->getIslands();
-        auto it = islands.find(m_inputState.cachedTargetBlock.islandID);
-        if (it != islands.end())
-        {
-            const FloatingIsland& island = it->second;
-            Vec3 localBlockPos = m_inputState.cachedTargetBlock.localBlockPos;
-            glm::mat4 islandTransform = island.getTransformMatrix();
-            m_vulkanBlockHighlighter->render(cmd, localBlockPos, islandTransform, viewProjection);
-        }
+        // SSR uses wide FOV projection to access extended geometry data
+        m_vulkanDeferred->computeSSR(cmd, viewMatrix, wideFOVProjectionMatrix);
     }
     
-    // Depth already transitioned to shader-read before render pass began
+    // ========================================
+    // PASS 2: FINAL COMPOSITION (Sky + HDR + SSR)
+    // ========================================
     
-    // Render volumetric clouds
+    // Depth remains in READ_ONLY_OPTIMAL for depth testing during composition
+    // Start swapchain render pass for final composition
+    m_vulkanContext->beginRenderPass(cmd, imageIndex);
+    
+    // Render skybox first
+    if (m_vulkanSkyRenderer)
+    {
+        m_vulkanSkyRenderer->render(cmd, sunDirGLM, sunIntensity, moonDirGLM, moonIntensity,
+                                   viewMatrix, projectionMatrix, timeOfDay);
+    }
+    
+    // Render volumetric clouds (before terrain, so terrain occludes them)
     if (m_vulkanCloudRenderer)
     {
         VulkanCloudRenderer::CloudParams cloudParams;
@@ -794,9 +897,86 @@ void GameClient::renderVulkan()
         cloudParams.cloudDensity = 0.5f;
         cloudParams.cloudSpeed = 0.5f;
         
-        VkImageView depthView = m_vulkanDeferred->getDepthView();
+        // Depth view is from VulkanContext (D32_SFLOAT), not G-buffer
+        VkImageView depthView = m_vulkanContext->getDepthImageView();
         m_vulkanCloudRenderer->render(cmd, depthView,
                                      viewMatrix, projectionMatrix, cloudParams);
+    }
+    
+    // Composite HDR + SSR to swapchain (writes opaque terrain OVER clouds)
+    if (m_vulkanDeferred)
+    {
+        VkViewport viewport = {0.0f, 0.0f, (float)m_vulkanDeferred->getWidth(), (float)m_vulkanDeferred->getHeight(), 0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        
+        VkRect2D scissor = {{0, 0}, {m_vulkanDeferred->getWidth(), m_vulkanDeferred->getHeight()}};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        
+        m_vulkanDeferred->compositeToSwapchain(cmd, m_playerController.getCamera().position);
+    }
+    
+    // Render reticle wireframe - snaps to hit block if valid target found
+    if (m_vulkanBlockHighlighter)
+    {
+        const Camera& camera = m_playerController.getCamera();
+        
+        // Render Lock A (persistent) - in island-local coordinates
+        if (m_inputState.hasLockA)
+        {
+            auto& islands = m_clientWorld->getIslandSystem()->getIslands();
+            auto it = islands.find(m_inputState.lockAIslandID);
+            if (it != islands.end())
+            {
+                const FloatingIsland& island = it->second;
+                glm::mat4 islandTransform = island.getTransformMatrix();
+                m_vulkanBlockHighlighter->render(cmd, m_inputState.lockAPos, islandTransform, viewProjection);
+            }
+        }
+        
+        // Render Lock B (persistent) - in island-local coordinates
+        if (m_inputState.hasLockB)
+        {
+            auto& islands = m_clientWorld->getIslandSystem()->getIslands();
+            auto it = islands.find(m_inputState.lockBIslandID);
+            if (it != islands.end())
+            {
+                const FloatingIsland& island = it->second;
+                glm::mat4 islandTransform = island.getTransformMatrix();
+                m_vulkanBlockHighlighter->render(cmd, m_inputState.lockBPos, islandTransform, viewProjection);
+            }
+        }
+        
+        // Render current reticle (only if no locks exist yet)
+        if (!m_inputState.hasLockA || !m_inputState.hasLockB)
+        {
+            if (m_inputState.reticleHasTarget)
+            {
+                // Snap to the hit block position on its island
+                auto& islands = m_clientWorld->getIslandSystem()->getIslands();
+                auto it = islands.find(m_inputState.reticleIslandID);
+                if (it != islands.end())
+                {
+                    const FloatingIsland& island = it->second;
+                    glm::mat4 islandTransform = island.getTransformMatrix();
+                    m_vulkanBlockHighlighter->render(cmd, m_inputState.cachedTargetBlock.localBlockPos, islandTransform, viewProjection);
+                }
+            }
+            else
+            {
+                // No target - show reticle at freeplace position with yaw rotation
+                glm::mat4 reticleTransform = glm::translate(glm::mat4(1.0f), 
+                                                             glm::vec3(m_inputState.reticleWorldPos.x, 
+                                                                      m_inputState.reticleWorldPos.y, 
+                                                                      m_inputState.reticleWorldPos.z));
+                reticleTransform = glm::rotate(reticleTransform, 
+                                               glm::radians(-camera.yaw), 
+                                               glm::vec3(0.0f, 1.0f, 0.0f));
+                reticleTransform = glm::translate(reticleTransform, glm::vec3(-0.5f, -0.5f, -0.5f));
+                
+                Vec3 origin(0, 0, 0);
+                m_vulkanBlockHighlighter->render(cmd, origin, reticleTransform, viewProjection);
+            }
+        }
     }
     
     // Render ImGui
@@ -806,8 +986,25 @@ void GameClient::renderVulkan()
         ImGui_ImplVulkan_RenderDrawData(draw_data, cmd);
     }
     
-    // End frame and present
-    m_vulkanContext->endFrame(imageIndex);
+    // End dynamic rendering before copy
+    vkCmdEndRendering(cmd);
+    
+    // Transition swapchain image to PRESENT_SRC layout
+    VkImageMemoryBarrier presentBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    presentBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    presentBarrier.dstAccessMask = 0;
+    presentBarrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    presentBarrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    presentBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    presentBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    presentBarrier.image = m_vulkanContext->getSwapchainImage(imageIndex);
+    presentBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &presentBarrier);
+    
+    // End frame and present (don't end render pass again)
+    m_vulkanContext->endFrame(imageIndex, false);
 }
 
 void GameClient::processKeyboard(float deltaTime)
@@ -997,76 +1194,342 @@ void GameClient::processBlockInteraction(float deltaTime)
         return;
     }
 
-    // Update raycast timer for performance
-    m_inputState.raycastTimer += deltaTime;
-    if (m_inputState.raycastTimer > 0.05f)
-    {  // 20 FPS raycasting for more responsive block selection
-        m_inputState.cachedTargetBlock = VoxelRaycaster::raycast(
-            m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_clientWorld->getIslandSystem());
-        m_inputState.raycastTimer = 0.0f;
+    // Update reticle position (moves along camera forward vector)
+    const Camera& camera = m_playerController.getCamera();
+    m_inputState.reticleWorldPos = camera.position + camera.front * m_inputState.reticleDistance;
+    
+    // Raycast from reticle toward camera to find first solid block
+    auto* islandSystem = m_clientWorld->getIslandSystem();
+    Vec3 reticlePos(m_inputState.reticleWorldPos.x, m_inputState.reticleWorldPos.y, m_inputState.reticleWorldPos.z);
+    Vec3 toCameraDir = (camera.position - reticlePos).normalized();
+    
+    RayHit hit = VoxelRaycaster::raycast(reticlePos, toCameraDir, m_inputState.reticleDistance, islandSystem);
+    
+    m_inputState.reticleHasTarget = false;
+    if (hit.hit)
+    {
+        // Found solid block - snap reticle to it for breaking
+        m_inputState.reticleHasTarget = true;
+        m_inputState.reticleIslandID = hit.islandID;
+        m_inputState.cachedTargetBlock = hit;
+        
+        // For placement: find first air block from hit toward camera
+        for (int step = 0; step < 10; ++step)
+        {
+            Vec3 testPos = hit.localBlockPos + toCameraDir * static_cast<float>(step);
+            Vec3 voxelPos(std::floor(testPos.x), std::floor(testPos.y), std::floor(testPos.z));
+            uint8_t voxel = islandSystem->getVoxelFromIsland(hit.islandID, voxelPos);
+            
+            if (voxel == 0) // Found air
+            {
+                m_inputState.reticleSnapPos = voxelPos;
+                break;
+            }
+        }
+    }
+    else
+    {
+        m_inputState.cachedTargetBlock = RayHit();
     }
 
     bool leftClick = glfwGetMouseButton(m_window->getHandle(), GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
     bool rightClick = glfwGetMouseButton(m_window->getHandle(), GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+    bool middleClick = glfwGetMouseButton(m_window->getHandle(), GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
 
-    // Left click - break block
-    if (leftClick && !m_inputState.leftMousePressed)
+    // ==========================================
+    // HOLD DETECTION FOR GEOMETRY MODE
+    // ==========================================
+    // Detect button state changes FIRST (before modifying timers)
+    bool leftPressed = leftClick && !m_inputState.leftMouseWasPressed;
+    bool leftReleased = !leftClick && m_inputState.leftMouseWasPressed;
+    bool rightPressed = rightClick && !m_inputState.rightMouseWasPressed;
+    bool rightReleased = !rightClick && m_inputState.rightMouseWasPressed;
+    
+    // Capture hold duration on release (before reset)
+    static float leftReleaseDuration = 0.0f;
+    static float rightReleaseDuration = 0.0f;
+    
+    if (leftReleased)
     {
-        m_inputState.leftMousePressed = true;
+        leftReleaseDuration = m_inputState.leftHoldTimer;
+    }
+    
+    if (rightReleased)
+    {
+        rightReleaseDuration = m_inputState.rightHoldTimer;
+    }
+    
+    // Track how long each button has been held
+    if (leftClick)
+    {
+        m_inputState.leftHoldTimer += deltaTime;
+    }
+    else
+    {
+        m_inputState.leftHoldTimer = 0.0f;
+    }
+    
+    if (rightClick)
+    {
+        m_inputState.rightHoldTimer += deltaTime;
+    }
+    else
+    {
+        m_inputState.rightHoldTimer = 0.0f;
+    }
 
-        if (m_inputState.cachedTargetBlock.hit)
+    // Check if currently holding
+    bool leftIsHold = leftClick && m_inputState.leftHoldTimer >= m_inputState.holdThreshold;
+    bool rightIsHold = rightClick && m_inputState.rightHoldTimer >= m_inputState.holdThreshold;
+    
+    // Debug hold state
+    static bool debugHoldOnce = false;
+    if (leftIsHold && !debugHoldOnce) {
+        std::cout << "🔵 LMB HOLD DETECTED (timer=" << m_inputState.leftHoldTimer << " threshold=" << m_inputState.holdThreshold << ")" << std::endl;
+        std::cout << "  Lock A: " << m_inputState.hasLockA << " Lock B: " << m_inputState.hasLockB << std::endl;
+        debugHoldOnce = true;
+    }
+    if (!leftClick) debugHoldOnce = false;
+
+    // ==========================================
+    // MMB - CLEAR ALL LOCKS
+    // ==========================================
+    static bool middleWasPressed = false;
+    if (middleClick && !middleWasPressed)
+    {
+        m_inputState.hasLockA = false;
+        m_inputState.hasLockB = false;
+        std::cout << "🗑️  All locks cleared" << std::endl;
+    }
+    middleWasPressed = middleClick;
+
+    // ==========================================
+    // LEFT CLICK/HOLD - INSTANT BREAK OR LOCK A OR AUTO-MINE
+    // ==========================================
+    // Click (release < 80ms) = instant break block
+    // Hold (>= 80ms) = create Lock A (geometry mode) OR auto-mine if both locks exist
+    
+    // Handle LMB hold to create Lock A (only if Lock A doesn't exist)
+    static bool lockACreated = false;
+    if (leftIsHold && !m_inputState.hasLockA && !lockACreated && m_inputState.reticleHasTarget)
+    {
+        m_inputState.hasLockA = true;
+        m_inputState.lockAPos = m_inputState.cachedTargetBlock.localBlockPos;
+        m_inputState.lockAIslandID = m_inputState.cachedTargetBlock.islandID;
+        lockACreated = true;
+        std::cout << "🔒 Lock A created at " << m_inputState.lockAPos.x << ", " 
+                  << m_inputState.lockAPos.y << ", " << m_inputState.lockAPos.z << std::endl;
+    }
+    
+    // Auto-mine mode when both locks exist and LMB held
+    static float autoMineTimer = 0.0f;
+    static bool autoMineDebugOnce = false;
+    if (leftIsHold && m_inputState.hasLockA && m_inputState.hasLockB && 
+        m_inputState.lockAIslandID == m_inputState.lockBIslandID)
+    {
+        if (!autoMineDebugOnce) {
+            std::cout << "🔥 AUTO-MINE MODE ACTIVATED! Timer starting..." << std::endl;
+            autoMineDebugOnce = true;
+        }
+        autoMineTimer += deltaTime;
+        std::cout << "  Auto-mine timer: " << autoMineTimer << " / " << m_inputState.autoOperationRate << std::endl;
+        
+        if (autoMineTimer >= m_inputState.autoOperationRate)
         {
-            // Get the current voxel type before changing it
-            uint8_t previousType = m_clientWorld->getIslandSystem()->getVoxelFromIsland(
-                m_inputState.cachedTargetBlock.islandID,
-                m_inputState.cachedTargetBlock.localBlockPos);
+            autoMineTimer = 0.0f;
             
-            // OPTIMISTIC UPDATE: Apply predicted change immediately on client
-            m_clientWorld->applyPredictedVoxelChange(
-                m_inputState.cachedTargetBlock.islandID,
-                m_inputState.cachedTargetBlock.localBlockPos,
-                0,  // newType (air = break block)
-                previousType);
+            // Step along ray from Lock A toward Lock B looking for solid blocks (identical to auto-place)
+            Vec3 direction = m_inputState.lockBPos - m_inputState.lockAPos;
+            float maxDist = direction.length();
+            direction = direction.normalized();
             
-            // Send network request for server validation (sequence number is tracked internally)
-            if (m_networkManager && m_networkManager->getClient() &&
-                m_networkManager->getClient()->isConnected())
+            Vec3 currentPos = m_inputState.lockAPos + Vec3(0.5f, 0.5f, 0.5f);
+            const float stepSize = 0.5f;
+            
+            for (float dist = 0.0f; dist < maxDist; dist += stepSize)
             {
-                uint32_t seqNum = m_networkManager->getClient()->sendVoxelChangeRequest(
-                    m_inputState.cachedTargetBlock.islandID,
-                    m_inputState.cachedTargetBlock.localBlockPos, 0);
+                Vec3 checkPos = currentPos + direction * dist;
+                Vec3 blockPos(
+                    std::floor(checkPos.x),
+                    std::floor(checkPos.y),
+                    std::floor(checkPos.z)
+                );
                 
-                // Track this prediction for reconciliation
-                m_pendingVoxelChanges[seqNum] = {
-                    m_inputState.cachedTargetBlock.islandID,
-                    m_inputState.cachedTargetBlock.localBlockPos,
-                    0,  // predictedType (air)
-                    previousType  // For rollback if server rejects
-                };
+                uint8_t blockType = m_clientWorld->getIslandSystem()->getVoxelFromIsland(
+                    m_inputState.lockAIslandID, blockPos);
+                
+                if (blockType != 0)  // Found solid block
+                {
+                    const BlockTypeInfo* blockInfo = BlockTypeRegistry::getInstance().getBlockType(blockType);
+                    uint8_t durability = blockInfo ? blockInfo->properties.durability : 3;
+                    
+                    bool shouldBreak = m_blockDamage.applyHit(m_inputState.lockAIslandID, blockPos, durability);
+                    
+                    if (shouldBreak)
+                    {
+                        m_clientWorld->applyPredictedVoxelChange(m_inputState.lockAIslandID, blockPos, 0, blockType);
+                        
+                        if (m_networkManager && m_networkManager->getClient() &&
+                            m_networkManager->getClient()->isConnected())
+                        {
+                            uint32_t seqNum = m_networkManager->getClient()->sendVoxelChangeRequest(
+                                m_inputState.lockAIslandID, blockPos, 0);
+                            m_pendingVoxelChanges[seqNum] = {m_inputState.lockAIslandID, blockPos, 0, blockType};
+                        }
+                    }
+                    break;  // Only mine one block per tick
+                }
             }
-
-            // Server will confirm or revert via VoxelChangeUpdate
-
-            // Clear the cached target block immediately to remove the yellow outline
-            m_inputState.cachedTargetBlock = RayHit();
-
-            // **FIXED**: Force immediate raycast to update block selection after breaking
-            m_inputState.cachedTargetBlock = VoxelRaycaster::raycast(
-                m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_clientWorld->getIslandSystem());
-            m_inputState.raycastTimer = 0.0f;
         }
     }
-    else if (!leftClick)
+    
+    else
     {
-        m_inputState.leftMousePressed = false;
+        autoMineDebugOnce = false;
     }
-
-    // Right click - place block or lock/switch recipe
-    if (rightClick && !m_inputState.rightMousePressed)
+    
+    if (!leftClick)
     {
-        m_inputState.rightMousePressed = true;
+        lockACreated = false;
+        autoMineTimer = 0.0f;  // Reset timer when button released
+        autoMineDebugOnce = false;
+    }
+    
+    // Handle LMB click to break block (only on release if it was a short click, not a hold)
+    if (leftReleased && leftReleaseDuration < m_inputState.holdThreshold && m_inputState.cachedTargetBlock.hit)
+    {
+        uint32_t islandID = m_inputState.cachedTargetBlock.islandID;
+        Vec3 blockPos = m_inputState.cachedTargetBlock.localBlockPos;
+        
+        // Get block type and durability
+        uint8_t blockType = m_clientWorld->getIslandSystem()->getVoxelFromIsland(islandID, blockPos);
+        
+        if (blockType != 0)  // Not air
+        {
+            // Get block durability from registry
+            const BlockTypeInfo* blockInfo = BlockTypeRegistry::getInstance().getBlockType(blockType);
+            uint8_t durability = blockInfo ? blockInfo->properties.durability : 3;
+            
+            // Apply 1 hit of damage
+            bool shouldBreak = m_blockDamage.applyHit(islandID, blockPos, durability);
+            
+            if (shouldBreak)
+            {
+                // Block breaks - apply change
+                m_clientWorld->applyPredictedVoxelChange(islandID, blockPos, 0, blockType);
+                
+                // Send to server for validation
+                if (m_networkManager && m_networkManager->getClient() &&
+                    m_networkManager->getClient()->isConnected())
+                {
+                    uint32_t seqNum = m_networkManager->getClient()->sendVoxelChangeRequest(islandID, blockPos, 0);
+                    m_pendingVoxelChanges[seqNum] = {islandID, blockPos, 0, blockType};
+                }
+                
+                std::cout << "💥 Block broken after " << static_cast<int>(durability) << " hits" << std::endl;
+            }
+            else
+            {
+                // Block damaged but not broken
+                uint8_t currentDamage = m_blockDamage.getDamage(islandID, blockPos);
+                float damagePercent = m_blockDamage.getDamagePercent(islandID, blockPos, durability);
+                std::cout << "🔨 Hit! Damage: " << static_cast<int>(currentDamage) << "/" 
+                         << static_cast<int>(durability) << " (" 
+                         << static_cast<int>(damagePercent * 100.0f) << "%)" << std::endl;
+            }
+        }
+    }
+    
+    m_inputState.leftMouseWasPressed = leftClick;
 
-        // If we have a queued element sequence, try to lock/switch to it
+    // ==========================================
+    // RIGHT CLICK/HOLD - INSTANT PLACE OR LOCK B OR AUTO-PLACE
+    // ==========================================
+    // Click (< 80ms) = instant place block or recipe lock
+    // Hold (>= 80ms) = create Lock B (geometry mode) OR auto-place if both locks exist
+    
+    // Handle RMB hold to create Lock B (only if Lock B doesn't exist)
+    static bool lockBCreated = false;
+    if (rightIsHold && !m_inputState.hasLockB && !lockBCreated && m_inputState.reticleHasTarget)
+    {
+        m_inputState.hasLockB = true;
+        m_inputState.lockBPos = m_inputState.cachedTargetBlock.localBlockPos;
+        m_inputState.lockBIslandID = m_inputState.cachedTargetBlock.islandID;
+        lockBCreated = true;
+        std::cout << "🔒 Lock B created at " << m_inputState.lockBPos.x << ", " 
+                  << m_inputState.lockBPos.y << ", " << m_inputState.lockBPos.z << std::endl;
+    }
+    
+    // Auto-place mode when both locks exist and RMB held (must have locked recipe)
+    static float autoPlaceTimer = 0.0f;
+    if (rightIsHold && m_inputState.hasLockA && m_inputState.hasLockB && 
+        m_inputState.lockAIslandID == m_inputState.lockBIslandID && m_lockedRecipe)
+    {
+        autoPlaceTimer += deltaTime;
+        
+        if (autoPlaceTimer >= m_inputState.autoOperationRate)
+        {
+            autoPlaceTimer = 0.0f;
+            
+            // DDA raycast from Lock A toward Lock B to find empty spaces
+            Vec3 direction = m_inputState.lockBPos - m_inputState.lockAPos;
+            float maxDist = direction.length();
+            direction = direction.normalized();
+            
+            // Step along ray looking for air blocks to fill
+            Vec3 currentPos = m_inputState.lockAPos + Vec3(0.5f, 0.5f, 0.5f);
+            const float stepSize = 0.5f;
+            
+            for (float dist = 0.0f; dist < maxDist; dist += stepSize)
+            {
+                Vec3 checkPos = currentPos + direction * dist;
+                Vec3 blockPos(
+                    std::floor(checkPos.x),
+                    std::floor(checkPos.y),
+                    std::floor(checkPos.z)
+                );
+                
+                uint8_t blockType = m_clientWorld->getIslandSystem()->getVoxelFromIsland(
+                    m_inputState.lockAIslandID, blockPos);
+                
+                if (blockType == 0)  // Found air block
+                {
+                    uint8_t blockToPlace = m_lockedRecipe->blockID;
+                    
+                    m_clientWorld->applyPredictedVoxelChange(
+                        m_inputState.lockAIslandID,
+                        blockPos,
+                        blockToPlace,
+                        0);
+                    
+                    if (m_networkManager && m_networkManager->getClient() &&
+                        m_networkManager->getClient()->isConnected())
+                    {
+                        uint32_t seqNum = m_networkManager->getClient()->sendVoxelChangeRequest(
+                            m_inputState.lockAIslandID, blockPos, blockToPlace);
+                        m_pendingVoxelChanges[seqNum] = {
+                            m_inputState.lockAIslandID,
+                            blockPos,
+                            blockToPlace,
+                            0
+                        };
+                    }
+                    break;  // Only place one block per tick
+                }
+            }
+        }
+    }
+    
+    if (!rightClick)
+    {
+        lockBCreated = false;
+        autoPlaceTimer = 0.0f;  // Reset timer when button released
+    }
+    
+    // Handle RMB click for instant placement or recipe locking (only on release if it was a short click, not a hold)
+    if (rightReleased && rightReleaseDuration < m_inputState.holdThreshold)
+    {
+        // Priority 1: If we have a queued element sequence, try to lock/switch to it
         if (!m_elementQueue.isEmpty())
         {
             auto& recipeSystem = ElementRecipeSystem::getInstance();
@@ -1084,12 +1547,12 @@ void GameClient::processBlockInteraction(float deltaTime)
                 m_elementQueue.clear();
             }
         }
-        // If no queue but we have a locked recipe and valid target, place block
-        else if (m_lockedRecipe && m_inputState.cachedTargetBlock.hit)
+        // If no queue but we have a locked recipe and valid reticle target, place block
+        else if (m_lockedRecipe && m_inputState.reticleHasTarget)
         {
-            Vec3 placePos = VoxelRaycaster::getPlacementPosition(m_inputState.cachedTargetBlock);
-            uint8_t existingVoxel =
-                m_clientWorld->getVoxel(m_inputState.cachedTargetBlock.islandID, placePos);
+            Vec3 placePos = m_inputState.reticleSnapPos;
+            uint32_t islandID = m_inputState.reticleIslandID;
+            uint8_t existingVoxel = m_clientWorld->getVoxel(islandID, placePos);
 
             if (existingVoxel == 0)
             {
@@ -1098,7 +1561,7 @@ void GameClient::processBlockInteraction(float deltaTime)
                 
                 // OPTIMISTIC UPDATE: Apply predicted change immediately on client
                 m_clientWorld->applyPredictedVoxelChange(
-                    m_inputState.cachedTargetBlock.islandID,
+                    islandID,
                     placePos,
                     blockToPlace,
                     0);  // previousType is air
@@ -1108,11 +1571,11 @@ void GameClient::processBlockInteraction(float deltaTime)
                     m_networkManager->getClient()->isConnected())
                 {
                     uint32_t seqNum = m_networkManager->getClient()->sendVoxelChangeRequest(
-                        m_inputState.cachedTargetBlock.islandID, placePos, blockToPlace);
+                        islandID, placePos, blockToPlace);
                     
                     // Track this prediction
                     m_pendingVoxelChanges[seqNum] = {
-                        m_inputState.cachedTargetBlock.islandID,
+                        islandID,
                         placePos,
                         blockToPlace,  // predictedType
                         existingVoxel  // previousType (air)
@@ -1123,21 +1586,32 @@ void GameClient::processBlockInteraction(float deltaTime)
                 
                 // Keep recipe locked for continuous placement
                 std::cout << "Block placed (" << m_lockedRecipe->name << " still locked)" << std::endl;
-
-                // Clear the cached target block to refresh the selection
-                m_inputState.cachedTargetBlock = RayHit();
-
-                // **FIXED**: Force immediate raycast to update block selection after placing
-                m_inputState.cachedTargetBlock = VoxelRaycaster::raycast(
-                    m_playerController.getCamera().position, m_playerController.getCamera().front, 50.0f, m_clientWorld->getIslandSystem());
                 m_inputState.raycastTimer = 0.0f;
+                
+                // Clear any damage on the placed position (in case we're overwriting damaged block)
+                m_blockDamage.clearDamage(islandID, placePos);
             }
         }
     }
-    else if (!rightClick)
+    
+    // RMB Hold - Create Lock B
+    static bool lockBTriggered = false;
+    if (rightIsHold && !lockBTriggered && !m_inputState.hasLockB && m_inputState.reticleHasTarget)
     {
-        m_inputState.rightMousePressed = false;
+        // Create Lock B at current reticle position
+        m_inputState.hasLockB = true;
+        m_inputState.lockBPos = m_inputState.reticleWorldPos;
+        m_inputState.lockBIslandID = m_inputState.reticleIslandID;
+        lockBTriggered = true;
+        std::cout << "🔒 Lock B created at (" << m_inputState.lockBPos.x << ", " 
+                  << m_inputState.lockBPos.y << ", " << m_inputState.lockBPos.z << ")" << std::endl;
     }
+    if (!rightClick)
+    {
+        lockBTriggered = false;
+    }
+    
+    m_inputState.rightMouseWasPressed = rightClick;
 }
 
 void GameClient::renderWaitingScreen()

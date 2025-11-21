@@ -8,10 +8,10 @@ layout(location = 3) in vec3 fragTangent;
 layout(location = 4) in flat uint fragBlockID;
 
 // G-Buffer outputs (match VulkanGBuffer.cpp format)
-layout(location = 0) out vec4 outAlbedo;      // RGB: albedo, A: unused
-layout(location = 1) out vec4 outNormal;      // RGB: world normal, A: unused
-layout(location = 2) out vec4 outPBR;         // R: roughness, G: metallic, B: ao, A: unused
-layout(location = 3) out vec4 outEmissive;    // RGB: emissive color, A: unused
+layout(location = 0) out vec4 outAlbedo;      // RGB: albedo, A: ao
+layout(location = 1) out vec4 outNormal;      // RGB: world normal, A: roughness
+layout(location = 2) out vec4 outPosition;    // RGB: world position, A: unused
+layout(location = 3) out vec4 outMetadata;    // R: metallic, G: material flag, BA: unused
 
 const uint WATER_BLOCK_ID = 45;
 
@@ -26,10 +26,17 @@ void main() {
     
     // Check if this is a water block
     if (fragBlockID == WATER_BLOCK_ID) {
-        // Water material properties
-        albedo = vec3(0.02, 0.05, 0.08);  // Dark blue-green water
-        roughness = 0.1;   // Very smooth for sharp reflections
-        metallic = 0.02;   // Non-metallic but some reflectivity
+        // Water material properties - flat surface for testing reflections
+        albedo = vec3(0.05, 0.15, 0.25);  // Dark blue-green water
+        roughness = 0.08;  // Very smooth for reflections
+        metallic = 0.15;   // Low metallic - water is dielectric
+        ao = 1.0;          // Full AO
+        
+        // Use flat normal for testing (no wave perturbation)
+        normal = vec3(0.0, 1.0, 0.0);
+        
+        // Water gets special treatment in lighting pass via metadata
+        // The lighting shader detects water and applies SSR
     } else {
         // Magenta fallback for other materials
         albedo = vec3(1.0, 0.0, 1.0);
@@ -37,9 +44,10 @@ void main() {
         metallic = 0.0;
     }
     
-    // Write to G-Buffer
-    outAlbedo = vec4(albedo, 1.0);
-    outNormal = vec4(normal * 0.5 + 0.5, 1.0);  // Encode [-1,1] to [0,1]
-    outPBR = vec4(roughness, metallic, ao, 1.0);
-    outEmissive = vec4(0.0, 0.0, 0.0, 1.0);
+    // Write to G-Buffer (matching actual layout)
+    float materialFlag = (fragBlockID == WATER_BLOCK_ID) ? 1.0 : 0.0;
+    outAlbedo = vec4(albedo, ao);
+    outNormal = vec4(normal * 0.5 + 0.5, roughness);  // Encode [-1,1] to [0,1]
+    outPosition = vec4(fragWorldPos, 0.0);
+    outMetadata = vec4(metallic, materialFlag, 0.0, 0.0);
 }

@@ -56,8 +56,7 @@ public:
      */
     bool initialize(VkDevice device, VmaAllocator allocator, VkPipelineCache pipelineCache,
                     VkDescriptorSetLayout gBufferDescriptorLayout,
-                    VkFormat outputFormat,
-                    VkRenderPass externalRenderPass = VK_NULL_HANDLE);
+                    VkFormat outputFormat);
 
     bool updateCloudNoiseDescriptor(VkImageView cloudNoiseTexture);
     
@@ -85,7 +84,7 @@ public:
 
     void destroy();
 
-    VkRenderPass getRenderPass() const { return m_renderPass; }
+
     VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout; }
 
 private:
@@ -107,8 +106,7 @@ private:
     VkDescriptorSetLayout m_lightingLayout = VK_NULL_HANDLE; // Shadow/cloud textures (set 1)
 
     // Pipeline
-    VkRenderPass m_renderPass = VK_NULL_HANDLE;
-    bool m_ownsRenderPass = true;  // If false, don't destroy render pass
+
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
 

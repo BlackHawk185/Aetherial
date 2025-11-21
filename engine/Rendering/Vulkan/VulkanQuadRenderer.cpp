@@ -491,8 +491,8 @@ void VulkanQuadRenderer::createPipeline() {
     attachments[3].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     attachments[3].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     
-    // Depth (D24_UNORM_S8_UINT to match G-buffer depth format)
-    attachments[4].format = VK_FORMAT_D24_UNORM_S8_UINT;
+    // Depth (D32_SFLOAT from VulkanContext)
+    attachments[4].format = m_context->getDepthFormat();
     attachments[4].samples = VK_SAMPLE_COUNT_1_BIT;
     attachments[4].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     attachments[4].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -538,8 +538,22 @@ void VulkanQuadRenderer::createPipeline() {
 
     vkCreateRenderPass(m_context->device, &rpInfo, nullptr, &m_gbufferRenderPass);
 
-    // Create graphics pipeline
+    // Create graphics pipeline with dynamic rendering (G-buffer)
+    VkFormat colorFormats[4] = {
+        VK_FORMAT_R16G16B16A16_SFLOAT,  // Albedo
+        VK_FORMAT_R16G16B16A16_SFLOAT,  // Normal
+        VK_FORMAT_R32G32B32A32_SFLOAT,  // Position
+        VK_FORMAT_R8G8B8A8_UNORM        // Metadata
+    };
+    VkFormat depthFormat = m_context->getDepthFormat();  // D32_SFLOAT
+    
+    VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    renderingInfo.colorAttachmentCount = 4;
+    renderingInfo.pColorAttachmentFormats = colorFormats;
+    renderingInfo.depthAttachmentFormat = depthFormat;
+    
     VkGraphicsPipelineCreateInfo pipelineInfo = {}; pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingInfo;
     pipelineInfo.stageCount = 2;
     pipelineInfo.pStages = stages;
     pipelineInfo.pVertexInputState = &vertexInput;
@@ -551,8 +565,6 @@ void VulkanQuadRenderer::createPipeline() {
     pipelineInfo.pColorBlendState = &colorBlend;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = m_pipelineLayout;
-    pipelineInfo.renderPass = m_gbufferRenderPass;
-    pipelineInfo.subpass = 0;
 
     VkResult result = vkCreateGraphicsPipelines(m_context->device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_gbufferPipeline);
     
@@ -699,8 +711,17 @@ void VulkanQuadRenderer::createSwapchainPipeline() {
     dynamicState.dynamicStateCount = 2;
     dynamicState.pDynamicStates = dynamicStates;
 
-    // Create pipeline for swapchain render pass
+    // Create pipeline for swapchain with dynamic rendering
+    VkFormat swapchainFormat = m_context->getSwapchainFormat();
+    VkFormat depthFormat = m_context->getDepthFormat();
+    
+    VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachmentFormats = &swapchainFormat;
+    renderingInfo.depthAttachmentFormat = depthFormat;
+    
     VkGraphicsPipelineCreateInfo pipelineInfo = {}; pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingInfo;
     pipelineInfo.stageCount = 2;
     pipelineInfo.pStages = stages;
     pipelineInfo.pVertexInputState = &vertexInput;
@@ -712,8 +733,6 @@ void VulkanQuadRenderer::createSwapchainPipeline() {
     pipelineInfo.pColorBlendState = &colorBlend;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = m_pipelineLayout;
-    pipelineInfo.renderPass = m_context->getRenderPass();  // Use swapchain render pass
-    pipelineInfo.subpass = 0;
     
     VkResult result = vkCreateGraphicsPipelines(m_context->device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_swapchainPipeline);
     if (result != VK_SUCCESS) {
@@ -784,10 +803,9 @@ void VulkanQuadRenderer::createDepthOnlyPipeline() {
     // This avoids initialization order issues with shadow map render pass
 }
 
-void VulkanQuadRenderer::ensureDepthPipeline(VkRenderPass shadowRenderPass) {
-    if (m_depthOnlyPipeline) return;  // Already created
+void VulkanQuadRenderer::ensureDepthPipeline() {
+    if (m_depthOnlyPipeline) return;
     
-    // Now create the pipeline with the actual shadow render pass
     VkPipelineShaderStageCreateInfo vertStage = {}; 
     vertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -840,8 +858,13 @@ void VulkanQuadRenderer::ensureDepthPipeline(VkRenderPass shadowRenderPass) {
     dynamicState.dynamicStateCount = 3;
     dynamicState.pDynamicStates = dynamicStates;
 
+    // Dynamic rendering: specify depth format instead of render pass
+    VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    renderingInfo.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+
     VkGraphicsPipelineCreateInfo pipelineInfo = {}; 
     pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingInfo;
     pipelineInfo.stageCount = 1;
     pipelineInfo.pStages = &vertStage;
     pipelineInfo.pVertexInputState = &vertexInput;
@@ -853,8 +876,6 @@ void VulkanQuadRenderer::ensureDepthPipeline(VkRenderPass shadowRenderPass) {
     pipelineInfo.pColorBlendState = &colorBlend;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = m_pipelineLayout;
-    pipelineInfo.renderPass = shadowRenderPass;
-    pipelineInfo.subpass = 0;
     
     VkResult result = vkCreateGraphicsPipelines(m_context->device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_depthOnlyPipeline);
     if (result != VK_SUCCESS) {
@@ -862,10 +883,10 @@ void VulkanQuadRenderer::ensureDepthPipeline(VkRenderPass shadowRenderPass) {
     }
 }
 
-void VulkanQuadRenderer::renderDepthOnly(VkCommandBuffer cmd, VkRenderPass shadowRenderPass, const glm::mat4& lightViewProjection) {
+void VulkanQuadRenderer::renderDepthOnly(VkCommandBuffer cmd, const glm::mat4& lightViewProjection) {
     if (m_chunks.empty()) return;
     
-    ensureDepthPipeline(shadowRenderPass);
+    ensureDepthPipeline();
     if (!m_depthOnlyPipeline) return;  // Pipeline creation failed
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_depthOnlyPipeline);
@@ -1145,8 +1166,6 @@ void VulkanQuadRenderer::processPendingUploads() {
                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
                         0, 0, nullptr, 1, &barrier, 0, nullptr);
     
-    vkEndCommandBuffer(cmdBuffer);
-
     vkEndCommandBuffer(cmdBuffer);
     
     // Submit and wait (synchronous during initialization)

@@ -7,6 +7,7 @@
 struct BlockProperties {
     // Basic properties
     float hardness = 1.0f;           // Mining time multiplier (0 = instant, higher = slower)
+    uint8_t durability = 3;          // Hits required to break (1 = instant, 3 = dirt/wood, 5+ = stone/ore)
     bool isTransparent = false;      // For rendering/lighting (affects neighbor face culling)
     bool isLiquid = false;           // Fluid physics behavior
     bool isSolid = true;             // Has collision (players can't walk through)
@@ -35,20 +36,23 @@ struct BlockProperties {
         props.isSolid = false;
         props.isTransparent = true;
         props.hardness = 0.0f;
+        props.durability = 0;
         return props;
     }
     
-    static BlockProperties Solid(float hardness = 1.0f) {
+    static BlockProperties Solid(float hardness = 1.0f, uint8_t durability = 3) {
         BlockProperties props;
         props.hardness = hardness;
+        props.durability = durability;
         props.isSolid = true;
         props.isTransparent = false;
         return props;
     }
     
-    static BlockProperties Transparent(float hardness = 0.5f) {
+    static BlockProperties Transparent(float hardness = 0.5f, uint8_t durability = 2) {
         BlockProperties props;
         props.hardness = hardness;
+        props.durability = durability;
         props.isSolid = false;
         props.isTransparent = true;
         return props;
@@ -57,6 +61,7 @@ struct BlockProperties {
     static BlockProperties LightSource(uint8_t level, float hardness = 1.0f) {
         BlockProperties props;
         props.hardness = hardness;
+        props.durability = 3;  // Default durability
         props.emitsLight = true;
         props.lightLevel = level;
         return props;
@@ -65,6 +70,7 @@ struct BlockProperties {
     static BlockProperties QuantumFieldGenerator() {
         BlockProperties props;
         props.hardness = 10.0f;           // Very hard to break
+        props.durability = 10;            // Takes 10 hits
         props.emitsLight = true;
         props.lightLevel = 15;            // Maximum brightness
         props.isQuantumField = true;

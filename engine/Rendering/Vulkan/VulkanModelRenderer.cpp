@@ -19,12 +19,11 @@ VulkanModelRenderer::~VulkanModelRenderer() {
     shutdown();
 }
 
-bool VulkanModelRenderer::initialize(VulkanContext* ctx, VkRenderPass gbufferRenderPass) {
+bool VulkanModelRenderer::initialize(VulkanContext* ctx) {
     if (!ctx) return false;
     
     m_context = ctx;
     m_allocator = ctx->getAllocator();
-    m_gbufferRenderPass = gbufferRenderPass;
     
     // Create island transform buffer (64 islands * mat4)
     m_islandTransformBuffer = std::make_unique<VulkanBuffer>();
@@ -83,15 +82,26 @@ void VulkanModelRenderer::shutdown() {
 }
 
 bool VulkanModelRenderer::loadModel(uint8_t blockID, const std::string& glbPath) {
-    // Check if already loaded
-    if (m_models.find(blockID) != m_models.end()) {
-        return true;
+    // Check if already loaded or currently loading
+    {
+        std::lock_guard<std::mutex> lock(m_modelsMutex);
+        if (m_models.find(blockID) != m_models.end()) {
+            return true;
+        }
+        if (m_loadingModels.find(blockID) != m_loadingModels.end()) {
+            // Another thread is loading this model, wait and check again
+            return true;  // Return success, will retry later if needed
+        }
+        // Mark as loading
+        m_loadingModels.insert(blockID);
     }
     
     GLBModelCPU cpuModel;
     if (!GLBLoader::loadGLB(glbPath, cpuModel) || !cpuModel.valid) {
         std::cerr << "⚠ Failed to load GLB: " << glbPath << " - creating magenta fallback" << std::endl;
         createMagentaCube(blockID);
+        std::lock_guard<std::mutex> lock(m_modelsMutex);
+        m_loadingModels.erase(blockID);
         return true;  // Fallback created successfully
     }
     
@@ -121,6 +131,8 @@ bool VulkanModelRenderer::loadModel(uint8_t blockID, const std::string& glbPath)
                                         VMA_MEMORY_USAGE_GPU_ONLY)) {
         std::cerr << "Failed to create vertex buffer for model" << std::endl;
         createMagentaCube(blockID);
+        std::lock_guard<std::mutex> lock(m_modelsMutex);
+        m_loadingModels.erase(blockID);
         return true;
     }
     
@@ -132,11 +144,19 @@ bool VulkanModelRenderer::loadModel(uint8_t blockID, const std::string& glbPath)
                                        VMA_MEMORY_USAGE_GPU_ONLY)) {
         std::cerr << "Failed to create index buffer for model" << std::endl;
         createMagentaCube(blockID);
+        std::lock_guard<std::mutex> lock(m_modelsMutex);
+        m_loadingModels.erase(blockID);
         return true;
     }
     
     // Upload data via staging buffer
     VkCommandBuffer cmd = m_context->beginSingleTimeCommands();
+    if (!cmd) {
+        std::cerr << "Failed to begin command buffer for model upload" << std::endl;
+        createMagentaCube(blockID);
+        m_loadingModels.erase(blockID);
+        return true;
+    }
     
     VulkanBuffer vertexStaging;
     VulkanBuffer indexStaging;
@@ -168,7 +188,12 @@ bool VulkanModelRenderer::loadModel(uint8_t blockID, const std::string& glbPath)
     indexStaging.destroy();
     
     modelData.indexCount = allIndices.size();
-    m_models[blockID] = std::move(modelData);
+    
+    {
+        std::lock_guard<std::mutex> lock(m_modelsMutex);
+        m_models[blockID] = std::move(modelData);
+        m_loadingModels.erase(blockID);
+    }
     
     std::cout << "✓ Loaded GLB model for BlockID " << (int)blockID << ": " 
               << allVertices.size()/8 << " verts, " << allIndices.size() << " indices" << std::endl;
@@ -246,6 +271,10 @@ void VulkanModelRenderer::createMagentaCube(uint8_t blockID) {
     
     // Upload via staging
     VkCommandBuffer cmd = m_context->beginSingleTimeCommands();
+    if (!cmd) {
+        std::cerr << "Failed to begin command buffer for magenta cube upload" << std::endl;
+        return;
+    }
     
     VulkanBuffer vertexStaging;
     VulkanBuffer indexStaging;
@@ -700,9 +729,21 @@ void VulkanModelRenderer::createPipeline() {
         return;
     }
     
-    // Create pipeline (using deferred G-buffer render pass)
+    // Dynamic rendering: specify G-buffer formats
+    VkFormat colorFormats[4] = {
+        VK_FORMAT_R16G16B16A16_SFLOAT,  // Albedo
+        VK_FORMAT_R16G16B16A16_SFLOAT,  // Normal
+        VK_FORMAT_R32G32B32A32_SFLOAT,  // Position
+        VK_FORMAT_R8G8B8A8_UNORM        // Metadata
+    };
+    VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    renderingInfo.colorAttachmentCount = 4;
+    renderingInfo.pColorAttachmentFormats = colorFormats;
+    renderingInfo.depthAttachmentFormat = m_context->getDepthFormat();  // D32_SFLOAT
+    
     VkGraphicsPipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingInfo;
     pipelineInfo.stageCount = 2;
     pipelineInfo.pStages = shaderStages;
     pipelineInfo.pVertexInputState = &vertexInputInfo;
@@ -713,8 +754,6 @@ void VulkanModelRenderer::createPipeline() {
     pipelineInfo.pDepthStencilState = &depthStencil;
     pipelineInfo.pColorBlendState = &colorBlending;
     pipelineInfo.layout = m_pipelineLayout;
-    pipelineInfo.renderPass = m_gbufferRenderPass;
-    pipelineInfo.subpass = 0;
     
     if (vkCreateGraphicsPipelines(device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS) {
         std::cerr << "Failed to create graphics pipeline" << std::endl;
