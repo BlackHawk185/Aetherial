@@ -27,7 +27,9 @@ const float THICKNESS = 1.0;
 const float MAX_DISTANCE = 120.0;
 
 vec3 viewSpaceFromDepth(vec2 uv, float depth) {
-    vec4 clipSpace = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+    vec2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    vec4 clipSpace = vec4(ndc, depth * 2.0 - 1.0, 1.0);
     vec4 viewSpace = ssr.invProjectionMatrix * clipSpace;
     return viewSpace.xyz / viewSpace.w;
 }
@@ -44,9 +46,9 @@ bool rayMarch(vec3 viewRayOrigin, vec3 viewRayDir, out vec2 hitUV, out vec3 hitC
             return false;
         }
         
-        // Project current ray position to screen space
         vec4 clipPos = ssr.projectionMatrix * vec4(currentViewPos, 1.0);
         clipPos.xyz /= clipPos.w;
+        clipPos.y = -clipPos.y;
         
         vec2 sampleUV = clipPos.xy * 0.5 + 0.5;
         
@@ -63,15 +65,7 @@ bool rayMarch(vec3 viewRayOrigin, vec3 viewRayDir, out vec2 hitUV, out vec3 hitC
         float depthDiff = currentViewPos.z - sceneViewPos.z;
         
         if (depthDiff > 0.0 && depthDiff < THICKNESS) {
-            // Check if we hit water - skip it to avoid self-reflection
-            vec4 hitMetadata = texture(gMetadata, sampleUV);
-            bool hitWaterOBJ = hitMetadata.g > 0.9;
-            bool hitWaterVoxel = (hitMetadata.r > 0.17 && hitMetadata.r < 0.18);
-            if (hitWaterOBJ || hitWaterVoxel) {
-                continue;  // Skip water, keep marching
-            }
-            
-            // Hit solid geometry! Sample lit HDR buffer at this location
+            // Hit geometry! Sample lit HDR buffer at this location
             hitUV = sampleUV;
             hitColor = texture(hdrBuffer, sampleUV).rgb;
             return true;
@@ -99,15 +93,16 @@ void main() {
     
     vec4 normalRoughness = texture(gNormal, uv);
     vec3 worldNormal = normalize(normalRoughness.rgb * 2.0 - 1.0);  // Decode from [0,1] to [-1,1]
+    float roughness = normalRoughness.a;
     vec4 metadata = texture(gMetadata, uv);
+    float metallic = metadata.r;
     
-    // Water detection
-    bool isWaterOBJ = metadata.g > 0.9;
-    bool isWaterVoxel = (metadata.r > 0.17 && metadata.r < 0.18);
-    bool isWater = isWaterOBJ || isWaterVoxel;
+    // Calculate reflection strength based on PBR properties
+    // High metallic OR low roughness = needs reflections
+    float reflectionNeed = max(metallic, 1.0 - roughness);
     
-    // Only apply SSR to water surfaces
-    if (!isWater) {
+    // Skip SSR for surfaces that don't need reflections (rough non-metallic)
+    if (reflectionNeed < 0.3) {
         imageStore(outputImage, coords, vec4(0.0));
         return;
     }
@@ -130,8 +125,8 @@ void main() {
     vec3 hitColor;
     
     if (rayMarch(rayOrigin, reflectDir, hitUV, hitColor)) {
-        // Store reflection color with full intensity
-        imageStore(outputImage, coords, vec4(hitColor, 1.0));
+        // Store reflection color with strength based on surface properties
+        imageStore(outputImage, coords, vec4(hitColor, reflectionNeed));
     } else {
         // No reflection hit - output black (will be handled by composite)
         imageStore(outputImage, coords, vec4(0.0));

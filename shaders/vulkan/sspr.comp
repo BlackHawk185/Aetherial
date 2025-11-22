@@ -1,0 +1,164 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// G-buffer inputs
+layout(set = 0, binding = 0) uniform sampler2D gNormal;
+layout(set = 0, binding = 1) uniform sampler2D gPosition;
+layout(set = 0, binding = 2) uniform sampler2D gDepth;
+layout(set = 0, binding = 3) uniform sampler2D gMetadata;
+layout(set = 0, binding = 4) uniform sampler2D hdrBuffer;
+
+// Output
+layout(set = 0, binding = 5, rgba16f) uniform image2D outputImage;
+
+// Uniforms
+layout(push_constant) uniform SSPRParams {
+    mat4 viewMatrix;
+    mat4 projectionMatrix;
+    vec3 cameraPos;
+    float planeY;  // Water plane height
+} sspr;
+
+// SSPR parameters - optimized for flat water surfaces
+const int MAX_STEPS = 128;
+const float STEP_SIZE = 0.3;
+const float MAX_DISTANCE = 150.0;
+const float WATER_PLANE_Y = 64.0;  // Water surface height
+
+vec3 worldSpaceFromDepth(vec2 uv, float depth) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    vec4 clipSpace = vec4(ndc, depth * 2.0 - 1.0, 1.0);
+    vec4 viewSpace = inverse(sspr.projectionMatrix) * clipSpace;
+    viewSpace /= viewSpace.w;
+    vec4 worldSpace = inverse(sspr.viewMatrix) * viewSpace;
+    return worldSpace.xyz;
+}
+
+vec2 worldToScreenSpace(vec3 worldPos) {
+    vec4 viewPos = sspr.viewMatrix * vec4(worldPos, 1.0);
+    vec4 clipPos = sspr.projectionMatrix * viewPos;
+    clipPos.xyz /= clipPos.w;
+    clipPos.y = -clipPos.y;
+    return clipPos.xy * 0.5 + 0.5;
+}
+
+bool rayMarchPlanar(vec3 worldRayOrigin, vec3 worldRayDir, float planeY, out vec2 hitUV, out vec3 hitColor) {
+    vec3 currentPos = worldRayOrigin;
+    float rayLength = 0.0;
+    
+    // Early exit if ray doesn't intersect water plane
+    if (abs(worldRayDir.y) < 0.001) {
+        return false;
+    }
+    
+    for (int i = 0; i < MAX_STEPS; i++) {
+        currentPos += worldRayDir * STEP_SIZE;
+        rayLength += STEP_SIZE;
+        
+        if (rayLength > MAX_DISTANCE) {
+            return false;
+        }
+        
+        vec2 sampleUV = worldToScreenSpace(currentPos);
+        
+        // Skip samples outside screen bounds
+        if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0) {
+            continue;
+        }
+        
+        // Sample depth and reconstruct world position
+        float sampleDepth = texture(gDepth, sampleUV).r;
+        if (sampleDepth >= 0.9999) {
+            continue;  // Sky
+        }
+        
+        vec3 sceneWorldPos = worldSpaceFromDepth(sampleUV, sampleDepth);
+        
+        // Check if ray intersected geometry
+        float depthDiff = length(currentPos - sspr.cameraPos) - length(sceneWorldPos - sspr.cameraPos);
+        
+        if (depthDiff > 0.0 && depthDiff < 1.5) {
+            // Check if the hit surface is not water (avoid self-reflection)
+            vec4 hitMetadata = texture(gMetadata, sampleUV);
+            float materialFlag = hitMetadata.g;
+            
+            if (materialFlag < 0.5) {  // Not water
+                hitUV = sampleUV;
+                hitColor = texture(hdrBuffer, sampleUV).rgb;
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dimensions = imageSize(outputImage);
+    
+    if (coords.x >= dimensions.x || coords.y >= dimensions.y) {
+        return;
+    }
+    
+    vec2 uv = (vec2(coords) + 0.5) / vec2(dimensions);
+    
+    float depth = texture(gDepth, uv).r;
+    if (depth >= 0.9999) {
+        imageStore(outputImage, coords, vec4(0.0));
+        return;
+    }
+    
+    // Check if this pixel is water
+    vec4 metadata = texture(gMetadata, uv);
+    float materialFlag = metadata.g;
+    
+    if (materialFlag < 0.5) {
+        // Not water - no SSPR
+        imageStore(outputImage, coords, vec4(0.0));
+        return;
+    }
+    
+    vec3 worldPos = worldSpaceFromDepth(uv, depth);
+    
+    // Read water surface normal from G-buffer (includes vertex shader wave deformation)
+    vec4 normalRoughness = texture(gNormal, uv);
+    vec3 worldNormal = normalize(normalRoughness.rgb * 2.0 - 1.0);  // Decode from [0,1] to [-1,1]
+    
+    // Calculate planar reflection
+    vec3 viewDir = normalize(sspr.cameraPos - worldPos);
+    vec3 reflectDir = reflect(-viewDir, worldNormal);
+    
+    // Offset ray origin slightly above water surface
+    vec3 rayOrigin = worldPos + worldNormal * 0.1;
+    
+    vec2 hitUV;
+    vec3 hitColor;
+    
+    if (rayMarchPlanar(rayOrigin, reflectDir, worldPos.y, hitUV, hitColor)) {
+        // Calculate Fresnel effect for water
+        float cosTheta = max(dot(worldNormal, viewDir), 0.0);
+        float fresnel = pow(1.0 - cosTheta, 5.0);
+        float F = mix(0.02, 1.0, fresnel);  // Water F0 = 0.02
+        
+        // Fade reflections based on distance
+        float reflectDistance = length(worldSpaceFromDepth(hitUV, texture(gDepth, hitUV).r) - worldPos);
+        float distanceFade = clamp(1.0 - reflectDistance / MAX_DISTANCE, 0.0, 1.0);
+        
+        float reflectionStrength = F * distanceFade;
+        imageStore(outputImage, coords, vec4(hitColor, reflectionStrength));
+    } else {
+        // No hit - reflect sky
+        vec3 skyColor = vec3(0.5, 0.7, 0.9);
+        float skyGradient = max(reflectDir.y, 0.0);
+        skyColor = mix(vec3(0.3, 0.5, 0.7), vec3(0.7, 0.85, 1.0), skyGradient);
+        
+        float cosTheta = max(dot(worldNormal, viewDir), 0.0);
+        float fresnel = pow(1.0 - cosTheta, 5.0);
+        float F = mix(0.02, 1.0, fresnel);
+        
+        imageStore(outputImage, coords, vec4(skyColor, F));
+    }
+}

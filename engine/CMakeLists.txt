@@ -41,7 +41,7 @@ add_library(engine STATIC
     Rendering/Vulkan/VulkanGBuffer.cpp
     Rendering/Vulkan/VulkanDeferred.cpp
     Rendering/Vulkan/VulkanShadowMap.cpp
-    Rendering/Vulkan/VulkanSSR.cpp
+    Rendering/Vulkan/VulkanSSPR.cpp
     Rendering/Vulkan/VulkanSkyRenderer.cpp
     Rendering/Vulkan/VulkanCloudRenderer.cpp
     

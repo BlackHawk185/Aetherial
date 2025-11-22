@@ -67,22 +67,10 @@ void Camera::getProjectionMatrix(float* matrix, float aspect)
 // New clean Vec3-based projection matrix
 glm::mat4 Camera::getProjectionMatrix(float aspect)
 {
-    float fov = 120.0f * PI_F / 180.0f;  // radians (tighter FOV - makes spaces feel more accurate)
+    float fov = 70.0f * PI_F / 180.0f;  // radians (tighter FOV - makes spaces feel more accurate)
     glm::mat4 proj = glm::perspective(fov, aspect, 0.1f, 1000.0f);
     
     // Vulkan Y-axis flip: negate Y-scale to correct for inverted clip space
-    proj[1][1] *= -1.0f;
-    
-    return proj;
-}
-
-// Wide FOV for rendering (captures more for SSR)
-glm::mat4 Camera::getWideFOVProjectionMatrix(float aspect)
-{
-    float fov = 180.0f * PI_F / 180.0f;  // Much wider FOV for SSR data
-    glm::mat4 proj = glm::perspective(fov, aspect, 0.1f, 1000.0f);
-    
-    // Vulkan Y-axis flip
     proj[1][1] *= -1.0f;
     
     return proj;

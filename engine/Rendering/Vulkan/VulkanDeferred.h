@@ -3,7 +3,7 @@
 #include "VulkanGBuffer.h"
 #include "VulkanBuffer.h"
 #include "VulkanShadowMap.h"
-#include "VulkanSSR.h"
+#include "VulkanSSPR.h"
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 #include <glm/glm.hpp>
@@ -135,7 +135,7 @@ public:
     uint32_t getHeight() const { return m_height; }
     
     VulkanShadowMap& getShadowMap() { return m_shadowMap; }
-    VulkanSSR& getSSR() { return m_ssr; }
+    VulkanSSPR& getSSPR() { return m_sspr; }
 
 private:
     bool loadShaders();
@@ -193,7 +193,7 @@ private:
 
     // Advanced rendering systems
     VulkanShadowMap m_shadowMap;
-    VulkanSSR m_ssr;
+    VulkanSSPR m_sspr;
     
     // Composite pass (HDR + SSR blend)
     VkPipeline m_compositePipeline = VK_NULL_HANDLE;

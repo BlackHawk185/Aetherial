@@ -91,7 +91,7 @@ void VoxelChunk::setRawVoxelData(const uint8_t* data, uint32_t size)
                         }
                     }
                     
-                    glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+                    glm::vec3 pos(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, static_cast<float>(z) + 0.5f);
                     m_modelInstances[blockType].push_back(pos);
                 }
             }
@@ -967,7 +967,7 @@ void VoxelChunk::setVoxelWithQuadManipulation(int x, int y, int z, uint8_t type)
         }
         
         if (shouldRender) {
-            glm::vec3 pos(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+            glm::vec3 pos(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, static_cast<float>(z) + 0.5f);
             m_modelInstances[type].push_back(pos);
         }
     }
@@ -979,7 +979,7 @@ void VoxelChunk::setVoxelWithQuadManipulation(int x, int y, int z, uint8_t type)
             const BlockTypeInfo* waterInfo = registry.getBlockType(BlockID::WATER);
             if (waterInfo && waterInfo->renderType == BlockRenderType::OBJ) {
                 // Water below now has air above - make it visible
-                glm::vec3 posBelow(static_cast<float>(x), static_cast<float>(y - 1), static_cast<float>(z));
+                glm::vec3 posBelow(static_cast<float>(x) + 0.5f, static_cast<float>(y - 1) + 0.5f, static_cast<float>(z) + 0.5f);
                 auto& waterInstances = m_modelInstances[BlockID::WATER];
                 // Check if not already present
                 if (std::find(waterInstances.begin(), waterInstances.end(), posBelow) == waterInstances.end()) {

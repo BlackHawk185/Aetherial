@@ -43,10 +43,20 @@ bool VulkanModelRenderer::initialize(VulkanContext* ctx) {
         return false;
     }
     
+    // Create separate instance buffer for forward rendering
+    m_forwardInstanceBuffer = std::make_unique<VulkanBuffer>();
+    if (!m_forwardInstanceBuffer->create(m_allocator, 65536 * sizeof(InstanceData),
+                                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                         VMA_MEMORY_USAGE_CPU_TO_GPU)) {
+        std::cerr << "Failed to create forward instance buffer" << std::endl;
+        return false;
+    }
+    
     createDescriptors();
     createPipeline();
+    createForwardPipeline();
     
-    std::cout << "✓ VulkanModelRenderer initialized" << std::endl;
+    std::cout << "✓ VulkanModelRenderer initialized (deferred + forward)" << std::endl;
     return true;
 }
 
@@ -75,8 +85,29 @@ void VulkanModelRenderer::shutdown() {
         m_descriptorPool = VK_NULL_HANDLE;
     }
     
+    if (m_forwardPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, m_forwardPipeline, nullptr);
+        m_forwardPipeline = VK_NULL_HANDLE;
+    }
+    
+    if (m_forwardPipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, m_forwardPipelineLayout, nullptr);
+        m_forwardPipelineLayout = VK_NULL_HANDLE;
+    }
+    
+    if (m_forwardDescriptorSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device, m_forwardDescriptorSetLayout, nullptr);
+        m_forwardDescriptorSetLayout = VK_NULL_HANDLE;
+    }
+    
+    if (m_forwardDescriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(device, m_forwardDescriptorPool, nullptr);
+        m_forwardDescriptorPool = VK_NULL_HANDLE;
+    }
+    
     m_models.clear();
     m_instanceBuffer.reset();
+    m_forwardInstanceBuffer.reset();
     m_islandTransformBuffer.reset();
     m_context = nullptr;
 }
@@ -341,10 +372,16 @@ void VulkanModelRenderer::updateChunkInstances(VoxelChunk* chunk, uint32_t islan
         
         for (const glm::vec3& localPos : positions) {
             InstanceData inst;
-            inst.position = chunkOffset + localPos;
+            glm::vec3 adjustedPos = chunkOffset + localPos;
+            adjustedPos.y -= 0.5f;
+            inst.position = adjustedPos;
             inst.islandID = islandID;
             inst.blockID = blockID;
-            inst.padding = 0;
+            inst.materialType = info->properties.materialType;
+            inst.isReflective = info->properties.isReflective ? 1 : 0;
+            inst.padding[0] = 0;
+            inst.padding[1] = 0;
+            inst.padding[2] = 0;
             batch.instances.push_back(inst);
         }
         
@@ -369,57 +406,36 @@ void VulkanModelRenderer::updateIslandTransform(uint32_t islandID, const glm::ma
     }
 }
 
-void VulkanModelRenderer::rebuildInstanceBuffer() {
+
+
+void VulkanModelRenderer::renderToGBuffer(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::mat4& view) {
+    if (m_chunkBatches.empty()) return;
+    if (!m_pipeline) return;
+    
+    // Rebuild instance buffer (excludes water - handled by forward pass)
+    const uint8_t WATER_BLOCK_ID = 45;
     m_instanceData.clear();
     
-    // Collect all instances from all chunks
     for (const auto& [chunk, batches] : m_chunkBatches) {
         for (const auto& batch : batches) {
-            m_instanceData.insert(m_instanceData.end(), batch.instances.begin(), batch.instances.end());
+            if (batch.blockID != WATER_BLOCK_ID) {  // Skip water
+                m_instanceData.insert(m_instanceData.end(), batch.instances.begin(), batch.instances.end());
+            }
         }
     }
     
-    // Upload to GPU
-    if (!m_instanceData.empty() && m_instanceBuffer) {
+    if (m_instanceData.empty()) return;
+    
+    // Upload opaque instances
+    if (m_instanceBuffer) {
         size_t dataSize = m_instanceData.size() * sizeof(InstanceData);
         if (dataSize > m_instanceBuffer->getSize()) {
-            // Resize buffer
             m_instanceBuffer->destroy();
-            m_instanceBuffer->create(m_allocator, dataSize * 2,
-                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                                    VMA_MEMORY_USAGE_CPU_TO_GPU);
+            m_instanceBuffer->create(m_allocator, dataSize * 2, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
         }
-        
         void* data = m_instanceBuffer->map();
         memcpy(data, m_instanceData.data(), dataSize);
         m_instanceBuffer->unmap();
-    }
-}
-
-void VulkanModelRenderer::renderToGBuffer(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::mat4& view) {
-    if (m_chunkBatches.empty()) {
-        static bool once = true;
-        if (once) {
-            std::cout << "[ModelRenderer] No chunk batches to render" << std::endl;
-            once = false;
-        }
-        return;
-    }
-    
-    if (!m_pipeline) {
-        std::cerr << "[ModelRenderer] No pipeline!" << std::endl;
-        return;
-    }
-    
-    rebuildInstanceBuffer();
-    
-    if (m_instanceData.empty()) {
-        static bool once = true;
-        if (once) {
-            std::cout << "[ModelRenderer] No instance data after rebuild" << std::endl;
-            once = false;
-        }
-        return;
     }
     
     // Bind instance buffer (shared by both pipelines)
@@ -450,26 +466,91 @@ void VulkanModelRenderer::renderToGBuffer(VkCommandBuffer cmd, const glm::mat4& 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                       0, sizeof(PushConstants), &pushConstants);
     
-    // Draw each model type
+    // Draw opaque models only (water skipped)
     uint32_t instanceOffset = 0;
     for (const auto& [chunk, batches] : m_chunkBatches) {
         for (const auto& batch : batches) {
+            if (batch.blockID == WATER_BLOCK_ID) continue;  // Skip water
+            
             auto it = m_models.find(batch.blockID);
             if (it == m_models.end()) continue;
             
             const ModelData& model = it->second;
             
-            // Bind model vertex/index buffers
-            VkBuffer vertexBuffers[] = { model.vertexBuffer->getBuffer() };
-            VkDeviceSize vertexOffsets[] = { 0 };
+            VkBuffer vertexBuffers[] = {model.vertexBuffer->getBuffer()};
+            VkDeviceSize vertexOffsets[] = {0};
             vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, vertexOffsets);
             vkCmdBindIndexBuffer(cmd, model.indexBuffer->getBuffer(), 0, VK_INDEX_TYPE_UINT32);
             
-            // Draw instanced
             vkCmdDrawIndexed(cmd, model.indexCount, batch.instances.size(), 0, 0, instanceOffset);
             
             instanceOffset += batch.instances.size();
         }
+    }
+}
+
+void VulkanModelRenderer::renderWaterToGBuffer(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::mat4& view) {
+    if (!m_pipeline) return;
+    
+    const uint8_t WATER_BLOCK_ID = 45;
+    
+    // Collect water instances
+    std::vector<InstanceData> waterInstances;
+    for (const auto& [chunk, batches] : m_chunkBatches) {
+        for (const auto& batch : batches) {
+            if (batch.blockID == WATER_BLOCK_ID) {
+                waterInstances.insert(waterInstances.end(), batch.instances.begin(), batch.instances.end());
+            }
+        }
+    }
+    
+    if (waterInstances.empty()) return;
+    
+    // Upload water instances to FORWARD instance buffer (separate from deferred)
+    if (!m_forwardInstanceBuffer) {
+        m_forwardInstanceBuffer = std::make_unique<VulkanBuffer>();
+    }
+    
+    size_t dataSize = waterInstances.size() * sizeof(InstanceData);
+    if (dataSize > m_forwardInstanceBuffer->getSize()) {
+        m_forwardInstanceBuffer->destroy();
+        m_forwardInstanceBuffer->create(m_allocator, dataSize * 2, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+    }
+    void* data = m_forwardInstanceBuffer->map();
+    memcpy(data, waterInstances.data(), dataSize);
+    m_forwardInstanceBuffer->unmap();
+    
+    // Bind deferred pipeline
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_descriptorSet, 0, nullptr);
+    
+    // Bind water instance buffer (separate from deferred pass)
+    VkBuffer instanceBuffers[] = {m_forwardInstanceBuffer->getBuffer()};
+    VkDeviceSize offsets[] = {0};
+    vkCmdBindVertexBuffers(cmd, 1, 1, instanceBuffers, offsets);
+    
+    struct {
+        glm::mat4 viewProjection;
+        glm::vec3 cameraPos;
+        float time;
+    } pushConstants;
+    
+    pushConstants.viewProjection = viewProjection;
+    pushConstants.cameraPos = glm::vec3(glm::inverse(view)[3]);
+    pushConstants.time = static_cast<float>(glfwGetTime());
+    
+    vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                      0, sizeof(pushConstants), &pushConstants);
+    
+    // Draw water
+    auto it = m_models.find(WATER_BLOCK_ID);
+    if (it != m_models.end()) {
+        const ModelData& model = it->second;
+        VkBuffer vertexBuffers[] = {model.vertexBuffer->getBuffer()};
+        VkDeviceSize vertexOffsets[] = {0};
+        vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, vertexOffsets);
+        vkCmdBindIndexBuffer(cmd, model.indexBuffer->getBuffer(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, model.indexCount, waterInstances.size(), 0, 0, 0);
     }
 }
 
@@ -640,12 +721,29 @@ void VulkanModelRenderer::createPipeline() {
     attributes[5].format = VK_FORMAT_R32_UINT;  // instance block ID
     attributes[5].offset = 4 * sizeof(float);
     
+    VkVertexInputAttributeDescription attributes6{};
+    attributes6.binding = 1;
+    attributes6.location = 6;
+    attributes6.format = VK_FORMAT_R32_UINT;  // instance material type
+    attributes6.offset = 5 * sizeof(float);
+    
+    VkVertexInputAttributeDescription attributes7{};
+    attributes7.binding = 1;
+    attributes7.location = 7;
+    attributes7.format = VK_FORMAT_R32_UINT;  // instance isReflective
+    attributes7.offset = 6 * sizeof(float);
+    
+    VkVertexInputAttributeDescription allAttributes[8] = {
+        attributes[0], attributes[1], attributes[2], 
+        attributes[3], attributes[4], attributes[5], attributes6, attributes7
+    };
+    
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
     vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vertexInputInfo.vertexBindingDescriptionCount = 2;
     vertexInputInfo.pVertexBindingDescriptions = bindings;
-    vertexInputInfo.vertexAttributeDescriptionCount = 6;
-    vertexInputInfo.pVertexAttributeDescriptions = attributes;
+    vertexInputInfo.vertexAttributeDescriptionCount = 8;
+    vertexInputInfo.pVertexAttributeDescriptions = allAttributes;
     
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -736,7 +834,9 @@ void VulkanModelRenderer::createPipeline() {
         VK_FORMAT_R32G32B32A32_SFLOAT,  // Position
         VK_FORMAT_R8G8B8A8_UNORM        // Metadata
     };
-    VkPipelineRenderingCreateInfo renderingInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkPipelineRenderingCreateInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingInfo.pNext = nullptr;
     renderingInfo.colorAttachmentCount = 4;
     renderingInfo.pColorAttachmentFormats = colorFormats;
     renderingInfo.depthAttachmentFormat = m_context->getDepthFormat();  // D32_SFLOAT
@@ -762,7 +862,357 @@ void VulkanModelRenderer::createPipeline() {
     vkDestroyShaderModule(device, vertShader, nullptr);
     vkDestroyShaderModule(device, fragShader, nullptr);
     
-    std::cout << "✓ VulkanModelRenderer pipeline created" << std::endl;
+    std::cout << "✓ VulkanModelRenderer deferred pipeline created" << std::endl;
 }
+
+void VulkanModelRenderer::createForwardPipeline() {
+    VkDevice device = m_context->getDevice();
+    
+    std::string exeDir;
+#ifdef _WIN32
+    char buffer[MAX_PATH];
+    GetModuleFileNameA(NULL, buffer, MAX_PATH);
+    std::filesystem::path exePath(buffer);
+    exeDir = exePath.parent_path().string();
+#else
+    exeDir = std::filesystem::current_path().string();
+#endif
+    
+    // Load shaders
+    auto loadShaderModule = [device](const char* filepath) -> VkShaderModule {
+        std::ifstream file(filepath, std::ios::ate | std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "Failed to open shader: " << filepath << std::endl;
+            return VK_NULL_HANDLE;
+        }
+        
+        size_t fileSize = static_cast<size_t>(file.tellg());
+        std::vector<char> buffer(fileSize);
+        file.seekg(0);
+        file.read(buffer.data(), fileSize);
+        file.close();
+        
+        VkShaderModuleCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        createInfo.codeSize = buffer.size();
+        createInfo.pCode = reinterpret_cast<const uint32_t*>(buffer.data());
+        
+        VkShaderModule shaderModule;
+        if (vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+            std::cerr << "Failed to create shader module: " << filepath << std::endl;
+            return VK_NULL_HANDLE;
+        }
+        
+        return shaderModule;
+    };
+    
+    std::string vertPath = exeDir + "/shaders/vulkan/model_forward.vert.spv";
+    std::string fragPath = exeDir + "/shaders/vulkan/model_forward.frag.spv";
+    
+    VkShaderModule vertShader = loadShaderModule(vertPath.c_str());
+    VkShaderModule fragShader = loadShaderModule(fragPath.c_str());
+    
+    if (!vertShader || !fragShader) {
+        std::cerr << "Failed to load forward shaders" << std::endl;
+        return;
+    }
+    
+    VkPipelineShaderStageCreateInfo shaderStages[2] = {};
+    shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    shaderStages[0].module = vertShader;
+    shaderStages[0].pName = "main";
+    
+    shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    shaderStages[1].module = fragShader;
+    shaderStages[1].pName = "main";
+    
+    // Vertex input (same as deferred)
+    VkVertexInputBindingDescription bindings[2] = {};
+    bindings[0].binding = 0;
+    bindings[0].stride = 8 * sizeof(float);
+    bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    
+    bindings[1].binding = 1;
+    bindings[1].stride = sizeof(InstanceData);
+    bindings[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+    
+    VkVertexInputAttributeDescription attributes[8] = {};
+    attributes[0].binding = 0;
+    attributes[0].location = 0;
+    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[0].offset = 0;
+    
+    attributes[1].binding = 0;
+    attributes[1].location = 1;
+    attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[1].offset = 3 * sizeof(float);
+    
+    attributes[2].binding = 0;
+    attributes[2].location = 2;
+    attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
+    attributes[2].offset = 6 * sizeof(float);
+    
+    attributes[3].binding = 1;
+    attributes[3].location = 3;
+    attributes[3].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[3].offset = 0;
+    
+    attributes[4].binding = 1;
+    attributes[4].location = 4;
+    attributes[4].format = VK_FORMAT_R32_UINT;
+    attributes[4].offset = 3 * sizeof(float);
+    
+    attributes[5].binding = 1;
+    attributes[5].location = 5;
+    attributes[5].format = VK_FORMAT_R32_UINT;
+    attributes[5].offset = 4 * sizeof(float);
+    
+    VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
+    vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInputInfo.vertexBindingDescriptionCount = 2;
+    vertexInputInfo.pVertexBindingDescriptions = bindings;
+    vertexInputInfo.vertexAttributeDescriptionCount = 6;
+    vertexInputInfo.pVertexAttributeDescriptions = attributes;
+    
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    
+    VkViewport viewport{};
+    viewport.width = (float)m_context->getSwapchainExtent().width;
+    viewport.height = (float)m_context->getSwapchainExtent().height;
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    
+    VkRect2D scissor{};
+    scissor.extent = m_context->getSwapchainExtent();
+    
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.pViewports = &viewport;
+    viewportState.scissorCount = 1;
+    viewportState.pScissors = &scissor;
+    
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.lineWidth = 1.0f;
+    
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_FALSE;  // Don't write depth for transparent
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    
+    // Alpha blending for transparency
+    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+    colorBlendAttachment.blendEnable = VK_TRUE;
+    colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+    colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | 
+                                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    
+    VkPipelineColorBlendStateCreateInfo colorBlending{};
+    colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments = &colorBlendAttachment;
+    
+    // Descriptor set layouts: Set 0 = island transforms, Set 1 = depth + HDR textures
+    VkDescriptorSetLayoutBinding descriptorBindings[2] = {};
+    descriptorBindings[0].binding = 0;
+    descriptorBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorBindings[0].descriptorCount = 1;
+    descriptorBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    
+    descriptorBindings[1].binding = 1;
+    descriptorBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorBindings[1].descriptorCount = 1;
+    descriptorBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 2;
+    layoutInfo.pBindings = descriptorBindings;
+    
+    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_forwardDescriptorSetLayout);
+    
+    // Descriptor pool
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSize.descriptorCount = 2;
+    
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = 1;
+    
+    vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_forwardDescriptorPool);
+    
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = m_forwardDescriptorPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &m_forwardDescriptorSetLayout;
+    
+    vkAllocateDescriptorSets(device, &allocInfo, &m_forwardDescriptorSet);
+    
+    // Push constants: mat4 viewProjection + vec3 cameraPos + float time
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = 80;  // mat4(64) + vec3(12) + float(4)
+    
+    VkDescriptorSetLayout setLayouts[] = {m_descriptorSetLayout, m_forwardDescriptorSetLayout};
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 2;
+    pipelineLayoutInfo.pSetLayouts = setLayouts;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+    
+    vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &m_forwardPipelineLayout);
+    
+    // Dynamic rendering: swapchain format
+    VkFormat swapchainFormat = m_context->getSwapchainImageFormat();
+    VkPipelineRenderingCreateInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingInfo.pNext = nullptr;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachmentFormats = &swapchainFormat;
+    renderingInfo.depthAttachmentFormat = m_context->getDepthFormat();
+    
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingInfo;
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = shaderStages;
+    pipelineInfo.pVertexInputState = &vertexInputInfo;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState = &multisampling;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.layout = m_forwardPipelineLayout;
+    
+    vkCreateGraphicsPipelines(device, m_context->pipelineCache, 1, &pipelineInfo, nullptr, &m_forwardPipeline);
+    
+    vkDestroyShaderModule(device, vertShader, nullptr);
+    vkDestroyShaderModule(device, fragShader, nullptr);
+    
+    std::cout << "✓ VulkanModelRenderer forward pipeline created (transparent water)" << std::endl;
+}
+
+void VulkanModelRenderer::renderForward(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::vec3& cameraPos,
+                                        VkImageView depthTexture, VkImageView hdrTexture, VkSampler sampler) {
+    if (!m_forwardPipeline) return;
+    
+    // Filter for water blocks only (BlockID 45)
+    const uint8_t WATER_BLOCK_ID = 45;
+    std::vector<InstanceData> waterInstances;
+    
+    for (const auto& [chunk, batches] : m_chunkBatches) {
+        for (const auto& batch : batches) {
+            if (batch.blockID == WATER_BLOCK_ID) {
+                waterInstances.insert(waterInstances.end(), batch.instances.begin(), batch.instances.end());
+            }
+        }
+    }
+    
+    if (waterInstances.empty()) return;
+    
+    // Upload water instances to separate buffer
+    if (m_forwardInstanceBuffer) {
+        size_t dataSize = waterInstances.size() * sizeof(InstanceData);
+        if (dataSize > m_forwardInstanceBuffer->getSize()) {
+            m_forwardInstanceBuffer->destroy();
+            m_forwardInstanceBuffer->create(m_allocator, dataSize * 2, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+        }
+        void* data = m_forwardInstanceBuffer->map();
+        memcpy(data, waterInstances.data(), dataSize);
+        m_forwardInstanceBuffer->unmap();
+    }
+    
+    // Update descriptors for depth and HDR textures
+    VkDescriptorImageInfo imageInfos[2] = {};
+    imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    imageInfos[0].imageView = depthTexture;
+    imageInfos[0].sampler = sampler;
+    
+    imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfos[1].imageView = hdrTexture;
+    imageInfos[1].sampler = sampler;
+    
+    VkWriteDescriptorSet descriptorWrites[2] = {};
+    descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[0].dstSet = m_forwardDescriptorSet;
+    descriptorWrites[0].dstBinding = 0;
+    descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorWrites[0].descriptorCount = 1;
+    descriptorWrites[0].pImageInfo = &imageInfos[0];
+    
+    descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[1].dstSet = m_forwardDescriptorSet;
+    descriptorWrites[1].dstBinding = 1;
+    descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorWrites[1].descriptorCount = 1;
+    descriptorWrites[1].pImageInfo = &imageInfos[1];
+    
+    vkUpdateDescriptorSets(m_context->getDevice(), 2, descriptorWrites, 0, nullptr);
+    
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_forwardPipeline);
+    
+    VkDescriptorSet sets[] = {m_descriptorSet, m_forwardDescriptorSet};
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_forwardPipelineLayout,
+                           0, 2, sets, 0, nullptr);
+    
+    VkBuffer instanceBuffers[] = {m_forwardInstanceBuffer->getBuffer()};
+    VkDeviceSize offsets[] = {0};
+    vkCmdBindVertexBuffers(cmd, 1, 1, instanceBuffers, offsets);
+    
+    static auto startTime = std::chrono::high_resolution_clock::now();
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    float time = std::chrono::duration<float>(currentTime - startTime).count();
+    
+    struct alignas(16) PushConstants {
+        glm::mat4 viewProjection;
+        glm::vec3 cameraPos;
+        float time;
+    } pushConstants;
+    
+    pushConstants.viewProjection = viewProjection;
+    pushConstants.cameraPos = cameraPos;
+    pushConstants.time = time;
+    
+    vkCmdPushConstants(cmd, m_forwardPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                      0, sizeof(PushConstants), &pushConstants);
+    
+    // Draw water
+    auto it = m_models.find(WATER_BLOCK_ID);
+    if (it != m_models.end()) {
+        const ModelData& model = it->second;
+        VkBuffer vertexBuffers[] = {model.vertexBuffer->getBuffer()};
+        VkDeviceSize vertexOffsets[] = {0};
+        vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, vertexOffsets);
+        vkCmdBindIndexBuffer(cmd, model.indexBuffer->getBuffer(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, model.indexCount, waterInstances.size(), 0, 0, 0);
+    }
+}
+
+
 
 

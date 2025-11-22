@@ -6,20 +6,20 @@
 #include <vk_mem_alloc.h>
 #include <glm/glm.hpp>
 
-class VulkanSSR {
+class VulkanSSPR {
 public:
     struct PushConstants {
         glm::mat4 viewMatrix;
         glm::mat4 projectionMatrix;
-        glm::mat4 invViewMatrix;
-        glm::mat4 invProjectionMatrix;
+        glm::vec3 cameraPos;
+        float planeY;
     };
 
-    VulkanSSR() = default;
-    ~VulkanSSR() { destroy(); }
+    VulkanSSPR() = default;
+    ~VulkanSSPR() { destroy(); }
 
-    VulkanSSR(const VulkanSSR&) = delete;
-    VulkanSSR& operator=(const VulkanSSR&) = delete;
+    VulkanSSPR(const VulkanSSPR&) = delete;
+    VulkanSSPR& operator=(const VulkanSSPR&) = delete;
 
     bool initialize(VkDevice device, VmaAllocator allocator, VkPipelineCache pipelineCache,
                     uint32_t width, uint32_t height, VkQueue graphicsQueue, VkCommandPool commandPool);
@@ -29,7 +29,8 @@ public:
     void compute(VkCommandBuffer cmd, 
                  VkImageView gNormal, VkImageView gPosition, VkImageView gDepth, 
                  VkImageView gMetadata, VkImageView hdrBuffer,
-                 const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix);
+                 const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix, 
+                 const glm::vec3& cameraPos, float time);
 
     VkImageView getOutputView() const { return m_reflectionImage.getView(); }
 

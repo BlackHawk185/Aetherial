@@ -66,6 +66,7 @@ void BlockTypeRegistry::initializeDefaultBlocks() {
     // === DECORATIVE/OBJ BLOCKS ===
     BlockProperties grassProps = BlockProperties::Transparent(0.1f, 1);
     grassProps.requiresSupport = true;
+    grassProps.materialType = 2;
     registerBlockType(BlockID::DECOR_GRASS, "decor_grass", BlockRenderType::OBJ, 
                      "assets/models/grass.glb", grassProps);
     
@@ -183,6 +184,8 @@ void BlockTypeRegistry::initializeDefaultBlocks() {
     // Water: Essential liquid
     BlockProperties waterProps = BlockProperties::Transparent(0.1f, 1);
     waterProps.isTransparent = true;
+    waterProps.materialType = 1;
+    waterProps.isReflective = true;
     registerBlockType(BlockID::WATER, "water", BlockRenderType::OBJ, "assets/models/water.glb", waterProps);
     
     std::cout << "BlockTypeRegistry initialized with " << m_blockTypes.size() << " block types" << std::endl;

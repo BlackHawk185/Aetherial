@@ -23,6 +23,10 @@ struct BlockProperties {
     // Rendering
     uint32_t textureIndex = 0;       // For voxel blocks (texture atlas index)
     
+    // Material properties for OBJ models
+    uint8_t materialType = 0;        // 0=default, 1=water, 2=grass, etc.
+    bool isReflective = false;       // Enables SSR/reflections
+    
     // Special behaviors
     bool isQuantumField = false;     // For QFG territory/attunement system
     float tickRate = 0.0f;           // For blocks that update over time (0 = no ticking)

@@ -1,6 +1,7 @@
 #include "VulkanDeferred.h"
 #include "VulkanContext.h"
 #include "ShaderPaths.h"
+#include <GLFW/glfw3.h>
 #include <iostream>
 #include <fstream>
 
@@ -61,9 +62,9 @@ bool VulkanDeferred::initialize(VkDevice device, VmaAllocator allocator, VkPipel
         return false;
     }
 
-    // Initialize SSR
-    if (!m_ssr.initialize(device, allocator, pipelineCache, width, height, graphicsQueue, commandPool)) {
-        std::cerr << "❌ Failed to initialize SSR" << std::endl;
+    // Initialize SSPR
+    if (!m_sspr.initialize(device, allocator, pipelineCache, width, height, graphicsQueue, commandPool)) {
+        std::cerr << "❌ Failed to initialize SSPR" << std::endl;
         return false;
     }
     
@@ -101,8 +102,8 @@ bool VulkanDeferred::resize(uint32_t width, uint32_t height) {
         return false;
     }
 
-    // Resize SSR
-    if (!m_ssr.resize(width, height)) {
+    // Resize SSPR
+    if (!m_sspr.resize(width, height)) {
         return false;
     }
 
@@ -696,15 +697,19 @@ void VulkanDeferred::endGeometryPass(VkCommandBuffer commandBuffer) {
 
 void VulkanDeferred::computeSSR(VkCommandBuffer commandBuffer,
                                 const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix) {
-    // SSR raymarches lit HDR buffer to get proper lit reflections
-    m_ssr.compute(commandBuffer,
-                  m_gbuffer.getNormalView(),
-                  m_gbuffer.getPositionView(),
-                  m_context->getDepthImageView(),
-                  m_gbuffer.getMetadataView(),
-                  m_hdrBuffer.getView(),
-                  viewMatrix,
-                  projectionMatrix);
+    // SSPR raymarches lit HDR buffer for planar water reflections
+    glm::vec3 cameraPos = glm::vec3(glm::inverse(viewMatrix)[3]);
+    float time = static_cast<float>(glfwGetTime());
+    m_sspr.compute(commandBuffer,
+                   m_gbuffer.getNormalView(),
+                   m_gbuffer.getPositionView(),
+                   m_context->getDepthImageView(),
+                   m_gbuffer.getMetadataView(),
+                   m_hdrBuffer.getView(),
+                   viewMatrix,
+                   projectionMatrix,
+                   cameraPos,
+                   time);
 }
 
 void VulkanDeferred::renderLightingToHDR(VkCommandBuffer commandBuffer,
@@ -858,7 +863,7 @@ bool VulkanDeferred::bindLightingTextures(VkImageView cloudNoiseTexture) {
 
     VkDescriptorImageInfo ssrInfo = {};
     ssrInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    ssrInfo.imageView = m_ssr.getOutputView();
+    ssrInfo.imageView = m_sspr.getOutputView();
     ssrInfo.sampler = m_ssrSampler;
 
     VkWriteDescriptorSet writes[4] = {};
@@ -898,16 +903,8 @@ void VulkanDeferred::compositeToSwapchain(VkCommandBuffer commandBuffer, const g
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_compositePipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_compositePipelineLayout, 0, 1, &m_compositeDescriptorSet, 0, nullptr);
     
-    // Push camera position and FOV values for viewport mapping
-    struct {
-        glm::vec3 cameraPos;
-        float normalFOV;  // 70 degrees
-        float wideFOV;    // 120 degrees
-    } pushConstants;
-    pushConstants.cameraPos = cameraPos;
-    pushConstants.normalFOV = 70.0f;
-    pushConstants.wideFOV = 120.0f;
-    vkCmdPushConstants(commandBuffer, m_compositePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
+    // Push camera position for Fresnel calculation
+    vkCmdPushConstants(commandBuffer, m_compositePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(glm::vec3), &cameraPos);
     
     vkCmdDraw(commandBuffer, 3, 1, 0, 0);
 }
@@ -956,9 +953,9 @@ void VulkanDeferred::destroy() {
     if (m_ssrSampler) vkDestroySampler(m_device, m_ssrSampler, nullptr);
     m_cascadeUniformBuffer.destroy();
     
-    // Destroy shadow and SSR
+    // Destroy shadow and SSPR
     m_shadowMap.destroy();
-    m_ssr.destroy();
+    m_sspr.destroy();
 
     // Destroy G-buffer
     m_gbuffer.destroy();
@@ -969,7 +966,7 @@ void VulkanDeferred::destroy() {
 // HDR render pass/framebuffer removed - using dynamic rendering
 
 bool VulkanDeferred::createCompositePipeline() {
-    VkDescriptorSetLayoutBinding bindings[5] = {};
+    VkDescriptorSetLayoutBinding bindings[6] = {};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[0].descriptorCount = 1;
@@ -995,19 +992,24 @@ bool VulkanDeferred::createCompositePipeline() {
     bindings[4].descriptorCount = 1;
     bindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     
+    bindings[5].binding = 5;
+    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[5].descriptorCount = 1;
+    bindings[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    
     VkDescriptorSetLayoutCreateInfo layoutInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    layoutInfo.bindingCount = 5;
+    layoutInfo.bindingCount = 6;
     layoutInfo.pBindings = bindings;
     
     if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_compositeDescriptorLayout) != VK_SUCCESS) {
         return false;
     }
     
-    // Push constants for camera position + FOV values
+    // Push constants for camera position
     VkPushConstantRange pushConstantRange = {};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(glm::vec3) + 2 * sizeof(float);  // cameraPos + normalFOV + wideFOV
+    pushConstantRange.size = sizeof(glm::vec3);  // cameraPos
     
     VkPipelineLayoutCreateInfo pipelineLayoutInfo = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pipelineLayoutInfo.setLayoutCount = 1;
@@ -1115,7 +1117,7 @@ bool VulkanDeferred::createCompositePipeline() {
     
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 5;  // hdr, ssr, metadata, normal, position
+    poolSize.descriptorCount = 6;  // hdr, ssr, metadata, normal, position, depth
     
     VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 1;
@@ -1135,13 +1137,13 @@ bool VulkanDeferred::createCompositePipeline() {
         return false;
     }
     
-    VkDescriptorImageInfo imageInfos[5] = {};
+    VkDescriptorImageInfo imageInfos[6] = {};
     imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     imageInfos[0].imageView = m_hdrBuffer.getView();
     imageInfos[0].sampler = m_compositeSampler;
     
     imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageInfos[1].imageView = m_ssr.getOutputView();
+    imageInfos[1].imageView = m_sspr.getOutputView();
     imageInfos[1].sampler = m_compositeSampler;
     
     imageInfos[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1156,8 +1158,12 @@ bool VulkanDeferred::createCompositePipeline() {
     imageInfos[4].imageView = m_gbuffer.getPositionView();
     imageInfos[4].sampler = m_compositeSampler;
     
-    VkWriteDescriptorSet writes[5] = {};
-    for (int i = 0; i < 5; i++) {
+    imageInfos[5].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    imageInfos[5].imageView = m_context->getDepthImageView();
+    imageInfos[5].sampler = m_compositeSampler;
+    
+    VkWriteDescriptorSet writes[6] = {};
+    for (int i = 0; i < 6; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = m_compositeDescriptorSet;
         writes[i].dstBinding = i;
@@ -1166,7 +1172,7 @@ bool VulkanDeferred::createCompositePipeline() {
         writes[i].pImageInfo = &imageInfos[i];
     }
     
-    vkUpdateDescriptorSets(m_device, 5, writes, 0, nullptr);
+    vkUpdateDescriptorSets(m_device, 6, writes, 0, nullptr);
     
     return true;
 }

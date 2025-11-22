@@ -36,6 +36,9 @@ public:
     
     // Rendering
     void renderToGBuffer(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::mat4& view);
+    void renderWaterToGBuffer(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::mat4& view);
+    void renderForward(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::vec3& cameraPos,
+                       VkImageView depthTexture, VkImageView hdrTexture, VkSampler sampler);
 
 private:
     struct ModelData {
@@ -49,7 +52,9 @@ private:
         glm::vec3 position;
         uint32_t islandID;
         uint32_t blockID;
-        uint32_t padding;
+        uint32_t materialType;
+        uint32_t isReflective;
+        uint32_t padding[3];
     };
     
     struct DrawBatch {
@@ -77,17 +82,24 @@ private:
     std::unique_ptr<VulkanBuffer> m_islandTransformBuffer;
     std::unordered_map<uint32_t, glm::mat4> m_islandTransforms;
     
-    // Pipeline and descriptors
+    // Deferred pipeline (opaque)
     VkPipeline m_pipeline = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
-
     
+    // Forward pipeline (transparent water)
+    VkPipeline m_forwardPipeline = VK_NULL_HANDLE;
+    VkPipelineLayout m_forwardPipelineLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_forwardDescriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool m_forwardDescriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet m_forwardDescriptorSet = VK_NULL_HANDLE;
+    std::unique_ptr<VulkanBuffer> m_forwardInstanceBuffer;
+
     // Helper functions
     void createMagentaCube(uint8_t blockID);
     void createPipeline();
+    void createForwardPipeline();
     void createDescriptors();
-    void rebuildInstanceBuffer();
 };

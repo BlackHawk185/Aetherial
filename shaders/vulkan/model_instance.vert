@@ -28,9 +28,15 @@ layout(location = 3) out vec3 fragTangent;
 layout(location = 4) out flat uint fragBlockID;
 
 const uint WATER_BLOCK_ID = 45;
+const uint GRASS_BLOCK_ID = 102;
 const float WAVE_AMPLITUDE = 0.15;
 const float WAVE_FREQUENCY = 1.5;
 const float WAVE_SPEED = 0.8;
+
+// Grass wind parameters
+const float WIND_STRENGTH = 0.3;
+const float WIND_SPEED = 1.2;
+const float WIND_FREQUENCY = 0.8;
 
 void main() {
     // Get island transform
@@ -57,6 +63,27 @@ void main() {
         float dz = cos(worldPosForWaves.z * WAVE_FREQUENCY * 1.3 + pc.time * WAVE_SPEED * 0.7) * WAVE_FREQUENCY * 1.3 * WAVE_AMPLITUDE * 0.8;
         
         normal = normalize(vec3(-dx, 1.0, -dz));
+    }
+    // Apply wind deformation for grass blocks
+    else if (instanceBlockID == GRASS_BLOCK_ID) {
+        vec3 worldPosForWind = (islandTransform * vec4(inPosition + instancePosition, 1.0)).xyz;
+        
+        // Height-based wind influence (stronger at top)
+        float heightFactor = clamp(inPosition.y, 0.0, 1.0);
+        
+        // Multi-directional wind waves
+        float wind1 = sin(worldPosForWind.x * WIND_FREQUENCY + pc.time * WIND_SPEED) * WIND_STRENGTH;
+        float wind2 = sin(worldPosForWind.z * WIND_FREQUENCY * 0.7 + pc.time * WIND_SPEED * 1.3) * WIND_STRENGTH * 0.7;
+        float wind3 = sin((worldPosForWind.x + worldPosForWind.z) * WIND_FREQUENCY * 0.5 + pc.time * WIND_SPEED * 0.8) * WIND_STRENGTH * 0.5;
+        
+        float totalWind = (wind1 + wind2 + wind3) * heightFactor;
+        
+        // Apply horizontal displacement
+        localPos.x += totalWind * 0.6;
+        localPos.z += totalWind * 0.4;
+        
+        // Slight vertical bob
+        localPos.y += abs(totalWind) * 0.1;
     }
     
     // Transform vertex to world space

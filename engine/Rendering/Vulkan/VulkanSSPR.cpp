@@ -1,10 +1,10 @@
-#include "VulkanSSR.h"
+#include "VulkanSSPR.h"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
 
-bool VulkanSSR::initialize(VkDevice device, VmaAllocator allocator, VkPipelineCache pipelineCache,
-                           uint32_t width, uint32_t height, VkQueue graphicsQueue, VkCommandPool commandPool) {
+bool VulkanSSPR::initialize(VkDevice device, VmaAllocator allocator, VkPipelineCache pipelineCache,
+                            uint32_t width, uint32_t height, VkQueue graphicsQueue, VkCommandPool commandPool) {
     destroy();
 
     m_device = device;
@@ -17,7 +17,7 @@ bool VulkanSSR::initialize(VkDevice device, VmaAllocator allocator, VkPipelineCa
                                    VK_FORMAT_R16G16B16A16_SFLOAT,
                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                    VK_IMAGE_ASPECT_COLOR_BIT)) {
-        std::cerr << "❌ Failed to create SSR reflection image" << std::endl;
+        std::cerr << "Failed to create SSPR reflection image" << std::endl;
         return false;
     }
 
@@ -74,30 +74,29 @@ bool VulkanSSR::initialize(VkDevice device, VmaAllocator allocator, VkPipelineCa
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
 
     if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_sampler) != VK_SUCCESS) {
-        std::cerr << "❌ Failed to create SSR sampler" << std::endl;
+        std::cerr << "Failed to create SSPR sampler" << std::endl;
         return false;
     }
 
     if (!createPipeline()) {
-        std::cerr << "❌ Failed to create SSR pipeline" << std::endl;
+        std::cerr << "Failed to create SSPR pipeline" << std::endl;
         return false;
     }
 
     if (!createDescriptorSet()) {
-        std::cerr << "❌ Failed to create SSR descriptor set" << std::endl;
+        std::cerr << "Failed to create SSPR descriptor set" << std::endl;
         return false;
     }
 
-    std::cout << "✅ VulkanSSR initialized: " << width << "x" << height << std::endl;
+    std::cout << "VulkanSSPR initialized: " << width << "x" << height << std::endl;
     return true;
 }
 
-bool VulkanSSR::resize(uint32_t width, uint32_t height) {
+bool VulkanSSPR::resize(uint32_t width, uint32_t height) {
     if (width == m_width && height == m_height) {
         return true;
     }
 
-    // Wait for GPU before recreating image (necessary during resize)
     vkDeviceWaitIdle(m_device);
 
     m_reflectionImage.destroy();
@@ -116,10 +115,9 @@ bool VulkanSSR::resize(uint32_t width, uint32_t height) {
     return createDescriptorSet();
 }
 
-void VulkanSSR::destroy() {
+void VulkanSSPR::destroy() {
     if (m_device == VK_NULL_HANDLE) return;
 
-    // Wait for GPU before destroying resources (necessary during cleanup)
     vkDeviceWaitIdle(m_device);
 
     if (m_descriptorPool) vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
@@ -139,10 +137,10 @@ void VulkanSSR::destroy() {
     m_sampler = VK_NULL_HANDLE;
 }
 
-VkShaderModule VulkanSSR::loadShaderModule(const std::string& filepath) {
+VkShaderModule VulkanSSPR::loadShaderModule(const std::string& filepath) {
     std::ifstream file(filepath, std::ios::ate | std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "❌ Failed to open shader: " << filepath << std::endl;
+        std::cerr << "Failed to open shader: " << filepath << std::endl;
         return VK_NULL_HANDLE;
     }
 
@@ -158,14 +156,14 @@ VkShaderModule VulkanSSR::loadShaderModule(const std::string& filepath) {
 
     VkShaderModule shaderModule;
     if (vkCreateShaderModule(m_device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
-        std::cerr << "❌ Failed to create shader module: " << filepath << std::endl;
+        std::cerr << "Failed to create shader module: " << filepath << std::endl;
         return VK_NULL_HANDLE;
     }
 
     return shaderModule;
 }
 
-bool VulkanSSR::createPipeline() {
+bool VulkanSSPR::createPipeline() {
     std::string exeDir;
 #ifdef _WIN32
     char buffer[MAX_PATH];
@@ -176,7 +174,7 @@ bool VulkanSSR::createPipeline() {
     exeDir = std::filesystem::current_path().string();
 #endif
 
-    m_computeShader = loadShaderModule(exeDir + "/shaders/vulkan/ssr.comp.spv");
+    m_computeShader = loadShaderModule(exeDir + "/shaders/vulkan/sspr.comp.spv");
     if (!m_computeShader) return false;
 
     VkDescriptorSetLayoutBinding bindings[6] = {};
@@ -230,7 +228,7 @@ bool VulkanSSR::createPipeline() {
     return true;
 }
 
-bool VulkanSSR::createDescriptorSet() {
+bool VulkanSSPR::createDescriptorSet() {
     if (m_descriptorPool) {
         vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
         m_descriptorPool = VK_NULL_HANDLE;
@@ -263,15 +261,14 @@ bool VulkanSSR::createDescriptorSet() {
     return true;
 }
 
-void VulkanSSR::compute(VkCommandBuffer cmd,
-                        VkImageView gNormal, VkImageView gPosition, VkImageView gDepth,
-                        VkImageView gMetadata, VkImageView hdrBuffer,
-                        const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix) {
-    VkImageView reflectionSource = hdrBuffer;
+void VulkanSSPR::compute(VkCommandBuffer cmd,
+                         VkImageView gNormal, VkImageView gPosition, VkImageView gDepth,
+                         VkImageView gMetadata, VkImageView hdrBuffer,
+                         const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix,
+                         const glm::vec3& cameraPos, float time) {
     VkDescriptorImageInfo imageInfos[6] = {};
-    VkImageView views[5] = {gNormal, gPosition, gDepth, gMetadata, reflectionSource};
+    VkImageView views[5] = {gNormal, gPosition, gDepth, gMetadata, hdrBuffer};
     for (int i = 0; i < 5; i++) {
-        // Depth buffer uses DEPTH_STENCIL_READ_ONLY_OPTIMAL, others use SHADER_READ_ONLY_OPTIMAL
         imageInfos[i].imageLayout = (i == 2) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         imageInfos[i].imageView = views[i];
         imageInfos[i].sampler = m_sampler;
@@ -315,8 +312,8 @@ void VulkanSSR::compute(VkCommandBuffer cmd,
     PushConstants pc;
     pc.viewMatrix = viewMatrix;
     pc.projectionMatrix = projectionMatrix;
-    pc.invViewMatrix = glm::inverse(viewMatrix);
-    pc.invProjectionMatrix = glm::inverse(projectionMatrix);
+    pc.cameraPos = cameraPos;
+    pc.planeY = time;
 
     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pc);
 

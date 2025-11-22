@@ -56,8 +56,11 @@ set(REQUIRED_VULKAN_SHADERS
     clouds.vert
     clouds.frag
     ssr.comp
+    sspr.comp
     model_instance.vert
     model_instance.frag
+    model_forward.vert
+    model_forward.frag
     composite.vert
     composite.frag
 )

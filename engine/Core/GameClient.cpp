@@ -607,10 +607,8 @@ void GameClient::renderVulkan()
     // Calculate camera matrices
     float aspect = static_cast<float>(m_windowWidth) / static_cast<float>(m_windowHeight);
     glm::mat4 projectionMatrix = m_playerController.getCamera().getProjectionMatrix(aspect);
-    glm::mat4 wideFOVProjectionMatrix = m_playerController.getCamera().getWideFOVProjectionMatrix(aspect);
     glm::mat4 viewMatrix = m_playerController.getCamera().getViewMatrix();
     glm::mat4 viewProjection = projectionMatrix * viewMatrix;
-    glm::mat4 wideViewProjection = wideFOVProjectionMatrix * viewMatrix;
     
     // Update island transforms for Vulkan renderer (islands drift each frame)
     if (m_clientWorld)
@@ -776,20 +774,19 @@ void GameClient::renderVulkan()
         }
         
         // G-buffer always receives depth in ATTACHMENT layout (transitioned above)
-        // Use wide FOV for rendering to capture more geometry for SSR
         m_vulkanDeferred->beginGeometryPass(cmd, m_vulkanContext->getDepthImage(), m_vulkanContext->getDepthImageView(), 
                                            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         
-        // Render voxels to G-buffer (with wide FOV for SSR data)
+        // Render voxels to G-buffer
         if (m_vulkanQuadRenderer)
         {
-            m_vulkanQuadRenderer->renderToGBuffer(cmd, wideViewProjection, viewMatrix);
+            m_vulkanQuadRenderer->renderToGBuffer(cmd, viewProjection, viewMatrix);
         }
         
-        // Render GLB models to G-buffer (with wide FOV for SSR data)
+        // Render GLB models to G-buffer
         if (m_vulkanModelRenderer)
         {
-            m_vulkanModelRenderer->renderToGBuffer(cmd, wideViewProjection, viewMatrix);
+            m_vulkanModelRenderer->renderToGBuffer(cmd, viewProjection, viewMatrix);
         }
         
         m_vulkanDeferred->endGeometryPass(cmd);
@@ -840,7 +837,7 @@ void GameClient::renderVulkan()
     }
     
     // ========================================
-    // PASS 1.5: LIGHTING TO HDR (ALL geometry including water)
+    // PASS 1.5: LIGHTING TO HDR (opaque geometry only)
     // ========================================
     if (m_vulkanDeferred)
     {
@@ -866,8 +863,7 @@ void GameClient::renderVulkan()
     // ========================================
     if (m_vulkanDeferred)
     {
-        // SSR uses wide FOV projection to access extended geometry data
-        m_vulkanDeferred->computeSSR(cmd, viewMatrix, wideFOVProjectionMatrix);
+        m_vulkanDeferred->computeSSR(cmd, viewMatrix, projectionMatrix);
     }
     
     // ========================================
@@ -913,6 +909,18 @@ void GameClient::renderVulkan()
         vkCmdSetScissor(cmd, 0, 1, &scissor);
         
         m_vulkanDeferred->compositeToSwapchain(cmd, m_playerController.getCamera().position);
+    }
+    
+    // ========================================
+    // PASS 3: FORWARD TRANSPARENT WATER (industry standard)
+    // Renders after composition with alpha blending
+    // ========================================
+    if (m_vulkanModelRenderer && m_vulkanDeferred)
+    {
+        VkImageView depthTexture = m_vulkanContext->getDepthImageView();
+        VkImageView hdrTexture = m_vulkanDeferred->getHDRView();
+        VkSampler sampler = m_vulkanDeferred->getGBufferSampler();
+        m_vulkanModelRenderer->renderForward(cmd, viewProjection, m_playerController.getCamera().position, depthTexture, hdrTexture, sampler);
     }
     
     // Render reticle wireframe - snaps to hit block if valid target found
