@@ -295,13 +295,20 @@ void VoxelChunk::generateMeshAsync(bool generateLighting)
                         
                         QuadFace quad;
                         quad.position = cornerPos;
-                        quad._padding0 = 0.0f;
-                        quad.width = static_cast<float>(width);
-                        quad.height = static_cast<float>(height);
-                        quad.packedNormal = packedNormal;
-                        quad.blockType = blockType;
-                        quad.faceDir = static_cast<uint32_t>(face);
-                        quad.islandID = islandID;
+                        
+                        // Pack dimensions into packed0: width(16) | height(16) as 8.8 fixed-point
+                        uint32_t widthFixed = static_cast<uint32_t>(width * 256.0f) & 0xFFFF;
+                        uint32_t heightFixed = static_cast<uint32_t>(height * 256.0f) & 0xFFFF;
+                        quad.packed0 = widthFixed | (heightFixed << 16);
+                        
+                        // Pack normal(30) | faceDir(3) into packed1 [1 bit unused]
+                        quad.packed1 = (packedNormal << 3) | (face & 0x7);
+                        
+                        // Pack blockType(16) | islandID(16) into packed2
+                        quad.packed2 = (blockType & 0xFFFF) | ((islandID & 0xFFFF) << 16);
+                        
+                        quad._padding0 = 0;
+                        quad._padding1 = 0;
                         
                         quads.push_back(quad);
                     }
@@ -315,9 +322,9 @@ void VoxelChunk::generateMeshAsync(bool generateLighting)
         for (size_t quadIdx = 0; quadIdx < newMesh->quads.size(); ++quadIdx)
         {
             const QuadFace& quad = newMesh->quads[quadIdx];
-            int width = static_cast<int>(quad.width);
-            int height = static_cast<int>(quad.height);
-            int face = quad.faceDir;
+            int width = static_cast<int>(quad.getWidth());
+            int height = static_cast<int>(quad.getHeight());
+            int face = quad.getFaceDir();
             
             // Determine base voxel coordinates from corner position
             int baseX, baseY, baseZ;
@@ -712,14 +719,14 @@ void VoxelChunk::explodeQuad(uint16_t quadIndex)
     
     QuadFace& quad = mesh->quads[quadIndex];
     
-    int width = static_cast<int>(quad.width);
-    int height = static_cast<int>(quad.height);
-    int face = quad.faceDir;
-    uint8_t blockType = quad.blockType;
+    int width = static_cast<int>(quad.getWidth());
+    int height = static_cast<int>(quad.getHeight());
+    int face = quad.getFaceDir();
+    uint8_t blockType = quad.getBlockType();
     
     // Zero out the old quad immediately so it doesn't render
-    quad.width = 0;
-    quad.height = 0;
+    quad.setWidth(0);
+    quad.setHeight(0);
     
     // Convert corner position back to base voxel coordinates
     // Must reverse the corner offsets applied in addQuad()
@@ -762,8 +769,8 @@ void VoxelChunk::explodeQuad(uint16_t quadIndex)
     }
     
     // Mark original quad as deleted (set width/height to 0)
-    quad.width = 0;
-    quad.height = 0;
+    quad.setWidth(0);
+    quad.setHeight(0);
     
     std::cout << "[EXPLODE] Quad " << quadIndex << " face=" << face << " width=" << width << " height=" << height 
               << " base=(" << baseX << "," << baseY << "," << baseZ << ")\n";
@@ -1098,7 +1105,7 @@ void VoxelChunk::removeVoxelQuads(int x, int y, int z)
             if (quadIdx < mesh->quads.size())
             {
                 QuadFace& quad = mesh->quads[quadIdx];
-                bool isGreedyQuad = (quad.width > 1.0f || quad.height > 1.0f);
+                bool isGreedyQuad = (quad.getWidth() > 1.0f || quad.getHeight() > 1.0f);
                 
                 if (isGreedyQuad)
                 {
@@ -1114,8 +1121,8 @@ void VoxelChunk::removeVoxelQuads(int x, int y, int z)
                 else
                 {
                     // This is already a 1x1 quad, just zero it out and remove mapping
-                    quad.width = 0;
-                    quad.height = 0;
+                    quad.setWidth(0);
+                    quad.setHeight(0);
                     mesh->voxelFaceToQuadIndex.erase(it);
                 }
             }
@@ -1236,8 +1243,8 @@ void VoxelChunk::addVoxelQuads(int x, int y, int z)
                     if (quadIdx < mesh->quads.size())
                     {
                         // Check dimensions before potentially reallocating
-                        float quadWidth = mesh->quads[quadIdx].width;
-                        float quadHeight = mesh->quads[quadIdx].height;
+                        float quadWidth = mesh->quads[quadIdx].getWidth();
+                        float quadHeight = mesh->quads[quadIdx].getHeight();
                         bool isGreedyQuad = (quadWidth > 1.0f || quadHeight > 1.0f);
                         
                         if (isGreedyQuad)
@@ -1251,8 +1258,8 @@ void VoxelChunk::addVoxelQuads(int x, int y, int z)
                             // Single face that's now covered - just remove it
                             if (!isFaceExposed(nx, ny, nz, oppFace))
                             {
-                                mesh->quads[quadIdx].width = 0;
-                                mesh->quads[quadIdx].height = 0;
+                                mesh->quads[quadIdx].setWidth(0);
+                                mesh->quads[quadIdx].setHeight(0);
                                 mesh->voxelFaceToQuadIndex.erase(it);
                             }
                         }
@@ -1333,13 +1340,20 @@ void VoxelChunk::addQuad(std::vector<QuadFace>& quads, float x, float y, float z
     // Add to QuadFace array for instanced rendering
     QuadFace quadFace;
     quadFace.position = cornerPos;  // Island-relative corner position (industry standard)
-    quadFace._padding0 = 0.0f;      // CRITICAL: Initialize padding for std430 alignment
-    quadFace.width = w;
-    quadFace.height = h;
-    quadFace.packedNormal = packedNormal;
-    quadFace.blockType = blockType;
-    quadFace.faceDir = static_cast<uint32_t>(face);  // uint32_t to match shader
-    quadFace.islandID = m_islandID;  // For SSBO transform lookup, set by renderer
+    
+    // Pack dimensions into packed0: width(16) | height(16) as 8.8 fixed-point
+    uint32_t widthFixed = static_cast<uint32_t>(w * 256.0f) & 0xFFFF;
+    uint32_t heightFixed = static_cast<uint32_t>(h * 256.0f) & 0xFFFF;
+    quadFace.packed0 = widthFixed | (heightFixed << 16);
+    
+    // Pack normal(30) | faceDir(3) into packed1 [1 bit unused]
+    quadFace.packed1 = (packedNormal << 3) | (face & 0x7);
+    
+    // Pack blockType(16) | islandID(16) into packed2
+    quadFace.packed2 = (blockType & 0xFFFF) | ((m_islandID & 0xFFFF) << 16);
+    
+    quadFace._padding0 = 0;
+    quadFace._padding1 = 0;
     
     quads.push_back(quadFace);
 }

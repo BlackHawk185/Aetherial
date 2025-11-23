@@ -1081,7 +1081,7 @@ void VulkanQuadRenderer::uploadChunkMesh(VoxelChunk* chunk) {
     std::vector<QuadFace> quadsWithIslandID = mesh->quads;
     
     for (auto& quad : quadsWithIslandID) {
-        quad.islandID = entry.islandID;
+        quad.setIslandID(entry.islandID);
         // Position is already chunk-relative, add chunk offset for island-relative coords
         quad.position += entry.chunkOffset;
     }
@@ -1126,7 +1126,7 @@ void VulkanQuadRenderer::processPendingUploads() {
         // Populate island IDs
         std::vector<QuadFace> quadsWithIslandID = mesh->quads;
         for (auto& quad : quadsWithIslandID) {
-            quad.islandID = entry->islandID;
+            quad.setIslandID(entry->islandID);
             quad.position += entry->chunkOffset;
         }
         

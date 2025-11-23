@@ -19,21 +19,31 @@
 using GLuint = uint32_t;
 
 // Unified quad/face representation (used for both render and collision)
-// QuadFace struct for vertex pulling - 40 bytes (matches GPU shader std430 layout exactly)
-// CRITICAL: std430 aligns vec3 to 16 bytes (as if it were vec4), so we add explicit padding
-// CRITICAL: Force 16-byte alignment for entire struct to match std430 array layout
+// QuadFace struct for vertex pulling - 32 bytes bit-packed (matches GPU shader std430 layout exactly)
+// CRITICAL: position is island-relative and NEVER packed (islands move, need precision)
+// Bit packing: width/height in 16-bit fixed-point (1/256 precision), normal 10:10:10, IDs in 16-bit
 struct alignas(16) QuadFace
 {
-    glm::vec3 position;   // Island-relative CORNER position (12 bytes, offset 0)
-    float _padding0;      // Explicit padding to match std430 vec3 alignment (4 bytes, offset 12)
-    float width;          // Width of the quad (4 bytes, offset 16)
-    float height;         // Height of the quad (4 bytes, offset 20)
-    uint32_t packedNormal;// Packed 10:10:10:2 normal (4 bytes, offset 24)
-    uint32_t blockType;   // Block type ID (4 bytes, offset 28)
-    uint32_t faceDir;     // Face direction 0-5 (4 bytes, offset 32)
-    uint32_t islandID;    // Island ID for transform lookup (4 bytes, offset 36)
+    glm::vec3 position;   // Island-relative CORNER position (12 bytes, offset 0) - NEVER PACK
+    uint32_t packed0;     // width(16) | height(16) - dimensions in 8.8 fixed-point (4 bytes, offset 12)
+    uint32_t packed1;     // normal(30) | faceDir(3) - packed normal + face direction (4 bytes, offset 16) [1 bit unused]
+    uint32_t packed2;     // blockType(16) | islandID(16) - packed IDs (4 bytes, offset 20)
+    uint32_t _padding0;   // Align to 32 bytes (4 bytes, offset 24)
+    uint32_t _padding1;   // Align to 32 bytes (4 bytes, offset 28)
+    
+    // Unpacking helpers
+    inline float getWidth() const { return float(packed0 & 0xFFFF) / 256.0f; }
+    inline float getHeight() const { return float((packed0 >> 16) & 0xFFFF) / 256.0f; }
+    inline uint32_t getFaceDir() const { return packed1 & 0x7; }  // 3 bits for 0-7 range (6 faces use 0-5)
+    inline uint32_t getBlockType() const { return packed2 & 0xFFFF; }
+    inline uint32_t getIslandID() const { return (packed2 >> 16) & 0xFFFF; }
+    
+    // Setters for convenience
+    inline void setWidth(float w) { packed0 = (packed0 & 0xFFFF0000) | (uint32_t(w * 256.0f) & 0xFFFF); }
+    inline void setHeight(float h) { packed0 = (packed0 & 0x0000FFFF) | ((uint32_t(h * 256.0f) & 0xFFFF) << 16); }
+    inline void setIslandID(uint32_t id) { packed2 = (packed2 & 0x0000FFFF) | ((id & 0xFFFF) << 16); }
 };
-static_assert(sizeof(QuadFace) == 48, "QuadFace must be 48 bytes with 16-byte alignment for std430 array");
+static_assert(sizeof(QuadFace) == 32, "QuadFace must be 32 bytes with 16-byte alignment for std430 array");
 static_assert(alignof(QuadFace) == 16, "QuadFace must have 16-byte alignment for std430 array");
 
 struct VoxelMesh

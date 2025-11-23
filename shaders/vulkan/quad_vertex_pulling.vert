@@ -3,18 +3,15 @@
 // Vertex pulling: fetch QuadFace from SSBO using gl_VertexIndex
 // Island-relative positions + per-island transforms
 
-// QuadFace struct (48 bytes with std430 layout - array elements align to 16 bytes)
-// Note: std430 aligns vec3 to 16 bytes, AND each array element to base alignment (16)
+// QuadFace struct (32 bytes bit-packed)
+// CRITICAL: position is island-relative and NEVER packed (islands move, need precision)
 struct QuadFace {
-    vec3 position;       // Island-relative CORNER position (12 bytes, offset 0, aligned to 16)
-    float _padding0;     // 4 bytes padding (offset 12) - CRITICAL for std430 alignment
-    float width;         // Quad width (4 bytes, offset 16)
-    float height;        // Quad height (4 bytes, offset 20)
-    uint packedNormal;   // 10:10:10:2 packed normal (4 bytes, offset 24)
-    uint blockType;      // Block type ID (4 bytes, offset 28)
-    uint faceDir;        // Face direction 0-5 (4 bytes, offset 32)
-    uint islandID;       // Island ID for SSBO lookup (4 bytes, offset 36)
-    // Implicit 8-byte padding here (offset 40-47) for array stride alignment to 16 bytes
+    vec3 position;       // Island-relative CORNER position (12 bytes, offset 0)
+    uint packed0;        // width(16) | height(16) - packed dimensions (offset 12)
+    uint packed1;        // normal(30) | faceDir(3) - packed normal + face (offset 16) [1 bit unused]
+    uint packed2;        // blockType(16) | islandID(16) - packed IDs (offset 20)
+    uint _padding0;      // Align to 32 bytes (offset 24)
+    uint _padding1;      // Align to 32 bytes (offset 28)
 };
 
 // Unit quad vertices (hardcoded, no vertex buffer needed)
@@ -79,17 +76,27 @@ void main() {
     // Fetch quad from SSBO
     QuadFace quad = quads[quadIndex];
     
+    // Unpack dimensions from packed0 (width in low 16, height in high 16)
+    float width = float(quad.packed0 & 0xFFFFu) / 256.0;
+    float height = float((quad.packed0 >> 16u) & 0xFFFFu) / 256.0;
+    
+    // Unpack faceDir from packed1 (low 3 bits - supports 0-7 range for 6 face directions)
+    uint faceDir = quad.packed1 & 0x7u;
+    
     // Get unit quad vertex ([0, 0] to [1, 1] - industry standard corner-based)
     vec3 unitPos = UNIT_QUAD_POSITIONS[vertexIndex];
     
     // Scale by quad dimensions (no center offset - direct corner positioning)
-    vec3 scaledPos = unitPos * vec3(quad.width, quad.height, 1.0);
+    vec3 scaledPos = unitPos * vec3(width, height, 1.0);
     
     // Rotate based on face direction to align with world axes
-    vec3 rotatedPos = FACE_ROTATIONS[quad.faceDir] * scaledPos;
+    vec3 rotatedPos = FACE_ROTATIONS[faceDir] * scaledPos;
+    
+    // Unpack islandID from packed2 (high 16 bits)
+    uint islandID = (quad.packed2 >> 16u) & 0xFFFFu;
     
     // Reconstruct island transform matrix from vec4 array
-    uint baseIdx = quad.islandID * 4u;
+    uint baseIdx = islandID * 4u;
     mat4 islandTransform = mat4(
         transformData[baseIdx + 0u],
         transformData[baseIdx + 1u],
@@ -104,19 +111,23 @@ void main() {
     // Apply view-projection
     gl_Position = pc.viewProjection * vec4(worldPos, 1.0);
     
-    // Unpack normal and transform with island rotation for per-pixel rotation
-    int nx = int((quad.packedNormal >>  0) & 0x3FF) - 512;
-    int ny = int((quad.packedNormal >> 10) & 0x3FF) - 512;
-    int nz = int((quad.packedNormal >> 20) & 0x3FF) - 512;
+    // Unpack normal from packed1 (bits 3-32: 10:10:10, with faceDir in bits 0-2)
+    uint packedNormal = (quad.packed1 >> 3u);
+    int nx = int((packedNormal >>  0u) & 0x3FFu) - 512;
+    int ny = int((packedNormal >> 10u) & 0x3FFu) - 512;
+    int nz = int((packedNormal >> 20u) & 0x3FFu) - 512;
     vec3 localNormal = normalize(vec3(float(nx), float(ny), float(nz)));
     
     // Extract rotation from island transform (upper 3x3) and apply to normal
     mat3 rotationMatrix = mat3(islandTransform);
     vNormal = normalize(rotationMatrix * localNormal);
     
+    // Unpack blockType from packed2 (low 16 bits)
+    uint blockType = quad.packed2 & 0xFFFFu;
+    
     // Pass attributes with tiled texture coordinates
     // Multiply texcoords by quad dimensions to repeat texture instead of stretching
-    vTexCoord = UNIT_QUAD_TEXCOORDS[vertexIndex] * vec2(quad.width, quad.height);
-    vBlockType = quad.blockType;
+    vTexCoord = UNIT_QUAD_TEXCOORDS[vertexIndex] * vec2(width, height);
+    vBlockType = blockType;
     vWorldPos = worldPos;
 }
