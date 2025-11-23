@@ -61,8 +61,8 @@ bool VulkanQuadRenderer::initialize(VulkanContext* ctx) {
     createSwapchainPipeline();  // Phase 2 testing
     // createDepthOnlyPipeline() deferred until shadow map render pass available
 
-    // Create persistent instance buffer (64MB) - SSBO for vertex pulling
-    constexpr size_t INSTANCE_BUFFER_SIZE = 64 * 1024 * 1024;
+    // Create persistent instance buffer (2GB) - SSBO for vertex pulling
+    constexpr size_t INSTANCE_BUFFER_SIZE = 2ULL * 1024 * 1024 * 1024;
     m_instanceBufferCapacity = INSTANCE_BUFFER_SIZE / sizeof(QuadFace);
 
     m_instanceBuffer = std::make_unique<VulkanBuffer>();
@@ -1055,21 +1055,18 @@ void VulkanQuadRenderer::uploadChunkMesh(VoxelChunk* chunk) {
         // Reallocation would move baseInstance, breaking all existing draw calls
         if (entry.allocatedSlots > 0) {
             // Mesh grew beyond capacity - clamp to allocated space
-            // The 25% padding on initial allocation should handle most cases
-            // If this still happens frequently, the async meshing system will
-            // eventually re-merge quads with greedy meshing
+            std::cerr << "[VulkanQuadRenderer] ERROR: Chunk mesh grew beyond initial allocation!\n";
             newQuadCount = entry.allocatedSlots;
         } else {
-            // First allocation: Add 25% padding for block breaking (greedy mesh explosion)
-            // Round up to nearest 256 for alignment
-            size_t withPadding = newQuadCount + (newQuadCount / 4);
-            size_t newAllocation = ((withPadding + 255) / 256) * 256;
-            
-            // Ensure minimum allocation of 256 quads
-            if (newAllocation < 256) newAllocation = 256;
+            // First allocation: Take current size + 300% padding for greedy mesh explosions
+            // Worst case: greedy mesh explodes to 4x size when blocks break
+            size_t withPadding = newQuadCount * 4;
+            size_t newAllocation = withPadding;
             
             if (m_instanceBufferUsed + newAllocation > m_instanceBufferCapacity) {
-                std::cerr << "[VulkanQuadRenderer] Instance buffer overflow!\n";
+                std::cerr << "[VulkanQuadRenderer] Instance buffer overflow! Used: " 
+                          << m_instanceBufferUsed << " Requested: " << newAllocation 
+                          << " Capacity: " << m_instanceBufferCapacity << "\n";
                 return;
             }
             

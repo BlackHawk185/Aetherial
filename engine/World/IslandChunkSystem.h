@@ -228,6 +228,9 @@ class IslandChunkSystem
     std::unordered_set<int64_t> placeWaterBasins(uint32_t islandID, const BiomePalette& palette, uint32_t seed);
     void cullExposedWater(uint32_t islandID, const std::unordered_set<int64_t>* waterPositionsToCheck = nullptr);
 
+    // Neighbor chunk mesh regeneration (for interchunk culling)
+    void regenerateNeighborChunkMeshes(uint32_t islandID, const Vec3& chunkCoord);
+
     // Island queries
     Vec3 getIslandCenter(uint32_t islandID) const;    // Get current physics center of island
     Vec3 getIslandVelocity(uint32_t islandID) const;  // Get current velocity of island

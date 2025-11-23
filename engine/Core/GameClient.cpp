@@ -1903,6 +1903,9 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
         // Generate mesh async - uploads when ready
         chunk->generateMeshAsync();
         m_chunksWithPendingMeshes.push_back(chunk);
+        
+        // Regenerate neighbor chunk meshes for interchunk culling
+        islandSystem->regenerateNeighborChunkMeshes(islandID, chunkCoord);
     }
     else
     {

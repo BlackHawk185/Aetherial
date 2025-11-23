@@ -186,11 +186,25 @@ void VoxelChunk::generateMeshAsync(bool generateLighting)
                         int width = 1;
                         int height = 1;
                         
+                        // Helper to check if a specific voxel's face is exposed
+                        auto isFaceExposed = [&](int vx, int vy, int vz, int faceDir) -> bool {
+                            switch (faceDir) {
+                                case 0: return (vx == 0 || !isBlockSolid((*voxelDataCopy)[(vx-1) + vy*SIZE + vz*SIZE*SIZE]));
+                                case 1: return (vx == SIZE-1 || !isBlockSolid((*voxelDataCopy)[(vx+1) + vy*SIZE + vz*SIZE*SIZE]));
+                                case 2: return (vy == 0 || !isBlockSolid((*voxelDataCopy)[vx + (vy-1)*SIZE + vz*SIZE*SIZE]));
+                                case 3: return (vy == SIZE-1 || !isBlockSolid((*voxelDataCopy)[vx + (vy+1)*SIZE + vz*SIZE*SIZE]));
+                                case 4: return (vz == 0 || !isBlockSolid((*voxelDataCopy)[vx + vy*SIZE + (vz-1)*SIZE*SIZE]));
+                                case 5: return (vz == SIZE-1 || !isBlockSolid((*voxelDataCopy)[vx + vy*SIZE + (vz+1)*SIZE*SIZE]));
+                                default: return false;
+                            }
+                        };
+                        
                         if (face == 0 || face == 1) { // X faces
                             while (z + width < SIZE) {
                                 int checkIdx = x + y * SIZE + (z + width) * SIZE * SIZE;
                                 uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
                                 if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) break;
+                                if (!isFaceExposed(x, y, z + width, face)) break;
                                 ++width;
                             }
                             bool canExpand = true;
@@ -198,7 +212,7 @@ void VoxelChunk::generateMeshAsync(bool generateLighting)
                                 for (int dz = 0; dz < width; ++dz) {
                                     int checkIdx = x + (y + height) * SIZE + (z + dz) * SIZE * SIZE;
                                     uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
-                                    if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) {
+                                    if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType || !isFaceExposed(x, y + height, z + dz, face)) {
                                         canExpand = false;
                                         break;
                                     }
@@ -213,6 +227,7 @@ void VoxelChunk::generateMeshAsync(bool generateLighting)
                                 int checkIdx = (x + width) + y * SIZE + z * SIZE * SIZE;
                                 uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
                                 if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) break;
+                                if (!isFaceExposed(x + width, y, z, face)) break;
                                 ++width;
                             }
                             bool canExpand = true;
@@ -220,7 +235,7 @@ void VoxelChunk::generateMeshAsync(bool generateLighting)
                                 for (int dx = 0; dx < width; ++dx) {
                                     int checkIdx = (x + dx) + y * SIZE + (z + height) * SIZE * SIZE;
                                     uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
-                                    if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) {
+                                    if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType || !isFaceExposed(x + dx, y, z + height, face)) {
                                         canExpand = false;
                                         break;
                                     }
@@ -235,6 +250,7 @@ void VoxelChunk::generateMeshAsync(bool generateLighting)
                                 int checkIdx = (x + width) + y * SIZE + z * SIZE * SIZE;
                                 uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
                                 if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) break;
+                                if (!isFaceExposed(x + width, y, z, face)) break;
                                 ++width;
                             }
                             bool canExpand = true;
@@ -242,7 +258,7 @@ void VoxelChunk::generateMeshAsync(bool generateLighting)
                                 for (int dx = 0; dx < width; ++dx) {
                                     int checkIdx = (x + dx) + (y + height) * SIZE + z * SIZE * SIZE;
                                     uint8_t checkBlock = (*voxelDataCopy)[checkIdx];
-                                    if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType) {
+                                    if (visited[checkIdx] || !isBlockSolid(checkBlock) || checkBlock != blockType || !isFaceExposed(x + dx, y + height, z, face)) {
                                         canExpand = false;
                                         break;
                                     }
@@ -638,8 +654,8 @@ bool VoxelChunk::shouldRender(const glm::vec3& cameraPos, float maxDistance) con
 // UNIFIED CULLING - Works for intra-chunk AND inter-chunk
 // ========================================
 
-// INTRA-CHUNK CULLING ONLY - Inter-chunk culling removed for performance
-// Boundary faces are always rendered (negligible visual difference, massive speed gain)
+// INTERCHUNK CULLING ENABLED - Check neighboring chunks for proper face culling
+// With 64³ chunks, remeshing neighbors is cheaper than rendering extra faces
 bool VoxelChunk::isFaceExposed(int x, int y, int z, int face) const
 {
     // Industry standard: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z
@@ -651,14 +667,37 @@ bool VoxelChunk::isFaceExposed(int x, int y, int z, int face) const
     int ny = y + dy[face];
     int nz = z + dz[face];
     
-    // Chunk boundary = always render (no inter-chunk culling)
-    if (nx < 0 || nx >= SIZE || ny < 0 || ny >= SIZE || nz < 0 || nz >= SIZE)
+    // Intra-chunk check
+    if (nx >= 0 && nx < SIZE && ny >= 0 && ny < SIZE && nz >= 0 && nz < SIZE)
     {
-        return true;
+        return !isVoxelSolid(nx, ny, nz);
     }
     
-    // Face is exposed if neighbor is not solid (intra-chunk culling)
-    return !isVoxelSolid(nx, ny, nz);
+    // Inter-chunk check: query neighboring chunk
+    if (!s_islandSystem) return true;  // No island system = render boundary faces
+    
+    // Calculate neighbor chunk coordinate
+    glm::vec3 neighborChunkCoord = m_chunkCoord;
+    int localX = nx;
+    int localY = ny;
+    int localZ = nz;
+    
+    if (nx < 0) { neighborChunkCoord.x -= 1; localX = SIZE - 1; }
+    else if (nx >= SIZE) { neighborChunkCoord.x += 1; localX = 0; }
+    
+    if (ny < 0) { neighborChunkCoord.y -= 1; localY = SIZE - 1; }
+    else if (ny >= SIZE) { neighborChunkCoord.y += 1; localY = 0; }
+    
+    if (nz < 0) { neighborChunkCoord.z -= 1; localZ = SIZE - 1; }
+    else if (nz >= SIZE) { neighborChunkCoord.z += 1; localZ = 0; }
+    
+    Vec3 neighborCoord(neighborChunkCoord.x, neighborChunkCoord.y, neighborChunkCoord.z);
+    VoxelChunk* neighborChunk = s_islandSystem->getChunkFromIsland(m_islandID, neighborCoord);
+    
+    if (!neighborChunk) return true;  // No neighbor chunk = render face
+    
+    // Check if neighbor voxel is solid
+    return !neighborChunk->isVoxelSolid(localX, localY, localZ);
 }
 
 // ========================================

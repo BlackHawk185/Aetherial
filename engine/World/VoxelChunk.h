@@ -177,7 +177,7 @@ class VoxelChunk
     
     bool isVoxelSolid(int x, int y, int z) const;
     
-    // Intra-chunk culling only (inter-chunk culling removed for performance)
+    // Interchunk culling enabled (queries neighboring chunks for proper face culling)
     bool isFaceExposed(int x, int y, int z, int face) const;
 };
 

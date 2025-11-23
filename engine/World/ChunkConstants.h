@@ -8,7 +8,7 @@ namespace ChunkConfig
 {
     // Global chunk size - adjust this value to prototype different chunk dimensions
     // All systems (rendering, physics, networking, collision) derive from this value
-    static constexpr int CHUNK_SIZE = 256;
+    static constexpr int CHUNK_SIZE = 64;
     
     // Derived constants (automatically updated when CHUNK_SIZE changes)
     static constexpr int CHUNK_VOLUME = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
