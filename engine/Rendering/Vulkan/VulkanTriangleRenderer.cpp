@@ -1,4 +1,5 @@
 #include "VulkanTriangleRenderer.h"
+#include "../../Profiling/Profiler.h"
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
@@ -449,6 +450,7 @@ bool VulkanTriangleRenderer::createGraphicsPipeline() {
 }
 
 void VulkanTriangleRenderer::render(VkCommandBuffer commandBuffer, float time) {
+    PROFILE_SCOPE("VulkanTriangleRenderer::render");
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipeline);
     
     VkBuffer vertexBuffers[] = {m_vertexBuffer};

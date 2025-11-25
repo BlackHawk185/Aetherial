@@ -214,6 +214,11 @@ class IslandChunkSystem
     {
         m_renderDistance = chunks;
     }
+    
+    // Chunk state management for memory optimization
+    void updateChunkStates(const Vec3& playerPosition);  // Activate/deactivate chunks based on distance
+    void setInteractionDistance(int chunks) { m_interactionDistance = chunks; }  // Chunks within this are ACTIVE
+    size_t getTotalMemoryUsage() const;  // Get total memory used by all chunks
 
     // Rendering interface
     void getAllChunks(std::vector<VoxelChunk*>& outChunks);
@@ -225,8 +230,7 @@ class IslandChunkSystem
     void generateFloatingIslandOrganic(uint32_t islandID, uint32_t seed, float radius = 48.0f, BiomeType biome = BiomeType::GRASSLAND);
 
     // Water basin generation (called during island generation)
-    std::unordered_set<int64_t> placeWaterBasins(uint32_t islandID, const BiomePalette& palette, uint32_t seed);
-    void cullExposedWater(uint32_t islandID, const std::unordered_set<int64_t>* waterPositionsToCheck = nullptr);
+
 
     // Neighbor chunk mesh regeneration (for interchunk culling)
     void regenerateNeighborChunkMeshes(uint32_t islandID, const Vec3& chunkCoord);
@@ -240,6 +244,7 @@ class IslandChunkSystem
     std::unordered_map<uint32_t, FloatingIsland> m_islands;
     uint32_t m_nextIslandID = 1;
     int m_renderDistance = 8;
+    int m_interactionDistance = 2;  // Chunks within this distance are kept ACTIVE (full voxel data)
     mutable std::mutex m_islandsMutex;
     bool m_isClient = false;  // Whether this system is client-side (chunks need GPU upload)
 

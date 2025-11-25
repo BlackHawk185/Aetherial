@@ -171,6 +171,12 @@ private:
         uint8_t voxelType;
     };
     
+    struct PendingSplitCheck {
+        uint32_t islandID;
+        Vec3 blockPos;
+        uint32_t sequenceNumber; // For tracking
+    };
+    
     // Player tracking (for island activation)
     Vec3 m_lastKnownPlayerPosition;
     bool m_hasPlayerPosition = false;
@@ -181,6 +187,7 @@ private:
     
     std::vector<VoxelChangeCommand> m_pendingVoxelChanges;
     std::vector<PlayerMovementCommand> m_pendingPlayerMovements;
+    std::vector<PendingSplitCheck> m_pendingSplitChecks;
     
     // ================================
     // INTERNAL METHODS
@@ -200,6 +207,11 @@ private:
      * Process queued commands from clients
      */
     void processQueuedCommands();
+    
+    /**
+     * Process pending island split checks (runs on game thread, not network thread)
+     */
+    void processPendingSplits();
     
     /**
      * Calculate and update tick rate statistics

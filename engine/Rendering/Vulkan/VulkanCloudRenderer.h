@@ -97,10 +97,11 @@ private:
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
 
-    // Descriptor resources
+    // Descriptor resources (2 sets for double buffering)
+    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
     VkDescriptorSetLayout m_descriptorLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_descriptorSets[MAX_FRAMES_IN_FLIGHT] = {};
     VkSampler m_depthSampler = VK_NULL_HANDLE;
     VkSampler m_noiseSampler = VK_NULL_HANDLE;
 

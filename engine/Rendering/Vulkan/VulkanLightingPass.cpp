@@ -96,28 +96,29 @@ bool VulkanLightingPass::createDescriptorLayouts() {
     // Create descriptor pool
     VkDescriptorPoolSize poolSizes[2] = {};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[0].descriptorCount = 3;  // Shadow map + cloud noise + SSR
+    poolSizes[0].descriptorCount = 3 * MAX_FRAMES_IN_FLIGHT;  // (Shadow array + cloud noise + SSR) * 2 frames
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[1].descriptorCount = 1;  // Cascade uniform
+    poolSizes[1].descriptorCount = 1 * MAX_FRAMES_IN_FLIGHT;  // Cascade uniform * 2 frames
 
     VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.poolSizeCount = 2;
     poolInfo.pPoolSizes = poolSizes;
-    poolInfo.maxSets = 1;
+    poolInfo.maxSets = MAX_FRAMES_IN_FLIGHT;
 
     if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descriptorPool) != VK_SUCCESS) {
         std::cerr << "❌ Failed to create lighting descriptor pool" << std::endl;
         return false;
     }
 
-    // Allocate descriptor set
+    // Allocate descriptor sets (one per frame-in-flight)
+    VkDescriptorSetLayout layouts[MAX_FRAMES_IN_FLIGHT] = {m_lightingLayout, m_lightingLayout};
     VkDescriptorSetAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocInfo.descriptorPool = m_descriptorPool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_lightingLayout;
+    allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+    allocInfo.pSetLayouts = layouts;
 
-    if (vkAllocateDescriptorSets(m_device, &allocInfo, &m_lightingDescriptorSet) != VK_SUCCESS) {
-        std::cerr << "❌ Failed to allocate lighting descriptor set" << std::endl;
+    if (vkAllocateDescriptorSets(m_device, &allocInfo, m_lightingDescriptorSets) != VK_SUCCESS) {
+        std::cerr << "❌ Failed to allocate lighting descriptor sets" << std::endl;
         return false;
     }
 
@@ -270,15 +271,18 @@ bool VulkanLightingPass::updateCloudNoiseDescriptor(VkImageView cloudNoiseTextur
     cloudNoiseInfo.imageView = cloudNoiseTexture;
     cloudNoiseInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet write = {};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = m_lightingDescriptorSet;
-    write.dstBinding = 1;  // Cloud noise is now binding 1
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.descriptorCount = 1;
-    write.pImageInfo = &cloudNoiseInfo;
+    // Update all frame descriptor sets
+    for (uint32_t frameIdx = 0; frameIdx < MAX_FRAMES_IN_FLIGHT; frameIdx++) {
+        VkWriteDescriptorSet write = {};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = m_lightingDescriptorSets[frameIdx];
+        write.dstBinding = 1;  // Cloud noise is now binding 1
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.descriptorCount = 1;
+        write.pImageInfo = &cloudNoiseInfo;
 
-    vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+        vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+    }
     return true;
 }
 
@@ -341,7 +345,7 @@ bool VulkanLightingPass::updateDescriptorSet(const VulkanShadowMap& shadowMap, V
     shadowInfo.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = m_lightingDescriptorSet;
+    writes[0].dstSet = m_lightingDescriptorSets[0];  // Will update in loop below
     writes[0].dstBinding = 0;
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[0].descriptorCount = 1;
@@ -354,7 +358,7 @@ bool VulkanLightingPass::updateDescriptorSet(const VulkanShadowMap& shadowMap, V
     cloudInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = m_lightingDescriptorSet;
+    writes[1].dstSet = m_lightingDescriptorSets[0];  // Will update in loop below
     writes[1].dstBinding = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[1].descriptorCount = 1;
@@ -367,7 +371,7 @@ bool VulkanLightingPass::updateDescriptorSet(const VulkanShadowMap& shadowMap, V
     bufferInfo.range = sizeof(CascadeUniforms);
 
     writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[2].dstSet = m_lightingDescriptorSet;
+    writes[2].dstSet = m_lightingDescriptorSets[0];  // Will update in loop below
     writes[2].dstBinding = 2;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[2].descriptorCount = 1;
@@ -380,13 +384,20 @@ bool VulkanLightingPass::updateDescriptorSet(const VulkanShadowMap& shadowMap, V
     ssrInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[3].dstSet = m_lightingDescriptorSet;
+    writes[3].dstSet = m_lightingDescriptorSets[0];  // Will update in loop below
     writes[3].dstBinding = 3;
     writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[3].descriptorCount = 1;
     writes[3].pImageInfo = &ssrInfo;
 
-    vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
+    // Update all frame descriptor sets
+    for (uint32_t frameIdx = 0; frameIdx < MAX_FRAMES_IN_FLIGHT; frameIdx++) {
+        writes[0].dstSet = m_lightingDescriptorSets[frameIdx];
+        writes[1].dstSet = m_lightingDescriptorSets[frameIdx];
+        writes[2].dstSet = m_lightingDescriptorSets[frameIdx];
+        writes[3].dstSet = m_lightingDescriptorSets[frameIdx];
+        vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
+    }
     return true;
 }
 
@@ -410,7 +421,8 @@ void VulkanLightingPass::render(VkCommandBuffer commandBuffer,
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
 
     // Bind descriptor sets (Set 0 = G-buffer, Set 1 = lighting)
-    VkDescriptorSet sets[2] = {gBufferDescriptorSet, m_lightingDescriptorSet};
+    uint32_t frameIndex = m_context->getCurrentFrame() % MAX_FRAMES_IN_FLIGHT;
+    VkDescriptorSet sets[2] = {gBufferDescriptorSet, m_lightingDescriptorSets[frameIndex]};
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
                            0, 2, sets, 0, nullptr);
 

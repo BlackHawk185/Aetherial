@@ -115,8 +115,9 @@ private:
     VkShaderModule m_fragShader = VK_NULL_HANDLE;
 
     // Descriptor pool and set for shadow/cloud/cascade (set 1)
+    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_lightingDescriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_lightingDescriptorSets[MAX_FRAMES_IN_FLIGHT] = {};  // One per frame-in-flight
     VkSampler m_shadowSampler = VK_NULL_HANDLE;
     VkSampler m_cloudNoiseSampler = VK_NULL_HANDLE;
     VkSampler m_ssrSampler = VK_NULL_HANDLE;

@@ -222,6 +222,10 @@ bool GameClient::update(float deltaTime)
             // Run client-side island physics between server updates
             // This provides smooth movement using server-provided velocities
             islandSystem->updateIslandPhysics(deltaTime);
+            
+            // Update chunk activation/deactivation based on player position
+            Vec3 playerPos = m_playerController.getPosition();
+            islandSystem->updateChunkStates(playerPos);
         }
     }
 
@@ -595,11 +599,16 @@ bool GameClient::initializeVulkan()
 
 void GameClient::renderVulkan()
 {
+    PROFILE_SCOPE("GameClient::renderVulkan");
+    
     // Begin frame (without starting render pass yet)
     uint32_t imageIndex = 0;
+    {
+    PROFILE_SCOPE("VulkanContext::beginFrame");
     if (!m_vulkanContext->beginFrame(imageIndex, false))
     {
         return; // Swapchain out of date, wait for resize
+    }
     }
     
     VkCommandBuffer cmd = m_vulkanContext->getCurrentCommandBuffer();
@@ -611,6 +620,8 @@ void GameClient::renderVulkan()
     glm::mat4 viewProjection = projectionMatrix * viewMatrix;
     
     // Update island transforms for Vulkan renderer (islands drift each frame)
+    {
+    PROFILE_SCOPE("UpdateIslandTransforms");
     if (m_clientWorld)
     {
         auto* islandSystem = m_clientWorld->getIslandSystem();
@@ -630,17 +641,24 @@ void GameClient::renderVulkan()
             }
         }
     }
+    }
     
     // Process pending mesh uploads (batched for performance)
+    {
+    PROFILE_SCOPE("ProcessPendingUploads");
     if (m_vulkanQuadRenderer)
     {
         m_vulkanQuadRenderer->processPendingUploads();
     }
+    }
     
     // Update dynamic buffers BEFORE render pass (vkCmdUpdateBuffer cannot be called inside render pass)
+    {
+    PROFILE_SCOPE("UpdateDynamicBuffers");
     if (m_vulkanQuadRenderer)
     {
         m_vulkanQuadRenderer->updateDynamicBuffers(cmd, viewProjection);
+    }
     }
     
     // Get sun/moon data for lighting
@@ -653,14 +671,17 @@ void GameClient::renderVulkan()
     glm::vec3 sunDirGLM(sunDir.x, sunDir.y, sunDir.z);
     glm::vec3 moonDirGLM(moonDir.x, moonDir.y, moonDir.z);
     
-    // ========================================
-    // PASS 0: SHADOW MAPS (Cascaded Light Maps)
-    // ========================================
-    // Calculate cascade matrices from camera frustum and sun direction
+    // Calculate cascade matrices from camera frustum and sun direction (used in multiple passes)
     VulkanDeferred::CascadeUniforms cascades{};
     glm::vec3 camPos(m_playerController.getCamera().position.x,
                      m_playerController.getCamera().position.y,
                      m_playerController.getCamera().position.z);
+    
+    // ========================================
+    // PASS 0: SHADOW MAPS (Cascaded Light Maps)
+    // ========================================
+    {
+    PROFILE_SCOPE("PASS0_ShadowMaps");
     
     // Cascade split distances (near to far)
     float cascadeSplits[4] = {50.0f, 200.0f, 800.0f, 3000.0f};
@@ -697,6 +718,8 @@ void GameClient::renderVulkan()
     cascades.lightTexel = glm::vec4(1.0f / 4096.0f, 0, 0, 0);
     
     // Render shadow maps from sun/moon POV
+    {
+    PROFILE_SCOPE("RenderShadowCascades");
     if (m_vulkanDeferred && m_vulkanQuadRenderer) {
         auto& shadowMap = m_vulkanDeferred->getShadowMap();
         
@@ -713,10 +736,14 @@ void GameClient::renderVulkan()
         // Transition shadow maps for shader reading
         shadowMap.transitionForShaderRead(cmd);
     }
+    }
+    } // End PASS0_ShadowMaps
     
     // ========================================
     // PASS 1: G-BUFFER (Deferred Geometry Pass)
     // ========================================
+    {
+    PROFILE_SCOPE("PASS1_GBuffer");
     if (m_vulkanDeferred)
     {
         // Depth layout cycle: Frame 0 needs explicit UNDEFINED->ATTACHMENT transition before G-buffer
@@ -778,9 +805,12 @@ void GameClient::renderVulkan()
                                            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         
         // Render voxels to G-buffer
+        {
+        PROFILE_SCOPE("VoxelQuadRenderer::renderToGBuffer");
         if (m_vulkanQuadRenderer)
         {
             m_vulkanQuadRenderer->renderToGBuffer(cmd, viewProjection, viewMatrix);
+        }
         }
         
         // Render GLB models to G-buffer
@@ -825,9 +855,10 @@ void GameClient::renderVulkan()
         depthInfo.imageView = m_vulkanContext->getDepthImageView();
         depthInfo.sampler = m_vulkanDeferred->getGBufferSampler();
         
+        uint32_t frameIndex = m_vulkanContext->getCurrentFrame() % 2;
         VkWriteDescriptorSet depthWrite = {};
         depthWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        depthWrite.dstSet = m_vulkanDeferred->getLightingDescriptorSet();
+        depthWrite.dstSet = m_vulkanDeferred->getLightingDescriptorSet(frameIndex);
         depthWrite.dstBinding = 4;
         depthWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         depthWrite.descriptorCount = 1;
@@ -835,10 +866,13 @@ void GameClient::renderVulkan()
         
         vkUpdateDescriptorSets(m_vulkanContext->device, 1, &depthWrite, 0, nullptr);
     }
+    } // End PASS1_GBuffer
     
     // ========================================
     // PASS 1.5: LIGHTING TO HDR (opaque geometry only)
     // ========================================
+    {
+    PROFILE_SCOPE("PASS1.5_Lighting");
     if (m_vulkanDeferred)
     {
         VulkanDeferred::LightingParams lightingParams;
@@ -856,19 +890,25 @@ void GameClient::renderVulkan()
         VkImageView cloudNoise = m_vulkanCloudRenderer ? m_vulkanCloudRenderer->getNoiseTextureView() : VK_NULL_HANDLE;
         m_vulkanDeferred->renderLightingToHDR(cmd, lightingParams, cascades, cloudNoise);
     }
+    } // End PASS1.5_Lighting
     
     // ========================================
     // PASS 1.6: SSR COMPUTE (raymarches lit HDR buffer for reflections)
     // Runs AFTER lighting to capture lit scene colors
     // ========================================
+    {
+    PROFILE_SCOPE("PASS1.6_SSR");
     if (m_vulkanDeferred)
     {
         m_vulkanDeferred->computeSSR(cmd, viewMatrix, projectionMatrix);
     }
+    } // End PASS1.6_SSR
     
     // ========================================
     // PASS 2: FINAL COMPOSITION (Sky + HDR + SSR)
     // ========================================
+    {
+    PROFILE_SCOPE("PASS2_Composition");
     
     // Depth remains in READ_ONLY_OPTIMAL for depth testing during composition
     // Start swapchain render pass for final composition
@@ -910,11 +950,14 @@ void GameClient::renderVulkan()
         
         m_vulkanDeferred->compositeToSwapchain(cmd, m_playerController.getCamera().position);
     }
+    } // End PASS2_Composition
     
     // ========================================
     // PASS 3: FORWARD TRANSPARENT WATER (industry standard)
     // Renders after composition with alpha blending
     // ========================================
+    {
+    PROFILE_SCOPE("PASS3_ForwardTransparent");
     if (m_vulkanModelRenderer && m_vulkanDeferred)
     {
         VkImageView depthTexture = m_vulkanContext->getDepthImageView();
@@ -993,6 +1036,7 @@ void GameClient::renderVulkan()
     {
         ImGui_ImplVulkan_RenderDrawData(draw_data, cmd);
     }
+    } // End PASS3_ForwardTransparent
     
     // End dynamic rendering before copy
     vkCmdEndRendering(cmd);
@@ -1012,7 +1056,10 @@ void GameClient::renderVulkan()
                          0, 0, nullptr, 0, nullptr, 1, &presentBarrier);
     
     // End frame and present (don't end render pass again)
+    {
+    PROFILE_SCOPE("VulkanContext::endFrame");
     m_vulkanContext->endFrame(imageIndex, false);
+    }
 }
 
 void GameClient::processKeyboard(float deltaTime)
@@ -1745,6 +1792,12 @@ void GameClient::registerChunkWithRenderer(VoxelChunk* chunk, FloatingIsland* is
     // Register with Vulkan renderer
     if (chunk && island)
     {
+        // Set model renderer pointer for state management callbacks
+        if (m_vulkanModelRenderer)
+        {
+            chunk->setModelRenderer(m_vulkanModelRenderer.get());
+        }
+        
         // Calculate chunk offset in world units
         glm::vec3 chunkOffset(chunkCoord.x * VoxelChunk::SIZE,
                               chunkCoord.y * VoxelChunk::SIZE,
@@ -1817,8 +1870,26 @@ void GameClient::handleCompressedIslandReceived(uint32_t islandID, const Vec3& p
             // Apply the voxel data directly - this replaces any procedural generation
             chunk->setRawVoxelData(voxelData, dataSize);
             
-            // Register chunk with renderer (will queue mesh generation)
-            registerChunkWithRenderer(chunk, island, localIslandID, originChunk);
+            // Set model renderer pointer
+            if (m_vulkanModelRenderer) {
+                chunk->setModelRenderer(m_vulkanModelRenderer.get());
+            }
+            
+            // Compress immediately - activates when player gets near
+            chunk->compressAfterWorldGen();
+            
+            // Register chunk quad mesh only (models registered on activation)
+            glm::vec3 chunkOffset(originChunk.x * VoxelChunk::SIZE,
+                                  originChunk.y * VoxelChunk::SIZE,
+                                  originChunk.z * VoxelChunk::SIZE);
+            
+            if (m_vulkanQuadRenderer) {
+                m_vulkanQuadRenderer->registerChunk(chunk, localIslandID, chunkOffset);
+            }
+            
+            // Generate mesh async
+            chunk->generateMeshAsync();
+            m_chunksWithPendingMeshes.push_back(chunk);
         }
         else
         {
@@ -1884,25 +1955,36 @@ void GameClient::handleCompressedChunkReceived(uint32_t islandID, const Vec3& ch
 
     if (chunk)
     {
-        // Apply the voxel data directly
-        chunk->setRawVoxelData(voxelData, dataSize);
-        
-        // Register chunk with Vulkan renderer
-        glm::vec3 chunkOffset(chunkCoord.x * VoxelChunk::SIZE,
-                              chunkCoord.y * VoxelChunk::SIZE,
-                              chunkCoord.z * VoxelChunk::SIZE);
-        
-        if (m_vulkanQuadRenderer) {
-            m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
-        }
-        
-        if (m_vulkanModelRenderer) {
-            m_vulkanModelRenderer->updateChunkInstances(chunk, islandID, chunkOffset);
-        }
+        try {
+            // Apply the voxel data directly
+            chunk->setRawVoxelData(voxelData, dataSize);
+            
+            // Set model renderer pointer for state management
+            if (m_vulkanModelRenderer) {
+                chunk->setModelRenderer(m_vulkanModelRenderer.get());
+            }
+            
+            // Immediately compress chunk - it will activate when player gets near
+            chunk->compressAfterWorldGen();
+            
+            // Register chunk with quad renderer only (for voxel mesh rendering)
+            // Model renderer registration happens on activation
+            glm::vec3 chunkOffset(chunkCoord.x * VoxelChunk::SIZE,
+                                  chunkCoord.y * VoxelChunk::SIZE,
+                                  chunkCoord.z * VoxelChunk::SIZE);
+            
+            if (m_vulkanQuadRenderer) {
+                m_vulkanQuadRenderer->registerChunk(chunk, islandID, chunkOffset);
+            }
 
-        // Generate mesh async - uploads when ready
-        chunk->generateMeshAsync();
-        m_chunksWithPendingMeshes.push_back(chunk);
+            // Generate mesh async - uploads when ready
+            chunk->generateMeshAsync();
+            m_chunksWithPendingMeshes.push_back(chunk);
+        }
+        catch (const std::exception& e) {
+            std::cerr << "❌ Error processing chunk for island " << islandID << ": " << e.what() << std::endl;
+            return;
+        }
         
         // Regenerate neighbor chunk meshes for interchunk culling
         islandSystem->regenerateNeighborChunkMeshes(islandID, chunkCoord);

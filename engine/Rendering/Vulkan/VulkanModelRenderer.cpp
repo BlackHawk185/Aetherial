@@ -3,6 +3,7 @@
 #include "VulkanContext.h"
 #include "../../World/VoxelChunk.h"
 #include "../../World/BlockType.h"
+#include "../../Profiling/Profiler.h"
 #include <iostream>
 #include <cstring>
 #include <fstream>
@@ -64,6 +65,9 @@ void VulkanModelRenderer::shutdown() {
     if (!m_context) return;
     
     VkDevice device = m_context->getDevice();
+    
+    // Wait for GPU to finish using buffers before destroying them
+    vkDeviceWaitIdle(device);
     
     if (m_pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device, m_pipeline, nullptr);
@@ -356,10 +360,6 @@ void VulkanModelRenderer::updateChunkInstances(VoxelChunk* chunk, uint32_t islan
         const std::vector<glm::vec3>& positions = chunk->getModelInstances(blockID);
         if (positions.empty()) continue;
         
-        std::cout << "[ModelRenderer] Found " << positions.size() << " instances of BlockID " << (int)blockID 
-                  << " (" << info->name << ") in chunk at " << chunkOffset.x << "," << chunkOffset.y << "," << chunkOffset.z 
-                  << " islandID=" << islandID << std::endl;
-        
         // Load model if not already loaded
         if (m_models.find(blockID) == m_models.end()) {
             loadModel(blockID, info->assetPath);
@@ -409,6 +409,7 @@ void VulkanModelRenderer::updateIslandTransform(uint32_t islandID, const glm::ma
 
 
 void VulkanModelRenderer::renderToGBuffer(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::mat4& view) {
+    PROFILE_SCOPE("VulkanModelRenderer::renderToGBuffer");
     if (m_chunkBatches.empty()) return;
     if (!m_pipeline) return;
     
@@ -490,6 +491,7 @@ void VulkanModelRenderer::renderToGBuffer(VkCommandBuffer cmd, const glm::mat4& 
 }
 
 void VulkanModelRenderer::renderWaterToGBuffer(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::mat4& view) {
+    PROFILE_SCOPE("VulkanModelRenderer::renderWaterToGBuffer");
     if (!m_pipeline) return;
     
     const uint8_t WATER_BLOCK_ID = 45;
@@ -1049,26 +1051,27 @@ void VulkanModelRenderer::createForwardPipeline() {
     
     vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_forwardDescriptorSetLayout);
     
-    // Descriptor pool
+    // Descriptor pool (2 sets for double buffering)
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 2;
+    poolSize.descriptorCount = 2 * MAX_FRAMES_IN_FLIGHT;  // 2 samplers * 2 frames
     
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
-    poolInfo.maxSets = 1;
+    poolInfo.maxSets = MAX_FRAMES_IN_FLIGHT;
     
     vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_forwardDescriptorPool);
     
+    VkDescriptorSetLayout layouts[MAX_FRAMES_IN_FLIGHT] = {m_forwardDescriptorSetLayout, m_forwardDescriptorSetLayout};
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocInfo.descriptorPool = m_forwardDescriptorPool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_forwardDescriptorSetLayout;
+    allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+    allocInfo.pSetLayouts = layouts;
     
-    vkAllocateDescriptorSets(device, &allocInfo, &m_forwardDescriptorSet);
+    vkAllocateDescriptorSets(device, &allocInfo, m_forwardDescriptorSets);
     
     // Push constants: mat4 viewProjection + vec3 cameraPos + float time
     VkPushConstantRange pushConstantRange{};
@@ -1119,6 +1122,7 @@ void VulkanModelRenderer::createForwardPipeline() {
 
 void VulkanModelRenderer::renderForward(VkCommandBuffer cmd, const glm::mat4& viewProjection, const glm::vec3& cameraPos,
                                         VkImageView depthTexture, VkImageView hdrTexture, VkSampler sampler) {
+    PROFILE_SCOPE("VulkanModelRenderer::renderForward");
     if (!m_forwardPipeline) return;
     
     // Filter for water blocks only (BlockID 45)
@@ -1147,7 +1151,10 @@ void VulkanModelRenderer::renderForward(VkCommandBuffer cmd, const glm::mat4& vi
         m_forwardInstanceBuffer->unmap();
     }
     
-    // Update descriptors for depth and HDR textures
+    // Get current frame index for double buffering
+    uint32_t frameIndex = m_context->getCurrentFrame() % MAX_FRAMES_IN_FLIGHT;
+
+    // Update per-frame descriptors for depth and HDR textures
     VkDescriptorImageInfo imageInfos[2] = {};
     imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
     imageInfos[0].imageView = depthTexture;
@@ -1159,14 +1166,14 @@ void VulkanModelRenderer::renderForward(VkCommandBuffer cmd, const glm::mat4& vi
     
     VkWriteDescriptorSet descriptorWrites[2] = {};
     descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    descriptorWrites[0].dstSet = m_forwardDescriptorSet;
+    descriptorWrites[0].dstSet = m_forwardDescriptorSets[frameIndex];
     descriptorWrites[0].dstBinding = 0;
     descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     descriptorWrites[0].descriptorCount = 1;
     descriptorWrites[0].pImageInfo = &imageInfos[0];
     
     descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    descriptorWrites[1].dstSet = m_forwardDescriptorSet;
+    descriptorWrites[1].dstSet = m_forwardDescriptorSets[frameIndex];
     descriptorWrites[1].dstBinding = 1;
     descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     descriptorWrites[1].descriptorCount = 1;
@@ -1176,7 +1183,7 @@ void VulkanModelRenderer::renderForward(VkCommandBuffer cmd, const glm::mat4& vi
     
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_forwardPipeline);
     
-    VkDescriptorSet sets[] = {m_descriptorSet, m_forwardDescriptorSet};
+    VkDescriptorSet sets[] = {m_descriptorSet, m_forwardDescriptorSets[frameIndex]};
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_forwardPipelineLayout,
                            0, 2, sets, 0, nullptr);
     

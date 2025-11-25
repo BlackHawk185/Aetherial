@@ -1,6 +1,7 @@
 #include "VulkanDeferred.h"
 #include "VulkanContext.h"
 #include "ShaderPaths.h"
+#include "../../Profiling/Profiler.h"
 #include <GLFW/glfw3.h>
 #include <iostream>
 #include <fstream>
@@ -611,12 +612,12 @@ bool VulkanDeferred::createDescriptorSets() {
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     poolSizes[0].descriptorCount = 1;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = 6; // 1 for texture atlas + 5 for G-buffer
+    poolSizes[1].descriptorCount = 6 * MAX_FRAMES_IN_FLIGHT; // (1 atlas + 5 G-buffer) * 2 frames
 
     VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.poolSizeCount = 2;
     poolInfo.pPoolSizes = poolSizes;
-    poolInfo.maxSets = 2;
+    poolInfo.maxSets = 1 + MAX_FRAMES_IN_FLIGHT;  // 1 geometry + 2 lighting sets
 
     VkResult result = vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_geometryDescriptorPool);
     if (result != VK_SUCCESS) {
@@ -633,10 +634,11 @@ bool VulkanDeferred::createDescriptorSets() {
     // Allocate lighting descriptor set
     VkDescriptorSetAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocInfo.descriptorPool = m_lightingDescriptorPool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_lightingDescriptorLayout;
+    allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+    VkDescriptorSetLayout lightingLayouts[MAX_FRAMES_IN_FLIGHT] = {m_lightingDescriptorLayout, m_lightingDescriptorLayout};
+    allocInfo.pSetLayouts = lightingLayouts;
 
-    result = vkAllocateDescriptorSets(m_device, &allocInfo, &m_lightingDescriptorSet);
+    result = vkAllocateDescriptorSets(m_device, &allocInfo, m_lightingDescriptorSets);
     if (result != VK_SUCCESS) {
         std::cerr << "❌ Failed to allocate lighting descriptor set" << std::endl;
         return false;
@@ -663,18 +665,21 @@ bool VulkanDeferred::createDescriptorSets() {
     // Depth descriptor (binding 4) NOT written at init - depth is UNDEFINED
     // Will be written dynamically before first lighting pass when depth is READ_ONLY
 
-    VkWriteDescriptorSet writes[4] = {};  // Only 4 descriptors (skip depth)
-    for (int i = 0; i < 4; i++) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = m_lightingDescriptorSet;
-        writes[i].dstBinding = i;
-        writes[i].dstArrayElement = 0;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[i].descriptorCount = 1;
-        writes[i].pImageInfo = &imageInfos[i];
-    }
+    // Initialize all frame descriptor sets
+    for (uint32_t frameIdx = 0; frameIdx < MAX_FRAMES_IN_FLIGHT; frameIdx++) {
+        VkWriteDescriptorSet writes[4] = {};  // Only 4 descriptors (skip depth)
+        for (int i = 0; i < 4; i++) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = m_lightingDescriptorSets[frameIdx];
+            writes[i].dstBinding = i;
+            writes[i].dstArrayElement = 0;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].descriptorCount = 1;
+            writes[i].pImageInfo = &imageInfos[i];
+        }
 
-    vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
+        vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
+    }
 
     return true;
 }
@@ -697,6 +702,8 @@ void VulkanDeferred::endGeometryPass(VkCommandBuffer commandBuffer) {
 
 void VulkanDeferred::computeSSR(VkCommandBuffer commandBuffer,
                                 const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix) {
+    uint32_t frameIndex = m_context->getCurrentFrame() % MAX_FRAMES_IN_FLIGHT;
+    
     // SSPR raymarches lit HDR buffer for planar water reflections
     glm::vec3 cameraPos = glm::vec3(glm::inverse(viewMatrix)[3]);
     float time = static_cast<float>(glfwGetTime());
@@ -709,7 +716,8 @@ void VulkanDeferred::computeSSR(VkCommandBuffer commandBuffer,
                    viewMatrix,
                    projectionMatrix,
                    cameraPos,
-                   time);
+                   time,
+                   frameIndex);
 }
 
 void VulkanDeferred::renderLightingToHDR(VkCommandBuffer commandBuffer,
@@ -753,7 +761,8 @@ void VulkanDeferred::renderLightingToHDR(VkCommandBuffer commandBuffer,
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_lightingPipeline);
     
     // Bind descriptor sets (set 0 = G-buffer, set 1 = shadows/noise)
-    VkDescriptorSet sets[] = {m_lightingDescriptorSet, m_shadowDescriptorSet};
+    uint32_t frameIndex = m_context->getCurrentFrame() % MAX_FRAMES_IN_FLIGHT;
+    VkDescriptorSet sets[] = {m_lightingDescriptorSets[frameIndex], m_shadowDescriptorSet};
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_lightingPipelineLayout,
                             0, 2, sets, 0, nullptr);
     
@@ -803,6 +812,7 @@ void VulkanDeferred::renderLightingPass(VkCommandBuffer commandBuffer,
                                         const CascadeUniforms& cascades,
                                         VkImageView cloudNoiseTexture)
 {
+    PROFILE_SCOPE("VulkanDeferred::renderLightingPass");
     (void)swapchainImageView;
     (void)cloudNoiseTexture;
     
@@ -813,7 +823,8 @@ void VulkanDeferred::renderLightingPass(VkCommandBuffer commandBuffer,
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_lightingPipeline);
     
-    VkDescriptorSet sets[] = {m_lightingDescriptorSet, m_shadowDescriptorSet};
+    uint32_t frameIndex = m_context->getCurrentFrame() % MAX_FRAMES_IN_FLIGHT;
+    VkDescriptorSet sets[] = {m_lightingDescriptorSets[frameIndex], m_shadowDescriptorSet};
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_lightingPipelineLayout,
                             0, 2, sets, 0, nullptr);
     
@@ -900,8 +911,10 @@ bool VulkanDeferred::bindLightingTextures(VkImageView cloudNoiseTexture) {
 }
 
 void VulkanDeferred::compositeToSwapchain(VkCommandBuffer commandBuffer, const glm::vec3& cameraPos) {
+    uint32_t frameIndex = m_context->getCurrentFrame() % MAX_FRAMES_IN_FLIGHT;
+    
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_compositePipeline);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_compositePipelineLayout, 0, 1, &m_compositeDescriptorSet, 0, nullptr);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_compositePipelineLayout, 0, 1, &m_compositeDescriptorSets[frameIndex], 0, nullptr);
     
     // Push camera position for Fresnel calculation
     vkCmdPushConstants(commandBuffer, m_compositePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(glm::vec3), &cameraPos);
@@ -1117,10 +1130,10 @@ bool VulkanDeferred::createCompositePipeline() {
     
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 6;  // hdr, ssr, metadata, normal, position, depth
+    poolSize.descriptorCount = 6 * MAX_FRAMES_IN_FLIGHT;  // hdr, ssr, metadata, normal, position, depth per frame
     
     VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.maxSets = 1;
+    poolInfo.maxSets = MAX_FRAMES_IN_FLIGHT;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
     
@@ -1128,51 +1141,55 @@ bool VulkanDeferred::createCompositePipeline() {
         return false;
     }
     
+    VkDescriptorSetLayout layouts[MAX_FRAMES_IN_FLIGHT] = {m_compositeDescriptorLayout, m_compositeDescriptorLayout};
     VkDescriptorSetAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocInfo.descriptorPool = m_compositeDescriptorPool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_compositeDescriptorLayout;
+    allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+    allocInfo.pSetLayouts = layouts;
     
-    if (vkAllocateDescriptorSets(m_device, &allocInfo, &m_compositeDescriptorSet) != VK_SUCCESS) {
+    if (vkAllocateDescriptorSets(m_device, &allocInfo, m_compositeDescriptorSets) != VK_SUCCESS) {
         return false;
     }
     
-    VkDescriptorImageInfo imageInfos[6] = {};
-    imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageInfos[0].imageView = m_hdrBuffer.getView();
-    imageInfos[0].sampler = m_compositeSampler;
-    
-    imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageInfos[1].imageView = m_sspr.getOutputView();
-    imageInfos[1].sampler = m_compositeSampler;
-    
-    imageInfos[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageInfos[2].imageView = m_gbuffer.getMetadataView();
-    imageInfos[2].sampler = m_compositeSampler;
-    
-    imageInfos[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageInfos[3].imageView = m_gbuffer.getNormalView();
-    imageInfos[3].sampler = m_compositeSampler;
-    
-    imageInfos[4].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageInfos[4].imageView = m_gbuffer.getPositionView();
-    imageInfos[4].sampler = m_compositeSampler;
-    
-    imageInfos[5].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    imageInfos[5].imageView = m_context->getDepthImageView();
-    imageInfos[5].sampler = m_compositeSampler;
-    
-    VkWriteDescriptorSet writes[6] = {};
-    for (int i = 0; i < 6; i++) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = m_compositeDescriptorSet;
-        writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[i].pImageInfo = &imageInfos[i];
+    // Initialize all per-frame descriptor sets
+    for (uint32_t frameIndex = 0; frameIndex < MAX_FRAMES_IN_FLIGHT; ++frameIndex) {
+        VkDescriptorImageInfo imageInfos[6] = {};
+        imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfos[0].imageView = m_hdrBuffer.getView();
+        imageInfos[0].sampler = m_compositeSampler;
+        
+        imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfos[1].imageView = m_sspr.getOutputView();
+        imageInfos[1].sampler = m_compositeSampler;
+        
+        imageInfos[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfos[2].imageView = m_gbuffer.getMetadataView();
+        imageInfos[2].sampler = m_compositeSampler;
+        
+        imageInfos[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfos[3].imageView = m_gbuffer.getNormalView();
+        imageInfos[3].sampler = m_compositeSampler;
+        
+        imageInfos[4].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfos[4].imageView = m_gbuffer.getPositionView();
+        imageInfos[4].sampler = m_compositeSampler;
+        
+        imageInfos[5].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        imageInfos[5].imageView = m_context->getDepthImageView();
+        imageInfos[5].sampler = m_compositeSampler;
+        
+        VkWriteDescriptorSet writes[6] = {};
+        for (int i = 0; i < 6; i++) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = m_compositeDescriptorSets[frameIndex];
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &imageInfos[i];
+        }
+        
+        vkUpdateDescriptorSets(m_device, 6, writes, 0, nullptr);
     }
-    
-    vkUpdateDescriptorSets(m_device, 6, writes, 0, nullptr);
     
     return true;
 }

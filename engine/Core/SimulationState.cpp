@@ -134,8 +134,8 @@ void SimulationState::createDefaultWorld()
     struct WorldGenConfig {
         uint32_t worldSeed;
         float regionSize = 1200.0f;
-        float voronoiCellSizeMin = 800.0f;   // Min Voronoi cell size (determines spacing & island size)
-        float voronoiCellSizeMax = 800.0f;  // Max Voronoi cell size (variation in spacing & size)
+        float voronoiCellSizeMin = 600.0f;   // Min Voronoi cell size (determines spacing & island size)
+        float voronoiCellSizeMax = 600.0f;  // Max Voronoi cell size (variation in spacing & size)
         float islandToVoronoiCellRatio = 0.75f;  // Island radius = 35% of cell size (30-40% with noise)
     } config;
     config.worldSeed = randomSeed;
@@ -157,8 +157,7 @@ void SimulationState::createDefaultWorld()
 
     // Create islands from definitions using std::async for parallel generation
     std::vector<std::future<void>> futures;
-    futures.reserve(islandDefs.size());
-
+    // Generate islands sequentially to avoid cache thrashing
     for (size_t i = 0; i < islandDefs.size(); i++)
     {
         const auto& def = islandDefs[i];
@@ -169,15 +168,8 @@ void SimulationState::createDefaultWorld()
                   << " @ (" << def.position.x << ", " << def.position.y << ", " << def.position.z << ")"
                   << " radius=" << def.radius << std::endl;
 
-        // Launch async task for voxel terrain generation
-        futures.push_back(std::async(std::launch::async, [this, islandID, seed = def.seed, radius = def.radius, biome = def.biome]() {
-            m_islandSystem.generateFloatingIslandOrganic(islandID, seed, radius, biome);
-        }));
-    }
-
-    // Wait for all island generation tasks to complete
-    for (auto& future : futures) {
-        future.get();
+        // Generate synchronously
+        m_islandSystem.generateFloatingIslandOrganic(islandID, def.seed, def.radius, def.biome);
     }
 
     // Set spawn position to first island

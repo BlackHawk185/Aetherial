@@ -121,12 +121,12 @@ public:
     // Accessors for geometry pass
     VkPipelineLayout getGeometryPipelineLayout() const { return m_geometryPipelineLayout; }
     VkDescriptorSetLayout getGeometryDescriptorLayout() const { return m_geometryDescriptorLayout; }
-    VkDescriptorSet getGBufferDescriptorSet() const { return m_lightingDescriptorSet; }
+    VkDescriptorSet getGBufferDescriptorSet() const { return m_lightingDescriptorSets[0]; }  // Backward compat, use frame 0
     VkImageView getAlbedoView() const { return m_gbuffer.getAlbedoView(); }
     VkImageView getHDRView() const { return m_hdrBuffer.getView(); }
     
     // Accessors for dynamic descriptor updates
-    VkDescriptorSet getLightingDescriptorSet() const { return m_lightingDescriptorSet; }
+    VkDescriptorSet getLightingDescriptorSet(uint32_t frameIndex) const { return m_lightingDescriptorSets[frameIndex % MAX_FRAMES_IN_FLIGHT]; }
     VkSampler getGBufferSampler() const { return m_gbufferSampler; }
     // Depth view is from VulkanContext, not G-buffer
 
@@ -177,9 +177,10 @@ private:
     VkPipelineLayout m_lightingPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_lightingPipeline = VK_NULL_HANDLE;
     
+    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
     VkDescriptorSetLayout m_lightingDescriptorLayout = VK_NULL_HANDLE;  // Set 0: G-buffer
     VkDescriptorPool m_lightingDescriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_lightingDescriptorSet = VK_NULL_HANDLE;  // Set 0: G-buffer textures
+    VkDescriptorSet m_lightingDescriptorSets[MAX_FRAMES_IN_FLIGHT] = {};  // Set 0: G-buffer textures (per-frame)
     VkSampler m_gbufferSampler = VK_NULL_HANDLE;
     
     VkDescriptorSetLayout m_shadowDescriptorLayout = VK_NULL_HANDLE;  // Set 1: Shadows/noise
@@ -200,6 +201,6 @@ private:
     VkPipelineLayout m_compositePipelineLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_compositeDescriptorLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_compositeDescriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_compositeDescriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_compositeDescriptorSets[MAX_FRAMES_IN_FLIGHT] = {};
     VkSampler m_compositeSampler = VK_NULL_HANDLE;
 };

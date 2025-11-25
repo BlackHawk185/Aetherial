@@ -18,6 +18,8 @@
 #include "../Rendering/Vulkan/VulkanContext.h"
 #include "../Rendering/Vulkan/VulkanQuadRenderer.h"
 #include "../Rendering/Vulkan/VulkanModelRenderer.h"
+// #include "../Rendering/Vulkan/ImpostorAtlas.h"  // Removed - not yet implemented
+// #include "../Rendering/Vulkan/BillboardRenderer.h"  // Removed - not yet implemented
 
 // Forward declarations
 class ClientWorld;
@@ -136,6 +138,8 @@ private:
     std::unique_ptr<VulkanContext> m_vulkanContext;
     std::unique_ptr<VulkanQuadRenderer> m_vulkanQuadRenderer;
     std::unique_ptr<VulkanModelRenderer> m_vulkanModelRenderer;
+    // std::unique_ptr<ImpostorAtlas> m_impostorAtlas;  // Removed - not yet implemented
+    // std::unique_ptr<BillboardRenderer> m_billboardRenderer;  // Removed - not yet implemented
     std::unique_ptr<VulkanDeferred> m_vulkanDeferred;
     std::unique_ptr<class VulkanSkyRenderer> m_vulkanSkyRenderer;
     std::unique_ptr<class VulkanCloudRenderer> m_vulkanCloudRenderer;

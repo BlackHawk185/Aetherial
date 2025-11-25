@@ -11,8 +11,8 @@
 DayNightController* g_dayNightController = nullptr;
 
 DayNightController::DayNightController()
-    : m_currentTime(12.0f)     // Start at noon for nice lighting
-    , m_timeSpeed(600.0f)        // 60x speed = 24 minute day cycle (1440 real minutes / 24 = 60x)
+    : m_currentTime(6.0f)      // Start at sunrise
+    , m_timeSpeed(60.0f)       // 6x speed = 240 minute day cycle (10x slower than before)
     , m_paused(false)
     , m_moonPhase(14.765f)      // Start moon ~180 degrees from sun (half lunar cycle)
     , m_moonOrbitSpeed(1.0f / 29.53f)  // Moon takes 29.53 days to orbit (relative to sun's 1-day cycle)
@@ -121,13 +121,7 @@ Vec3 DayNightController::getMoonDirection() const {
 }
 
 float DayNightController::getSunIntensity() const {
-    float angle = calculateSunAngle();
-    float elevation = std::sin(angle);
-    
-    // Sun is always active, brightness varies with elevation
-    // Full brightness at zenith, dimmer near horizon, but never off
-    // Map -1 to 1 elevation to 0.3 to 1.0 intensity
-    return 0.3f + (elevation * 0.5f + 0.5f) * 0.7f;
+    return 1.0f;
 }
 
 float DayNightController::getMoonIntensity() const {

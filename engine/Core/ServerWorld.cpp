@@ -104,6 +104,9 @@ void ServerWorld::updateIslandActivation(const Vec3& playerPosition)
         return;
     }
     
+    // Update chunk states for memory optimization
+    m_simulation.getIslandSystem()->updateChunkStates(playerPosition);
+    
     // Delegate to base simulation
     m_simulation.updateIslandActivation(playerPosition);
 }

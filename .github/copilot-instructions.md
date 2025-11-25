@@ -1,12 +1,13 @@
+
 # AI Assistant Directives
 
 ## Core Principles
-- **Minimal code**: Write only what's needed. No defensive checks, fallbacks, or "just in case" logic.
 - **Delete aggressively**: Remove dead code immediately. Never comment out or deprecate.
 - **Performance-first**: SoA layout for entity storage. Cache-friendly, SIMD-ready.
 - **Server authority**: All state changes validated server-side, even in integrated mode.
 - **Event-driven**: No polling loops. React to events.
 - **Cross-platform**: Windows/Linux/macOS. No platform-specific hacks.
+- **AAA Standards**: Follow industry best practices for architecture and code quality.
 
 ## Code Generation Rules
 1. Write the solution that works
@@ -22,7 +23,6 @@ After writing code, immediately:
 1. Delete unused code
 2. Remove defensive checks
 3. Strip excessive logging
-4. Verify minimal solution
 
 ## Industry Standard Violations
 Alert user when doing:

@@ -30,7 +30,7 @@ public:
                  VkImageView gNormal, VkImageView gPosition, VkImageView gDepth, 
                  VkImageView gMetadata, VkImageView hdrBuffer,
                  const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix, 
-                 const glm::vec3& cameraPos, float time);
+                 const glm::vec3& cameraPos, float time, uint32_t frameIndex);
 
     VkImageView getOutputView() const { return m_reflectionImage.getView(); }
 
@@ -39,6 +39,8 @@ private:
     bool createDescriptorSet();
     VkShaderModule loadShaderModule(const std::string& filepath);
 
+    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
+    
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
@@ -53,6 +55,6 @@ private:
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_descriptorLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_descriptorSets[MAX_FRAMES_IN_FLIGHT] = {};
     bool m_imageNeedsTransition = true;
 };

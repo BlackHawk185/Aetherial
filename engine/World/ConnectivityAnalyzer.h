@@ -38,6 +38,9 @@ public:
         IslandChunkSystem* system, 
         uint32_t originalIslandID
     );
+    
+    // Check if a voxel exists at island-relative position (PUBLIC for neighbor checks)
+    static bool isSolidVoxel(const FloatingIsland* island, const Vec3& islandRelativePos);
 
 private:
     // 3D flood-fill to find all voxels connected to a starting position
@@ -55,7 +58,4 @@ private:
     
     // Get all 6 neighbors (±X, ±Y, ±Z) for connectivity check
     static std::vector<Vec3> getNeighbors(const Vec3& pos);
-    
-    // Check if a voxel exists at island-relative position
-    static bool isSolidVoxel(const FloatingIsland* island, const Vec3& islandRelativePos);
 };

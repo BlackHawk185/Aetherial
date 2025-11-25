@@ -5,6 +5,7 @@
 
 #include "../Time/DayNightController.h"  // For dynamic sun direction
 #include "../Rendering/Vulkan/VulkanQuadRenderer.h"  // For Vulkan GPU upload
+#include "../Rendering/Vulkan/VulkanModelRenderer.h"  // For model instance management
 
 #include <algorithm>
 #include <cmath>
@@ -21,6 +22,63 @@
 // Static island system pointer for inter-chunk queries
 IslandChunkSystem* VoxelChunk::s_islandSystem = nullptr;
 
+// ============================================================================
+// COMPRESSED CHUNK DATA - RLE COMPRESSION
+// ============================================================================
+
+void CompressedChunkData::compress(const uint8_t* data, size_t size)
+{
+    originalSize = size;
+    compressedVoxels.clear();
+    compressedVoxels.reserve(size / 4);  // Estimate: 4:1 compression for typical terrain
+    
+    uint8_t currentValue = data[0];
+    uint32_t runLength = 1;
+    
+    for (size_t i = 1; i < size; ++i) {
+        if (data[i] == currentValue && runLength < 65535) {
+            runLength++;
+        } else {
+            // Write run: [length_low, length_high, value]
+            compressedVoxels.push_back(static_cast<uint8_t>(runLength & 0xFF));
+            compressedVoxels.push_back(static_cast<uint8_t>((runLength >> 8) & 0xFF));
+            compressedVoxels.push_back(currentValue);
+            
+            currentValue = data[i];
+            runLength = 1;
+        }
+    }
+    
+    // Write final run
+    compressedVoxels.push_back(static_cast<uint8_t>(runLength & 0xFF));
+    compressedVoxels.push_back(static_cast<uint8_t>((runLength >> 8) & 0xFF));
+    compressedVoxels.push_back(currentValue);
+    
+    compressedVoxels.shrink_to_fit();
+}
+
+void CompressedChunkData::decompress(uint8_t* outData, size_t outSize) const
+{
+    if (outSize != originalSize) {
+        std::cerr << "CompressedChunkData::decompress: Size mismatch!" << std::endl;
+        return;
+    }
+    
+    size_t writePos = 0;
+    for (size_t i = 0; i < compressedVoxels.size(); i += 3) {
+        uint16_t runLength = compressedVoxels[i] | (static_cast<uint16_t>(compressedVoxels[i+1]) << 8);
+        uint8_t value = compressedVoxels[i+2];
+        
+        for (uint16_t j = 0; j < runLength && writePos < outSize; ++j) {
+            outData[writePos++] = value;
+        }
+    }
+}
+
+// ============================================================================
+// CHUNK STATE MANAGEMENT
+// ============================================================================
+
 VoxelChunk::VoxelChunk()
 {
     // Initialize voxel data to empty (0 = air)
@@ -28,6 +86,123 @@ VoxelChunk::VoxelChunk()
     
     // Initialize render mesh with empty shared_ptr
     renderMesh = std::make_shared<VoxelMesh>();
+    
+    // Start in ACTIVE state
+    m_state = ChunkState::ACTIVE;
+}
+
+void VoxelChunk::activate()
+{
+    if (m_state == ChunkState::ACTIVE) return;
+    
+    if (m_state == ChunkState::INACTIVE && m_compressedData) {
+        // Decompress voxel data
+        m_compressedData->decompress(voxels.data(), VOLUME);
+        m_compressedData.reset();  // Free compressed data
+        
+        // Rebuild model instance data from decompressed voxels
+        m_modelInstances.clear();
+        auto& registry = BlockTypeRegistry::getInstance();
+        
+        for (int z = 0; z < SIZE; ++z) {
+            for (int y = 0; y < SIZE; ++y) {
+                for (int x = 0; x < SIZE; ++x) {
+                    uint8_t blockType = voxels[x + y * SIZE + z * SIZE * SIZE];
+                    if (blockType == BlockID::AIR) continue;
+                    
+                    const BlockTypeInfo* blockInfo = registry.getBlockType(blockType);
+                    if (blockInfo && blockInfo->renderType == BlockRenderType::OBJ) {
+                        // Water culling
+                        if (blockType == BlockID::WATER) {
+                            uint8_t blockAbove = (y + 1 < SIZE) ? voxels[x + (y+1) * SIZE + z * SIZE * SIZE] : BlockID::AIR;
+                            if (blockAbove != BlockID::AIR) continue;
+                        }
+                        
+                        glm::vec3 pos(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, static_cast<float>(z) + 0.5f);
+                        m_modelInstances[blockType].push_back(pos);
+                    }
+                }
+            }
+        }
+        
+        // Re-register models with renderer (client-side only)
+        notifyModelRendererOfActivation();
+    }
+    
+    m_state = ChunkState::ACTIVE;
+}
+
+void VoxelChunk::deactivate()
+{
+    if (m_state != ChunkState::ACTIVE) return;
+    
+    // Unregister models from renderer before clearing (client-side only)
+    notifyModelRendererOfDeactivation();
+    
+    // Compress voxel data
+    m_compressedData = std::make_unique<CompressedChunkData>();
+    m_compressedData->compress(voxels.data(), VOLUME);
+    
+    // Clear model instance data to free memory
+    m_modelInstances.clear();
+    
+    // Keep mesh on GPU, but mark as inactive
+    m_state = ChunkState::INACTIVE;
+}
+
+void VoxelChunk::compressAfterWorldGen()
+{
+    // Called immediately after world generation to compress chunks
+    // Chunks start INACTIVE and only activate when player gets near
+    if (m_state != ChunkState::ACTIVE) return;
+    
+    // Compress voxel data
+    m_compressedData = std::make_unique<CompressedChunkData>();
+    m_compressedData->compress(voxels.data(), VOLUME);
+    
+    // Clear model instance data (will be rebuilt on activation)
+    m_modelInstances.clear();
+    
+    // Mark as inactive (no renderer notification needed - never registered yet)
+    m_state = ChunkState::INACTIVE;
+}
+
+void VoxelChunk::notifyModelRendererOfActivation()
+{
+    if (!m_modelRenderer || !m_isClientChunk) return;
+    
+    // Re-register this chunk's models with the renderer
+    glm::vec3 chunkOffset(
+        m_chunkCoord.x * SIZE,
+        m_chunkCoord.y * SIZE,
+        m_chunkCoord.z * SIZE
+    );
+    m_modelRenderer->updateChunkInstances(this, m_islandID, chunkOffset);
+}
+
+void VoxelChunk::notifyModelRendererOfDeactivation()
+{
+    if (!m_modelRenderer || !m_isClientChunk) return;
+    
+    // Unregister this chunk from the renderer
+    m_modelRenderer->unregisterChunk(this);
+}
+
+size_t VoxelChunk::getMemoryUsage() const
+{
+    size_t total = sizeof(VoxelChunk);
+    
+    if (m_state == ChunkState::ACTIVE) {
+        total += VOLUME;  // Full voxel array
+    } else if (m_state == ChunkState::INACTIVE && m_compressedData) {
+        total += m_compressedData->getCompressedSize();
+    }
+    
+    if (renderMesh) {
+        total += renderMesh->quads.size() * sizeof(QuadFace);
+    }
+    
+    return total;
 }
 
 VoxelChunk::~VoxelChunk()
@@ -40,6 +215,12 @@ uint8_t VoxelChunk::getVoxel(int x, int y, int z) const
 {
     if (x < 0 || x >= SIZE || y < 0 || y >= SIZE || z < 0 || z >= SIZE)
         return 0;  // Out of bounds = air
+    
+    // Auto-activate if inactive (read-only access is safe)
+    if (m_state == ChunkState::INACTIVE) {
+        const_cast<VoxelChunk*>(this)->activate();
+    }
+    
     return voxels[x + y * SIZE + z * SIZE * SIZE];
 }
 
@@ -47,6 +228,11 @@ void VoxelChunk::setVoxel(int x, int y, int z, uint8_t type)
 {
     if (x < 0 || x >= SIZE || y < 0 || y >= SIZE || z < 0 || z >= SIZE)
         return;
+    
+    // Auto-activate if inactive (writing requires decompression)
+    if (m_state == ChunkState::INACTIVE) {
+        activate();
+    }
     
     // Use direct quad manipulation instead of full remesh
     setVoxelWithQuadManipulation(x, y, z, type);
@@ -57,6 +243,11 @@ void VoxelChunk::setVoxelDataDirect(int x, int y, int z, uint8_t type)
     // SERVER-ONLY: Direct voxel data modification without any mesh operations
     if (x < 0 || x >= SIZE || y < 0 || y >= SIZE || z < 0 || z >= SIZE)
         return;
+    
+    // Auto-activate if inactive
+    if (m_state == ChunkState::INACTIVE) {
+        activate();
+    }
     
     voxels[x + y * SIZE + z * SIZE * SIZE] = type;
 }

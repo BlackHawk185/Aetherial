@@ -2,6 +2,7 @@
 #include "ConnectivityAnalyzer.h"
 #include "IslandChunkSystem.h"
 #include "VoxelChunk.h"
+#include "BlockType.h"
 #include <iostream>
 
 std::vector<uint32_t> ConnectivityAnalyzer::splitIslandByConnectivity(
@@ -227,70 +228,55 @@ bool ConnectivityAnalyzer::wouldBreakingCauseSplit(const FloatingIsland* island,
 {
     if (!island) return false;
     
+    // Check if the block being broken is actually solid
+    if (!isSolidVoxel(island, islandRelativePos))
+    {
+        return false; // Can't split if we're not breaking a solid block
+    }
+    
     // Get all solid neighbors of the block we're about to break
     std::vector<Vec3> neighbors = getSolidNeighbors(island, islandRelativePos);
     
-    // Only blocks with exactly 2 neighbors can cause a split
-    if (neighbors.size() != 2)
+    std::cout << "[SPLIT CHECK] Block at (" << islandRelativePos.x << ", " << islandRelativePos.y << ", " << islandRelativePos.z 
+              << ") has " << neighbors.size() << " solid neighbors" << std::endl;
+    
+    // Need at least 2 neighbors to potentially cause a split
+    if (neighbors.size() < 2)
     {
-        return false; // Can't split with 0, 1, 3, 4, 5, or 6 neighbors
+        return false; // 0 or 1 neighbors can't cause a split
     }
     
-    // Check if the 2 neighbors are adjacent to each other (6-way connectivity)
-    Vec3 diff = neighbors[0] - neighbors[1];
-    int manhattanDist = abs(diff.x) + abs(diff.y) + abs(diff.z);
+    // Strategy: Run TWO parallel flood-fills from different neighbors
+    // If they overlap, there's no split. If both complete without overlapping, there IS a split.
+    // Extract whichever side is SMALLER to minimize network data.
     
-    if (manhattanDist == 1)
-    {
-        // Neighbors are adjacent - they can connect directly, no split
-        return false;
-    }
+    const int MAX_VOXELS_PER_SIDE = 5000; // Abort if one side exceeds this (too expensive)
     
-    // The 2 neighbors are NOT adjacent - breaking this block will split the island!
-    // OPTIMIZATION: Race flood-fill from both neighbors to find which side is smaller
-    // This avoids flood-filling a massive island when we only need the small fragment
-    
-    std::unordered_set<Vec3> visited0;
-    std::unordered_set<Vec3> visited1;
-    std::queue<Vec3> queue0;
+    std::unordered_set<Vec3> visited1; // Flood-fill from first neighbor
+    std::unordered_set<Vec3> visited2; // Flood-fill from second neighbor
     std::queue<Vec3> queue1;
+    std::queue<Vec3> queue2;
     
-    visited0.insert(islandRelativePos); // Exclude the broken block
+    // Mark the broken block as excluded for both searches
     visited1.insert(islandRelativePos);
+    visited2.insert(islandRelativePos);
     
-    queue0.push(neighbors[0]);
-    queue1.push(neighbors[1]);
-    visited0.insert(neighbors[0]);
-    visited1.insert(neighbors[1]);
+    // Start from opposite neighbors
+    queue1.push(neighbors[0]);
+    visited1.insert(neighbors[0]);
     
-    int count0 = 1;
-    int count1 = 1;
+    queue2.push(neighbors[1]);
+    visited2.insert(neighbors[1]);
     
-    // Race both flood-fills, alternating one step at a time
-    while (!queue0.empty() || !queue1.empty())
+    bool flood1Complete = false;
+    bool flood2Complete = false;
+    bool overlap = false;
+    
+    // Expand both flood-fills in parallel until EITHER completes or they overlap
+    // Whichever completes first is the smaller fragment
+    while (!overlap && !flood1Complete && !flood2Complete)
     {
-        // Expand fragment 0 by one layer
-        if (!queue0.empty())
-        {
-            int layerSize = queue0.size();
-            for (int i = 0; i < layerSize; i++)
-            {
-                Vec3 current = queue0.front();
-                queue0.pop();
-                
-                for (const Vec3& neighbor : getNeighbors(current))
-                {
-                    if (visited0.find(neighbor) != visited0.end()) continue;
-                    if (!isSolidVoxel(island, neighbor)) continue;
-                    
-                    visited0.insert(neighbor);
-                    queue0.push(neighbor);
-                    count0++;
-                }
-            }
-        }
-        
-        // Expand fragment 1 by one layer
+        // Expand flood-fill 1 by one layer
         if (!queue1.empty())
         {
             int layerSize = queue1.size();
@@ -304,39 +290,118 @@ bool ConnectivityAnalyzer::wouldBreakingCauseSplit(const FloatingIsland* island,
                     if (visited1.find(neighbor) != visited1.end()) continue;
                     if (!isSolidVoxel(island, neighbor)) continue;
                     
+                    // Check for overlap with flood-fill 2
+                    if (visited2.find(neighbor) != visited2.end())
+                    {
+                        overlap = true;
+                        break;
+                    }
+                    
                     visited1.insert(neighbor);
                     queue1.push(neighbor);
-                    count1++;
                 }
+                
+                if (overlap) break;
+            }
+            
+            if (queue1.empty()) flood1Complete = true;
+            
+            // Safety: abort if one side is too large
+            if (visited1.size() > MAX_VOXELS_PER_SIDE)
+            {
+                std::cout << "[SPLIT CHECK] Side 1 too large (" << visited1.size() << " voxels), aborting" << std::endl;
+                return false;
             }
         }
         
-        // If one side finished (found all its voxels), it's the smaller fragment
-        if (queue0.empty() && !queue1.empty())
+        if (overlap || flood1Complete) break;
+        
+        // Expand flood-fill 2 by one layer
+        if (!queue2.empty())
         {
-            outFragmentAnchor = neighbors[0];
-            return true;
-        }
-        if (queue1.empty() && !queue0.empty())
-        {
-            outFragmentAnchor = neighbors[1];
-            return true;
+            int layerSize = queue2.size();
+            for (int i = 0; i < layerSize; i++)
+            {
+                Vec3 current = queue2.front();
+                queue2.pop();
+                
+                for (const Vec3& neighbor : getNeighbors(current))
+                {
+                    if (visited2.find(neighbor) != visited2.end()) continue;
+                    if (!isSolidVoxel(island, neighbor)) continue;
+                    
+                    // Check for overlap with flood-fill 1
+                    if (visited1.find(neighbor) != visited1.end())
+                    {
+                        overlap = true;
+                        break;
+                    }
+                    
+                    visited2.insert(neighbor);
+                    queue2.push(neighbor);
+                }
+                
+                if (overlap) break;
+            }
+            
+            if (queue2.empty()) flood2Complete = true;
+            
+            // Safety: abort if one side is too large
+            if (visited2.size() > MAX_VOXELS_PER_SIDE)
+            {
+                std::cout << "[SPLIT CHECK] Side 2 too large (" << visited2.size() << " voxels), aborting" << std::endl;
+                return false;
+            }
         }
     }
     
-    // Both finished at same time - pick the smaller count
-    outFragmentAnchor = (count0 <= count1) ? neighbors[0] : neighbors[1];
+    // If the flood-fills overlapped, no split occurred
+    if (overlap)
+    {
+        std::cout << "[SPLIT CHECK] No split - flood-fills overlapped (side1=" << visited1.size() 
+                  << " side2=" << visited2.size() << ")" << std::endl;
+        return false;
+    }
+    
+    // One side completed first = it's the smaller fragment = SPLIT!
+    std::cout << "[SPLIT CHECK] SPLIT DETECTED! Side 1=" << visited1.size() 
+              << " voxels, Side 2=" << visited2.size() << " voxels" << std::endl;
+    
+    // Whichever side completed first is the smaller fragment
+    if (flood1Complete)
+    {
+        outFragmentAnchor = neighbors[0];
+        std::cout << "[SPLIT CHECK] Extracting side 1 (completed first with " << visited1.size() << " voxels)" << std::endl;
+    }
+    else
+    {
+        outFragmentAnchor = neighbors[1];
+        std::cout << "[SPLIT CHECK] Extracting side 2 (completed first with " << visited2.size() << " voxels)" << std::endl;
+    }
+    
     return true;
 }
 
 uint32_t ConnectivityAnalyzer::extractFragmentToNewIsland(IslandChunkSystem* system, uint32_t originalIslandID, const Vec3& fragmentAnchor, std::vector<Vec3>* outRemovedVoxels)
 {
-    if (!system) return 0;
+    std::cout << "[EXTRACT] Starting fragment extraction from island " << originalIslandID 
+              << " anchor=(" << fragmentAnchor.x << "," << fragmentAnchor.y << "," << fragmentAnchor.z << ")" << std::endl;
+    
+    if (!system) {
+        std::cerr << "[EXTRACT] ERROR: Null system pointer" << std::endl;
+        return 0;
+    }
     
     FloatingIsland* mainIsland = system->getIsland(originalIslandID);
-    if (!mainIsland) return 0;
+    if (!mainIsland) {
+        std::cerr << "[EXTRACT] ERROR: Could not find island " << originalIslandID << std::endl;
+        return 0;
+    }
     
     // Flood-fill from fragment anchor to find all fragment voxels
+    // LIMIT: Cap fragment size to prevent massive extractions from blocking network thread
+    const int MAX_FRAGMENT_SIZE = 5000; // Don't extract fragments larger than 5000 blocks
+    
     std::unordered_set<Vec3> fragmentVoxels;
     std::queue<Vec3> queue;
     queue.push(fragmentAnchor);
@@ -358,16 +423,33 @@ uint32_t ConnectivityAnalyzer::extractFragmentToNewIsland(IslandChunkSystem* sys
             
             fragmentVoxels.insert(neighbor);
             queue.push(neighbor);
+            
+            // Safety check: Don't extract massive fragments (would stall network thread)
+            if (fragmentVoxels.size() >= MAX_FRAGMENT_SIZE)
+            {
+                std::cerr << "[EXTRACT] WARNING: Fragment too large (" << fragmentVoxels.size() 
+                          << " voxels), aborting extraction to prevent timeout" << std::endl;
+                return 0;
+            }
         }
     }
     
-    if (fragmentVoxels.empty()) return 0;
+    if (fragmentVoxels.empty()) {
+        std::cerr << "[EXTRACT] ERROR: Fragment flood-fill found 0 voxels" << std::endl;
+        return 0;
+    }
+    
+    std::cout << "[EXTRACT] Found fragment with " << fragmentVoxels.size() << " voxels" << std::endl;
     
     centerOfMass = centerOfMass / static_cast<float>(fragmentVoxels.size());
     
     // Create new island for fragment
     // Physics center should be in WORLD space (main island world pos + fragment's local center of mass)
     Vec3 worldCenterOfMass = mainIsland->physicsCenter + centerOfMass;
+    
+    std::cout << "[EXTRACT] Creating new island at world pos (" << worldCenterOfMass.x << "," 
+              << worldCenterOfMass.y << "," << worldCenterOfMass.z << ")" << std::endl;
+    
     uint32_t newIslandID = system->createIsland(worldCenterOfMass);
     FloatingIsland* newIsland = system->getIsland(newIslandID);
     
@@ -401,10 +483,12 @@ uint32_t ConnectivityAnalyzer::extractFragmentToNewIsland(IslandChunkSystem* sys
             // Place voxel in new island at position relative to fragment's center of mass
             // This makes the fragment centered at (0,0,0) in the new island's local space
             Vec3 newIslandRelativePos = voxelPos - centerOfMass;
-            system->setVoxelWithMesh(newIslandID, newIslandRelativePos, voxelType);
             
-            // Remove from main island using setVoxelWithMesh to properly rebuild meshes
-            system->setVoxelWithMesh(originalIslandID, voxelPos, 0);
+            // Use server-only method (no mesh generation on server)
+            system->setVoxelServerOnly(newIslandID, newIslandRelativePos, voxelType);
+            
+            // Remove from main island (server-only, no mesh operations)
+            system->setVoxelServerOnly(originalIslandID, voxelPos, 0);
             
             // Track removed voxel for network broadcast
             if (outRemovedVoxels)
@@ -457,5 +541,8 @@ bool ConnectivityAnalyzer::isSolidVoxel(const FloatingIsland* island, const Vec3
         return false;
     }
     
-    return (chunk->getVoxel(lx, ly, lz) != 0);
+    uint8_t voxelType = chunk->getVoxel(lx, ly, lz);
+    
+    // Ignore fluid blocks for connectivity - they don't provide structural support
+    return (voxelType != 0 && voxelType != BlockID::WATER);
 }

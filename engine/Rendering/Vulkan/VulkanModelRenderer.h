@@ -90,11 +90,12 @@ private:
     VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
     
     // Forward pipeline (transparent water)
+    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
     VkPipeline m_forwardPipeline = VK_NULL_HANDLE;
     VkPipelineLayout m_forwardPipelineLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_forwardDescriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_forwardDescriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_forwardDescriptorSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_forwardDescriptorSets[MAX_FRAMES_IN_FLIGHT] = {};  // One per frame-in-flight
     std::unique_ptr<VulkanBuffer> m_forwardInstanceBuffer;
 
     // Helper functions

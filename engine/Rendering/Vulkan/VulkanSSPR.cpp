@@ -236,25 +236,26 @@ bool VulkanSSPR::createDescriptorSet() {
 
     VkDescriptorPoolSize poolSizes[2] = {};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[0].descriptorCount = 5;
+    poolSizes[0].descriptorCount = 5 * MAX_FRAMES_IN_FLIGHT;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[1].descriptorCount = 1;
+    poolSizes[1].descriptorCount = 1 * MAX_FRAMES_IN_FLIGHT;
 
     VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.poolSizeCount = 2;
     poolInfo.pPoolSizes = poolSizes;
-    poolInfo.maxSets = 1;
+    poolInfo.maxSets = MAX_FRAMES_IN_FLIGHT;
 
     if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descriptorPool) != VK_SUCCESS) {
         return false;
     }
 
+    VkDescriptorSetLayout layouts[MAX_FRAMES_IN_FLIGHT] = {m_descriptorLayout, m_descriptorLayout};
     VkDescriptorSetAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocInfo.descriptorPool = m_descriptorPool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_descriptorLayout;
+    allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+    allocInfo.pSetLayouts = layouts;
 
-    if (vkAllocateDescriptorSets(m_device, &allocInfo, &m_descriptorSet) != VK_SUCCESS) {
+    if (vkAllocateDescriptorSets(m_device, &allocInfo, m_descriptorSets) != VK_SUCCESS) {
         return false;
     }
 
@@ -265,7 +266,9 @@ void VulkanSSPR::compute(VkCommandBuffer cmd,
                          VkImageView gNormal, VkImageView gPosition, VkImageView gDepth,
                          VkImageView gMetadata, VkImageView hdrBuffer,
                          const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix,
-                         const glm::vec3& cameraPos, float time) {
+                         const glm::vec3& cameraPos, float time, uint32_t frameIndex) {
+    uint32_t setIndex = frameIndex % MAX_FRAMES_IN_FLIGHT;
+    
     VkDescriptorImageInfo imageInfos[6] = {};
     VkImageView views[5] = {gNormal, gPosition, gDepth, gMetadata, hdrBuffer};
     for (int i = 0; i < 5; i++) {
@@ -280,7 +283,7 @@ void VulkanSSPR::compute(VkCommandBuffer cmd,
     VkWriteDescriptorSet writes[6] = {};
     for (int i = 0; i < 6; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = m_descriptorSet;
+        writes[i].dstSet = m_descriptorSets[setIndex];
         writes[i].dstBinding = i;
         writes[i].dstArrayElement = 0;
         writes[i].descriptorCount = 1;
@@ -307,7 +310,7 @@ void VulkanSSPR::compute(VkCommandBuffer cmd,
                          0, 0, nullptr, 0, nullptr, 1, &barrier);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &m_descriptorSet, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayout, 0, 1, &m_descriptorSets[setIndex], 0, nullptr);
 
     PushConstants pc;
     pc.viewMatrix = viewMatrix;

@@ -28,6 +28,9 @@ bool VulkanBlockHighlighter::initialize(VulkanContext* ctx) {
 void VulkanBlockHighlighter::shutdown() {
     if (!m_context || !m_context->device) return;
     
+    // Wait for GPU to finish using buffers before destroying them
+    vkDeviceWaitIdle(m_context->device);
+    
     if (m_pipeline) {
         vkDestroyPipeline(m_context->device, m_pipeline, nullptr);
         m_pipeline = VK_NULL_HANDLE;

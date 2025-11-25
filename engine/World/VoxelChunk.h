@@ -69,6 +69,30 @@ struct VoxelMesh
 };
 
 class IslandChunkSystem;  // Forward declaration
+class VulkanModelRenderer;  // Forward declaration
+
+// Chunk memory state for efficient memory management
+enum class ChunkState : uint8_t
+{
+    ACTIVE,      // Full voxel data in RAM, can be modified (within interaction range)
+    INACTIVE,    // Compressed voxel data, mesh on GPU only (visible but not interactive)
+    UNLOADED     // Not in memory at all
+};
+
+// RLE-compressed chunk data for inactive chunks
+struct CompressedChunkData
+{
+    std::vector<uint8_t> compressedVoxels;  // RLE compressed: [count, value, count, value, ...]
+    size_t originalSize = 0;
+    
+    // Compress from raw voxel data
+    void compress(const uint8_t* data, size_t size);
+    
+    // Decompress back to raw voxel data
+    void decompress(uint8_t* outData, size_t outSize) const;
+    
+    size_t getCompressedSize() const { return compressedVoxels.size(); }
+};
 
 class VoxelChunk
 {
@@ -87,7 +111,21 @@ class VoxelChunk
     void setIsClient(bool isClient) { m_isClientChunk = isClient; }
     bool isClient() const { return m_isClientChunk; }
 
+    // Chunk state management
+    ChunkState getState() const { return m_state; }
+    void activate();    // Decompress and load full voxel data
+    void deactivate();  // Compress voxel data, keep mesh on GPU
+    bool isActive() const { return m_state == ChunkState::ACTIVE; }
+    size_t getMemoryUsage() const;  // Returns actual memory used (compressed or uncompressed)
+    void compressAfterWorldGen();  // Compress immediately after world generation (before first activation)
+    
+    // Model renderer integration (client-side only)
+    void setModelRenderer(VulkanModelRenderer* renderer) { m_modelRenderer = renderer; }
+    void notifyModelRendererOfActivation();  // Called after activation to re-register models
+    void notifyModelRendererOfDeactivation();  // Called before deactivation to unregister models
+    
     // Voxel data access (ID-based - clean and efficient)
+    // NOTE: These will auto-activate inactive chunks when modified
     uint8_t getVoxel(int x, int y, int z) const;
     void setVoxel(int x, int y, int z, uint8_t type);
     
@@ -162,8 +200,13 @@ class VoxelChunk
     std::vector<QuadFace> generateFullChunkMesh();
     
    private:
-    std::array<uint8_t, VOLUME> voxels;
+    std::array<uint8_t, VOLUME> voxels;  // Only allocated when ACTIVE
     std::shared_ptr<VoxelMesh> renderMesh;  // Direct access (no atomic overhead)
+    
+    // Chunk state management
+    ChunkState m_state = ChunkState::ACTIVE;
+    std::unique_ptr<CompressedChunkData> m_compressedData;  // Only allocated when INACTIVE
+    VulkanModelRenderer* m_modelRenderer = nullptr;  // Set by GameClient (nullptr on server)
     
     // Cached world-space AABB for frustum culling optimization
     WorldAABB m_cachedWorldAABB;

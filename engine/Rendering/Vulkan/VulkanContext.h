@@ -66,6 +66,7 @@ public:
     VkImageView getDepthImageView() const { return m_depthImageView; }
     VkImage getDepthImage() const { return m_depthImage; }
     VkFormat getDepthFormat() const { return m_depthFormat; }
+    uint32_t getCurrentFrame() const { return m_currentFrame; }
     
     // Swapchain recreation
     void recreateSwapchain();
@@ -152,11 +153,12 @@ private:
     
     VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     
-    // Synchronization objects (double buffering)
-    static constexpr int MAX_FRAMES_IN_FLIGHT = 2;
-    std::vector<VkSemaphore> m_imageAvailableSemaphores;
-    std::vector<VkSemaphore> m_renderFinishedSemaphores;
-    std::vector<VkFence> m_inFlightFences;
+    // Synchronization objects
+    static constexpr int MAX_FRAMES_IN_FLIGHT = 3;  // Triple buffering for smoother frame pacing
+    std::vector<VkSemaphore> m_imageAvailableSemaphores;  // Per frame in flight (acquire)
+    std::vector<VkSemaphore> m_renderFinishedSemaphores;  // Per swapchain image (present wait)
+    std::vector<VkFence> m_inFlightFences;  // Per frame in flight
+    std::vector<VkFence> m_imagesInFlight;  // Track which fence is using which image
     uint32_t m_currentFrame = 0;
     
     // Window handle (for swapchain recreation)

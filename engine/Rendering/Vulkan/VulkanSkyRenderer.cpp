@@ -2,6 +2,7 @@
 #include "VulkanSkyRenderer.h"
 #include "VulkanContext.h"
 #include "VulkanBuffer.h"
+#include "../../Profiling/Profiler.h"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -47,6 +48,9 @@ void VulkanSkyRenderer::shutdown() {
     if (!m_context) return;
 
     VkDevice device = m_context->getDevice();
+    
+    // Wait for GPU to finish using buffers before destroying them
+    vkDeviceWaitIdle(device);
 
     if (m_pipeline) vkDestroyPipeline(device, m_pipeline, nullptr);
     if (m_pipelineLayout) vkDestroyPipelineLayout(device, m_pipelineLayout, nullptr);
@@ -330,6 +334,7 @@ void VulkanSkyRenderer::render(VkCommandBuffer cmd,
                                const glm::vec3& moonDirection, float moonIntensity,
                                const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix,
                                float timeOfDay) {
+    PROFILE_SCOPE("VulkanSkyRenderer::render");
     if (!m_initialized) return;
 
     // Remove translation from view matrix for skybox

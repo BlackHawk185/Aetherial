@@ -1,6 +1,7 @@
 #include "VulkanCloudRenderer.h"
 #include "VulkanContext.h"
 #include "../Parameters.h"
+#include "../../Profiling/Profiler.h"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -313,15 +314,15 @@ bool VulkanCloudRenderer::createDescriptorSet() {
         return false;
     }
 
-    // Create descriptor pool
+    // Create descriptor pool (2 sets for double buffering)
     VkDescriptorPoolSize poolSizes[1] = {};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[0].descriptorCount = 2;
+    poolSizes[0].descriptorCount = 2 * MAX_FRAMES_IN_FLIGHT;  // 2 samplers * 2 frames
 
     VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = poolSizes;
-    poolInfo.maxSets = 1;
+    poolInfo.maxSets = MAX_FRAMES_IN_FLIGHT;
 
     result = vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descriptorPool);
     if (result != VK_SUCCESS) {
@@ -329,34 +330,36 @@ bool VulkanCloudRenderer::createDescriptorSet() {
         return false;
     }
 
-    // Allocate descriptor set
+    // Allocate descriptor sets (one per frame-in-flight)
+    VkDescriptorSetLayout layouts[MAX_FRAMES_IN_FLIGHT] = {m_descriptorLayout, m_descriptorLayout};
     VkDescriptorSetAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocInfo.descriptorPool = m_descriptorPool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &m_descriptorLayout;
+    allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+    allocInfo.pSetLayouts = layouts;
 
-    result = vkAllocateDescriptorSets(m_device, &allocInfo, &m_descriptorSet);
+    result = vkAllocateDescriptorSets(m_device, &allocInfo, m_descriptorSets);
     if (result != VK_SUCCESS) {
-        std::cerr << "❌ Failed to allocate descriptor set" << std::endl;
+        std::cerr << "❌ Failed to allocate descriptor sets" << std::endl;
         return false;
     }
 
-    // Update descriptor set with noise texture (depth will be updated per-frame)
+    // Update all descriptor sets with noise texture (static, doesn't change per-frame)
     VkDescriptorImageInfo noiseImageInfo = {};
     noiseImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     noiseImageInfo.imageView = m_noiseTextureView;
     noiseImageInfo.sampler = m_noiseSampler;
 
-    VkWriteDescriptorSet writes[1] = {};
-    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[0].dstSet = m_descriptorSet;
-    writes[0].dstBinding = 1;
-    writes[0].dstArrayElement = 0;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[0].descriptorCount = 1;
-    writes[0].pImageInfo = &noiseImageInfo;
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = m_descriptorSets[i];
+        write.dstBinding = 1;
+        write.dstArrayElement = 0;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.descriptorCount = 1;
+        write.pImageInfo = &noiseImageInfo;
 
-    vkUpdateDescriptorSets(m_device, 1, writes, 0, nullptr);
+        vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+    }
 
     return true;
 }
@@ -489,6 +492,7 @@ void VulkanCloudRenderer::render(VkCommandBuffer cmd, VkImageView depthTexture,
                                  const glm::mat4& viewMatrix, const glm::mat4& projectionMatrix,
                                  const CloudParams& params)
 {
+    PROFILE_SCOPE("VulkanCloudRenderer::render");
     if (!EngineParameters::Clouds::ENABLE_CLOUDS) {
         std::cout << "Clouds disabled" << std::endl;
         return;
@@ -501,7 +505,10 @@ void VulkanCloudRenderer::render(VkCommandBuffer cmd, VkImageView depthTexture,
         return;
     }
     
-    // Update depth texture in descriptor set (dynamic)
+    // Get current frame index for double buffering
+    uint32_t frameIndex = m_context->getCurrentFrame() % MAX_FRAMES_IN_FLIGHT;
+    
+    // Update depth texture in per-frame descriptor set
     VulkanLayoutTracker::getInstance().recordDescriptorWrite(
         depthTexture,
         VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
@@ -513,7 +520,7 @@ void VulkanCloudRenderer::render(VkCommandBuffer cmd, VkImageView depthTexture,
     depthImageInfo.sampler = m_depthSampler;
 
     VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = m_descriptorSet;
+    write.dstSet = m_descriptorSets[frameIndex];
     write.dstBinding = 0;
     write.dstArrayElement = 0;
     write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -522,10 +529,10 @@ void VulkanCloudRenderer::render(VkCommandBuffer cmd, VkImageView depthTexture,
 
     vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
 
-    // Bind pipeline and descriptor set
+    // Bind pipeline and per-frame descriptor set
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 
-                           0, 1, &m_descriptorSet, 0, nullptr);
+                           0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
 
     // Set viewport and scissor
     VkViewport viewport = {};
